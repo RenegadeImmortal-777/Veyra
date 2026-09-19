@@ -1,42 +1,57 @@
-# Veyra Horizon
+# Veyra 3.0 Convergence
 
-Veyra is now a dual-engine programming-language platform for Windows.
+Veyra is a dual-engine programming language platform with a broad compatibility runtime and a native Rust bytecode VM.
 
-## Engines
+## Language
+Veyra supports variables/constants, typed functions, recursion, closures, classes and bound methods, lists/maps/tuples/sets, indexing and member access, modules, if/else, while, for/in, break/continue, try/catch/throw, comments, a REPL, and runtime type enforcement.
 
-- Compatibility engine: Veyra 1.0 interpreter with functions, recursion, loops, lists, maps, modules, runtime types, REPL and built-ins.
-- Horizon engine: standalone Rust executable with lexer, parser, AST, bytecode compiler and stack virtual machine.
+## Python ecosystem bridge
+A Veyra program can import project-installed Python modules with:
 
-## Commands
+    let np = py_import("numpy");
 
-    veyra --version
-    veyra doctor
-    veyra new myapp
+Member access and calls work directly:
+
+    let math = py_import("math");
+    print(math.sqrt(81));
+
+Keyword arguments are available through:
+
+    py_call(fn, [arg1, arg2], {"name": value});
+
+Project dependencies are isolated under .veyra/venv.
+
+## CLI
+    veyra new app
     veyra run [file.vy]
     veyra check [file.vy]
     veyra fmt [file.vy]
+    veyra lint [file.vy]
     veyra test
+    veyra bench [file.vy] [iterations]
     veyra build
-    veyra clean
-    veyra native run file.vy
-    veyra native doctor
+    veyra add <python-package>
+    veyra remove <python-package>
+    veyra packages
+    veyra lock
+    veyra install
+    veyra audit
+    veyra env
+    veyra native ...
+    veyra doctor
     veyra info
 
-Opening a .vy file in VS Code enables the locally installed Veyra language extension.
+## Runtime services
+Veyra exposes JSON, regex, files, environment access, HTTP GET, SQLite, subprocesses, random utilities, parallel_map and Python reflection helpers.
 
-## Repository layout
-
-- veyra.py: compatibility runtime
-- veyra_cli.py: unified Horizon CLI
-- engine-rs/: native Rust compiler/VM
-- bin/: native release executable
-- stdlib/: standard-library seed
-- examples/: compatibility and native examples
-- tests/: regression tests
+## Architecture
+- veyra.py: Convergence compatibility runtime
+- veyra_cli.py: unified CLI and project environment manager
+- engine-rs/: native Rust lexer/parser/AST/bytecode compiler/VM
+- bin/veyra-native.exe: optimized native VM
+- stdlib/: Veyra standard-library seed
+- tooling/vscode/: local VS Code language support
 - spec/: architecture and language specification
-- tooling/vscode/: VS Code language package
-- ROADMAP.md: native-parity and long-horizon research targets
+- tests/: regression suite
 
-## Current guarantee
-
-The compatibility test suite, native Rust test suite, sample programs, project creation, checking, building and doctor checks all pass on the development machine.
+The Python bridge is an interoperability strategy, not a claim that Veyra's native VM independently reimplements Python's ecosystem.

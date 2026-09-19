@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, math, os, sys, time, json
+import argparse, math, os, sys, time, json, re, csv, sqlite3, subprocess, importlib, random
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
-VERSION = "1.0.0"
+VERSION = "3.0.0-convergence"
 
 class VeyraError(Exception):
     pass
@@ -17,8 +20,8 @@ class Token:
     col: int
 
 KEYWORDS = {
-    "let","const","fn","if","else","while","for","in","return","true","false",
-    "null","break","continue","use","and","or","not"
+    "let","const","fn","class","if","else","while","for","in","return","true","false",
+    "null","break","continue","use","and","or","not","try","catch","throw"
 }
 
 class Lexer:
@@ -121,7 +124,13 @@ class Call: fn: Any; args: list
 @dataclass
 class Index: obj: Any; key: Any
 @dataclass
+class Member: obj: Any; name: str
+@dataclass
 class ListExpr: items: list
+@dataclass
+class TupleExpr: items: list
+@dataclass
+class SetExpr: items: list
 @dataclass
 class MapExpr: pairs: list
 @dataclass
@@ -140,6 +149,12 @@ class WhileStmt: cond: Any; body: Block
 class ForStmt: name: str; iterable: Any; body: Block
 @dataclass
 class FunctionStmt: name: str; params: list; return_type: str|None; body: Block
+@dataclass
+class ClassStmt: name: str; body: Block
+@dataclass
+class TryStmt: body: Block; error_name: str; handler: Block
+@dataclass
+class ThrowStmt: value: Any
 @dataclass
 class ReturnStmt: value: Any
 @dataclass
@@ -173,9 +188,13 @@ class Parser:
         if self.match("let"): return self.let_stmt(False)
         if self.match("const"): return self.let_stmt(True)
         if self.match("fn"): return self.fn_stmt()
+        if self.match("class"): return self.class_stmt()
         if self.match("if"): return self.if_stmt()
         if self.match("while"): return self.while_stmt()
         if self.match("for"): return self.for_stmt()
+        if self.match("try"): return self.try_stmt()
+        if self.match("throw"):
+            v = self.expr(); self.semi(); return ThrowStmt(v)
         if self.match("return"):
             v = None if self.cur().kind in (";","}") else self.expr()
             self.semi(); return ReturnStmt(v)
@@ -213,6 +232,14 @@ class Parser:
         if self.match("->"):
             ret = self.expect("IDENT", "expected return type").value
         return FunctionStmt(name, params, ret, self.block())
+    def class_stmt(self):
+        name = self.expect("IDENT", "expected class name").value
+        return ClassStmt(name, self.block())
+    def try_stmt(self):
+        body = self.block()
+        self.expect("catch", "expected 'catch'")
+        error_name = self.expect("IDENT", "expected catch variable").value
+        return TryStmt(body, error_name, self.block())
     def block(self):
         self.expect("{"); body = []
         while self.cur().kind != "}":
@@ -283,6 +310,8 @@ class Parser:
                 self.expect(")"); e = Call(e, args)
             elif self.match("["):
                 k = self.expr(); self.expect("]"); e = Index(e, k)
+            elif self.match("."):
+                e = Member(e, self.expect("IDENT", "expected member name").value)
             else:
                 break
         return e
@@ -297,7 +326,16 @@ class Parser:
         x = self.match("IDENT")
         if x: return Var(x.value)
         if self.match("("):
-            e = self.expr(); self.expect(")"); return e
+            if self.match(")"): return TupleExpr([])
+            e = self.expr()
+            if self.match(","):
+                items = [e]
+                if self.cur().kind != ")":
+                    while True:
+                        items.append(self.expr())
+                        if not self.match(","): break
+                self.expect(")"); return TupleExpr(items)
+            self.expect(")"); return e
         if self.match("["):
             a = []
             if self.cur().kind != "]":
@@ -307,13 +345,19 @@ class Parser:
                         break
             self.expect("]"); return ListExpr(a)
         if self.match("{"):
-            pairs = []
-            if self.cur().kind != "}":
-                while True:
-                    k = self.expr(); self.expect(":"); v = self.expr(); pairs.append((k, v))
-                    if not self.match(","):
-                        break
-            self.expect("}"); return MapExpr(pairs)
+            if self.match("}"): return MapExpr([])
+            first = self.expr()
+            if self.match(":"):
+                pairs = [(first, self.expr())]
+                while self.match(","):
+                    if self.cur().kind == "}": break
+                    k = self.expr(); self.expect(":"); pairs.append((k, self.expr()))
+                self.expect("}"); return MapExpr(pairs)
+            items = [first]
+            while self.match(","):
+                if self.cur().kind == "}": break
+                items.append(self.expr())
+            self.expect("}"); return SetExpr(items)
         c = self.cur()
         raise VeyraError(f"{self.file}:{c.line}:{c.col}: expected expression, got {c.kind}")
 
@@ -348,7 +392,11 @@ def type_of(v):
     if isinstance(v, float): return "Float"
     if isinstance(v, str): return "String"
     if isinstance(v, list): return "List"
+    if isinstance(v, tuple): return "Tuple"
+    if isinstance(v, set): return "Set"
     if isinstance(v, dict): return "Map"
+    if isinstance(v, VeyraInstance): return v.klass.name
+    if isinstance(v, VeyraClass): return "Class"
     if isinstance(v, Function): return "Function"
     if callable(v): return "Function"
     return type(v).__name__
@@ -364,6 +412,41 @@ def check_type(v, t, name="value"):
 class Signal(Exception):
     def __init__(self, kind, value=None):
         self.kind = kind; self.value = value
+
+class VeyraThrown(Exception):
+    def __init__(self, value):
+        self.value = value
+        super().__init__(format_value(value))
+
+class BoundMethod:
+    def __init__(self, fn, instance):
+        self.fn = fn; self.instance = instance
+    def __call__(self, *args):
+        return self.fn(self.instance, *args)
+
+class VeyraInstance:
+    def __init__(self, klass):
+        self.klass = klass; self.fields = {}
+    def get(self, name):
+        if name in self.fields: return self.fields[name]
+        if name in self.klass.methods: return BoundMethod(self.klass.methods[name], self)
+        raise VeyraError(f"undefined member '{name}' on {self.klass.name}")
+    def set(self, name, value):
+        self.fields[name] = value
+    def __repr__(self):
+        return f"<{self.klass.name} instance>"
+
+class VeyraClass:
+    def __init__(self, name, methods):
+        self.name = name; self.methods = methods
+    def __call__(self, *args):
+        inst = VeyraInstance(self)
+        init = self.methods.get("init")
+        if init: BoundMethod(init, inst)(*args)
+        elif args: raise VeyraError(f"{self.name} expects 0 arguments")
+        return inst
+    def __repr__(self):
+        return f"<class {self.name}>"
 
 class Function:
     def __init__(self, node, closure, rt):
@@ -393,6 +476,8 @@ def format_value(v):
     if v is True: return "true"
     if v is False: return "false"
     if isinstance(v, list): return "[" + ", ".join(format_value(x) for x in v) + "]"
+    if isinstance(v, tuple): return "(" + ", ".join(format_value(x) for x in v) + ")"
+    if isinstance(v, set): return "{" + ", ".join(format_value(x) for x in v) + "}"
     if isinstance(v, dict): return "{" + ", ".join(f"{format_value(k)}: {format_value(x)}" for k, x in v.items()) + "}"
     return str(v)
 
@@ -418,20 +503,53 @@ class Runtime:
         def write(path, data):
             with open(path, "w", encoding="utf-8") as f: f.write(str(data))
             return None
+        def py_import(name):
+            try: return importlib.import_module(str(name))
+            except Exception as ex: raise VeyraError(f"python import {name}: {ex}")
+        def parallel_map(fn, items, workers=None):
+            with ThreadPoolExecutor(max_workers=None if workers is None else int(workers)) as pool:
+                return list(pool.map(fn, list(items)))
+        def shell(command):
+            r = subprocess.run(str(command), shell=True, text=True, capture_output=True)
+            return {"code":r.returncode,"out":r.stdout,"err":r.stderr}
+        def http_get(url):
+            with urllib.request.urlopen(str(url), timeout=30) as r:
+                return r.read().decode("utf-8")
+        def db_open(path):
+            return sqlite3.connect(str(path))
         builtins = {
             "print":p,"len":len,"str":lambda x:format_value(x),"int":int,"float":float,
             "bool":bool,"type":type_of,"range":vrange,"assert":vassert,"push":push,"pop":pop,
             "keys":lambda d:list(d.keys()),"values":lambda d:list(d.values()),"input":input,
             "clock":time.time,"sqrt":math.sqrt,"abs":abs,"min":min,"max":max,"round":round,
-            "read":read,"write":write,"json":lambda x:json.dumps(x, ensure_ascii=False)
+            "tuple":tuple,"set":set,"list":list,"map":dict,"sorted":sorted,"sum":sum,
+            "read":read,"write":write,"json":lambda x:json.dumps(x, ensure_ascii=False),
+            "json_parse":json.loads,"regex":lambda pattern,text: re.findall(str(pattern),str(text)),
+            "py_import":py_import,
+            "py_call":lambda fn,args=None,kwargs=None: fn(*(args or []), **(kwargs or {})),
+            "py_get":lambda obj,name:getattr(obj,str(name)),
+            "py_set":lambda obj,name,value:(setattr(obj,str(name),value) or value),
+            "py_dir":lambda obj:list(dir(obj)),
+            "parallel_map":parallel_map,"shell":shell,"http_get":http_get,
+            "db_open":db_open,"random":random.random,"randint":random.randint,
+            "path_exists":lambda p:Path(str(p)).exists(),"cwd":lambda:os.getcwd(),
+            "env":lambda k:os.environ.get(str(k))
         }
         for n, v in builtins.items(): target.define(n, v, const=True)
     def eval(self, e, env):
         if isinstance(e, Literal): return e.value
         if isinstance(e, Var): return env.get(e.name)
         if isinstance(e, ListExpr): return [self.eval(x, env) for x in e.items]
+        if isinstance(e, TupleExpr): return tuple(self.eval(x, env) for x in e.items)
+        if isinstance(e, SetExpr): return set(self.eval(x, env) for x in e.items)
         if isinstance(e, MapExpr): return {self.eval(k, env): self.eval(v, env) for k, v in e.pairs}
         if isinstance(e, Index): return self.eval(e.obj, env)[self.eval(e.key, env)]
+        if isinstance(e, Member):
+            obj = self.eval(e.obj, env)
+            if isinstance(obj, VeyraInstance): return obj.get(e.name)
+            if isinstance(obj, dict) and e.name in obj: return obj[e.name]
+            try: return getattr(obj, e.name)
+            except AttributeError: raise VeyraError(f"undefined member '{e.name}'")
         if isinstance(e, Unary):
             r = self.eval(e.right, env)
             if e.op in ("!","not"): return not bool(r)
@@ -486,6 +604,24 @@ class Runtime:
                     elif s.op == "*=": nv = old * nv
                     elif s.op == "/=": nv = old / nv
                 obj[key] = nv; return None
+            if isinstance(s.target, Member):
+                obj = self.eval(s.target.obj, env); nv = self.eval(s.value, env)
+                if isinstance(obj, VeyraInstance):
+                    old = obj.fields.get(s.target.name)
+                    if s.op == "+=": nv = old + nv
+                    elif s.op == "-=": nv = old - nv
+                    elif s.op == "*=": nv = old * nv
+                    elif s.op == "/=": nv = old / nv
+                    obj.set(s.target.name, nv); return None
+                if isinstance(obj, dict):
+                    old = obj.get(s.target.name)
+                    if s.op == "+=": nv = old + nv
+                    elif s.op == "-=": nv = old - nv
+                    elif s.op == "*=": nv = old * nv
+                    elif s.op == "/=": nv = old / nv
+                    obj[s.target.name] = nv; return None
+                if s.op != "=": raise VeyraError("compound member assignment unsupported for this object")
+                setattr(obj, s.target.name, nv); return None
             raise VeyraError("invalid assignment target")
         if isinstance(s, IfStmt):
             if self.eval(s.cond, env): return self.exec(s.then, env)
@@ -510,6 +646,23 @@ class Runtime:
             return None
         if isinstance(s, FunctionStmt):
             env.define(s.name, Function(s, env, self), const=True); return None
+        if isinstance(s, ClassStmt):
+            methods = {}
+            for item in s.body.body:
+                if not isinstance(item, FunctionStmt):
+                    raise VeyraError("class bodies currently contain methods only")
+                methods[item.name] = Function(item, env, self)
+            env.define(s.name, VeyraClass(s.name, methods), const=True); return None
+        if isinstance(s, TryStmt):
+            try:
+                return self.exec_block(s.body, Env(env))
+            except VeyraThrown as ex:
+                catch_env = Env(env); catch_env.define(s.error_name, ex.value)
+                return self.exec_block(s.handler, catch_env)
+            except VeyraError as ex:
+                catch_env = Env(env); catch_env.define(s.error_name, str(ex))
+                return self.exec_block(s.handler, catch_env)
+        if isinstance(s, ThrowStmt): raise VeyraThrown(self.eval(s.value, env))
         if isinstance(s, ReturnStmt): raise Signal("return", None if s.value is None else self.eval(s.value, env))
         if isinstance(s, FlowStmt): raise Signal(s.kind)
         if isinstance(s, UseStmt):

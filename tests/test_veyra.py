@@ -30,4 +30,20 @@ class VeyraTests(unittest.TestCase):
     def test_type_check(self):
         with self.assertRaises(veyra.VeyraError): self.execute('let x: Int = "bad";')
 
+    def test_class_and_method(self):
+        src='class C { fn init(self, x: Int) -> Void { self.x = x; } fn inc(self) -> Int { self.x += 1; return self.x; } } let c=C(4); print(c.inc());'
+        self.assertEqual(self.execute(src), '5')
+
+    def test_try_throw(self):
+        src='try { throw "boom"; } catch err { print(err); }'
+        self.assertEqual(self.execute(src), 'boom')
+
+    def test_tuple_set(self):
+        src='let t=(1,2,3); let s={1,2,3}; print(len(t)); print(len(s));'
+        self.assertEqual(self.execute(src), '3\n3')
+
+    def test_python_bridge(self):
+        src='let m=py_import("math"); print(m.sqrt(81));'
+        self.assertEqual(self.execute(src), '9.0')
+
 if __name__ == '__main__': unittest.main()

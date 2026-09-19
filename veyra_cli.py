@@ -4,7 +4,7 @@ import argparse, hashlib, json, os, platform, shutil, subprocess, sys, time
 from pathlib import Path
 import veyra as legacy
 
-VERSION = "2.0.0-horizon"
+VERSION = "3.0.0-convergence"
 ROOT = Path(__file__).resolve().parent
 NATIVE = ROOT / "bin" / "veyra-native.exe"
 
@@ -29,17 +29,108 @@ def cmd_new(name):
     (p/"src").mkdir(parents=True); (p/"tests").mkdir(); (p/"vendor").mkdir()
     (p/"veyra.json").write_text(json.dumps({
         "name":p.name,"version":"0.1.0","entry":"src/main.vy",
-        "edition":"2026","engine":VERSION
+        "edition":"2026","engine":VERSION,"dependencies":{}
     },indent=2)+"\n",encoding="utf-8")
     (p/"src"/"main.vy").write_text(
         'const language: String = "Veyra";\nprint("Hello from", language);\n',encoding="utf-8")
     (p/".gitignore").write_text("dist/\n.veyra/\n*.vyc\n",encoding="utf-8")
     print(f"Created {p}"); print(f"  cd {p}"); print("  veyra run")
 
+def find_project(start=None):
+    p=Path(start or Path.cwd()).resolve()
+    for candidate in [p,*p.parents]:
+        m=candidate/"veyra.json"
+        if m.exists(): return candidate,m
+    raise legacy.VeyraError("veyra.json not found")
+
 def manifest(cwd=Path.cwd()):
-    p=cwd/"veyra.json"
-    if not p.exists(): raise legacy.VeyraError("veyra.json not found")
+    root,p=find_project(cwd)
     return json.loads(p.read_text(encoding="utf-8")),p
+
+def activate_env(start=None):
+    try: root,_=find_project(start)
+    except legacy.VeyraError: return None
+    site=root/".veyra"/"venv"/"Lib"/"site-packages"
+    if site.exists() and str(site) not in sys.path: sys.path.insert(0,str(site))
+    return root
+
+def ensure_env():
+    root,_=find_project()
+    envdir=root/".veyra"/"venv"
+    py=envdir/"Scripts"/"python.exe"
+    if not py.exists():
+        print("Creating Veyra project environment...")
+        subprocess.run([sys.executable,"-m","venv",str(envdir)],check=True)
+    return root,py
+
+def cmd_add(package):
+    root,py=ensure_env()
+    subprocess.run([str(py),"-m","pip","install",package],check=True)
+    m,mp=manifest(root)
+    probe=subprocess.run([str(py),"-m","pip","show",package],capture_output=True,text=True)
+    version="*"
+    for line in probe.stdout.splitlines():
+        if line.startswith("Version:"): version=line.split(":",1)[1].strip()
+    m.setdefault("dependencies",{})[package]=version
+    mp.write_text(json.dumps(m,indent=2)+"\n",encoding="utf-8")
+    print(f"Added {package} {version}")
+
+def cmd_remove(package):
+    root,py=ensure_env()
+    subprocess.run([str(py),"-m","pip","uninstall","-y",package],check=True)
+    m,mp=manifest(root); m.setdefault("dependencies",{}).pop(package,None)
+    mp.write_text(json.dumps(m,indent=2)+"\n",encoding="utf-8")
+    print(f"Removed {package}")
+
+def cmd_packages():
+    root,py=ensure_env()
+    subprocess.run([str(py),"-m","pip","list"])
+    m,_=manifest(root)
+    print("Manifest dependencies:",json.dumps(m.get("dependencies",{}),indent=2))
+
+def cmd_lock():
+    root,py=ensure_env()
+    r=subprocess.run([str(py),"-m","pip","freeze"],capture_output=True,text=True,check=True)
+    lock=root/"veyra.lock"
+    lock.write_text(r.stdout,encoding="utf-8")
+    print(f"Locked dependencies to {lock}")
+
+def cmd_install():
+    root,py=ensure_env()
+    lock=root/"veyra.lock"
+    m,_=manifest(root)
+    if lock.exists():
+        subprocess.run([str(py),"-m","pip","install","-r",str(lock)],check=True)
+    else:
+        for name,ver in m.get("dependencies",{}).items():
+            spec=name if ver in ("","*") else f"{name}=={ver}"
+            subprocess.run([str(py),"-m","pip","install",spec],check=True)
+    print("Dependencies synchronized")
+
+def cmd_audit():
+    root,py=ensure_env()
+    r=subprocess.run([str(py),"-m","pip","check"])
+    if r.returncode: raise SystemExit(r.returncode)
+    print("Dependency graph: OK")
+
+def cmd_lint(path):
+    source=Path(path).read_text(encoding="utf-8")
+    legacy.parse(source,str(path))
+    issues=[]
+    for n,line in enumerate(source.splitlines(),1):
+        if "\t" in line: issues.append(f"{path}:{n}: tab indentation")
+        if len(line)>120: issues.append(f"{path}:{n}: line exceeds 120 characters")
+        if line.rstrip()!=line: issues.append(f"{path}:{n}: trailing whitespace")
+    if issues:
+        print("\n".join(issues)); raise SystemExit(1)
+    print(f"{path}: lint OK")
+
+def cmd_bench(path,iterations=10):
+    activate_env(Path(path).parent)
+    times=[]
+    for _ in range(int(iterations)):
+        t=time.perf_counter(); legacy.run_file(str(path)); times.append(time.perf_counter()-t)
+    print(f"{path}: {len(times)} runs | best={min(times)*1000:.3f}ms | mean={sum(times)/len(times)*1000:.3f}ms")
 
 def resolve_file(arg=None):
     if arg: return Path(arg)
@@ -126,13 +217,31 @@ def main():
             if len(a)<2: raise legacy.VeyraError("usage: veyra new <name>")
             return cmd_new(a[1])
         if a[0]=="run":
-            p=resolve_file(a[1] if len(a)>1 else None); return legacy.run_file(str(p))
+            p=resolve_file(a[1] if len(a)>1 else None); activate_env(p.parent); return legacy.run_file(str(p))
         if a[0]=="check":
             p=resolve_file(a[1] if len(a)>1 else None); return cmd_check(p)
         if a[0]=="fmt":
             p=resolve_file(a[1] if len(a)>1 else None); return cmd_fmt(p,"--check" in a)
-        if a[0]=="test": return cmd_test()
-        if a[0]=="build": return cmd_build("--native" in a)
+        if a[0]=="test": activate_env(); return cmd_test()
+        if a[0]=="add":
+            if len(a)<2: raise legacy.VeyraError("usage: veyra add <python-package>")
+            return cmd_add(a[1])
+        if a[0]=="remove":
+            if len(a)<2: raise legacy.VeyraError("usage: veyra remove <python-package>")
+            return cmd_remove(a[1])
+        if a[0] in ("packages","deps"): return cmd_packages()
+        if a[0]=="lock": return cmd_lock()
+        if a[0]=="install": return cmd_install()
+        if a[0]=="audit": return cmd_audit()
+        if a[0]=="lint":
+            p=resolve_file(a[1] if len(a)>1 else None); return cmd_lint(p)
+        if a[0]=="bench":
+            p=resolve_file(a[1] if len(a)>1 else None)
+            n=a[2] if len(a)>2 else 10
+            return cmd_bench(p,n)
+        if a[0]=="env":
+            root,py=ensure_env(); print(f"project={root}\npython={py}"); return
+        if a[0]=="build": activate_env(); return cmd_build("--native" in a)
         if a[0]=="clean":
             d=Path("dist")
             if d.exists(): shutil.rmtree(d)
@@ -141,7 +250,7 @@ def main():
             if len(a)==1: return native(["repl"])
             raise SystemExit(native(a[1:]).returncode)
         if a[0].endswith(".vy"): return legacy.run_file(a[0])
-        print("Veyra commands: run, check, fmt, test, build, clean, new, native, doctor, info, --version")
+        print("Veyra commands: run, check, fmt, lint, test, bench, build, clean, new, add, remove, packages, lock, install, audit, env, native, doctor, info, --version")
     except (legacy.VeyraError,OSError,json.JSONDecodeError) as e:
         print(f"veyra: error: {e}",file=sys.stderr); raise SystemExit(1)
 
