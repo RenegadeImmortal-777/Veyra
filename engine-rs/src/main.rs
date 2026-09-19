@@ -4,9 +4,16 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
+    },
+    thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use libloading::Library;
 use rand::Rng;
 use regex::Regex;
 use rusqlite::Connection;
@@ -14,7 +21,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 
-const VERSION: &str = "5.0.0-frontier";
+const VERSION: &str = "6.0.0-apex";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -24,12 +31,19 @@ enum Tok {
     Let,
     Const,
     Fn,
+    Class,
     Return,
+    Break,
+    Continue,
     If,
     Else,
     While,
     For,
     In,
+    Try,
+    Catch,
+    Throw,
+    Await,
     And,
     Or,
     Not,
@@ -44,6 +58,7 @@ enum Tok {
     Rs,
     Comma,
     Colon,
+    Dot,
     Semi,
     Plus,
     Minus,
@@ -128,12 +143,19 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 "let" => Tok::Let,
                 "const" => Tok::Const,
                 "fn" => Tok::Fn,
+                "class" => Tok::Class,
                 "return" => Tok::Return,
+                "break" => Tok::Break,
+                "continue" => Tok::Continue,
                 "if" => Tok::If,
                 "else" => Tok::Else,
                 "while" => Tok::While,
                 "for" => Tok::For,
                 "in" => Tok::In,
+                "try" => Tok::Try,
+                "catch" => Tok::Catch,
+                "throw" => Tok::Throw,
+                "await" => Tok::Await,
                 "and" => Tok::And,
                 "or" => Tok::Or,
                 "not" => Tok::Not,
@@ -189,6 +211,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 out.push(Tok::Colon);
                 i += 1
             }
+            '.' => {
+                out.push(Tok::Dot);
+                i += 1
+            }
             ';' => {
                 out.push(Tok::Semi);
                 i += 1
@@ -239,20 +265,35 @@ enum Expr {
     List(Vec<Expr>),
     Map(Vec<(Expr, Expr)>),
     Index(Box<Expr>, Box<Expr>),
+    Member(Box<Expr>, String),
+    MethodCall(Box<Expr>, String, Vec<Expr>),
+    Await(Box<Expr>),
     Unary(String, Box<Expr>),
     Bin(Box<Expr>, String, Box<Expr>),
     Call(String, Vec<Expr>),
 }
 #[derive(Clone, Debug)]
 enum Stmt {
-    Let(String, Expr, bool),
+    Let(String, Option<String>, Expr, bool),
     Assign(String, Expr),
     Expr(Expr),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
     While(Expr, Vec<Stmt>),
     ForRange(String, Expr, Expr, Vec<Stmt>),
-    Fn(String, Vec<String>, Vec<Stmt>),
+    ForEach(String, Expr, Vec<Stmt>),
+    Try(Vec<Stmt>, String, Vec<Stmt>),
+    Throw(Expr),
+    Fn(
+        String,
+        Vec<(String, Option<String>)>,
+        Option<String>,
+        Vec<Stmt>,
+    ),
+    Class(String, Option<String>, Vec<Stmt>),
+    SetMember(Expr, String, Expr),
     Return(Option<Expr>),
+    Break,
+    Continue,
 }
 
 struct Parser {
@@ -312,15 +353,34 @@ impl Parser {
                 Tok::Id(s) => s,
                 x => return Err(format!("expected name, got {x:?}")),
             };
-            if self.eat(&Tok::Colon) {
-                if !matches!(self.bump(), Tok::Id(_)) {
-                    return Err("expected type name".into());
+            let ty = if self.eat(&Tok::Colon) {
+                match self.bump() {
+                    Tok::Id(s) => Some(s),
+                    _ => return Err("expected type name".into()),
                 }
-            }
+            } else {
+                None
+            };
             self.need(&Tok::Eq, "expected '='")?;
             let e = self.expr()?;
             self.eat(&Tok::Semi);
-            return Ok(Stmt::Let(name, e, is_const));
+            return Ok(Stmt::Let(name, ty, e, is_const));
+        }
+        if self.eat(&Tok::Class) {
+            let name = match self.bump() {
+                Tok::Id(s) => s,
+                x => return Err(format!("expected class name, got {x:?}")),
+            };
+            let parent = if self.eat(&Tok::Colon) {
+                match self.bump() {
+                    Tok::Id(s) => Some(s),
+                    x => return Err(format!("expected parent class name, got {x:?}")),
+                }
+            } else {
+                None
+            };
+            let body = self.block()?;
+            return Ok(Stmt::Class(name, parent, body));
         }
         if self.eat(&Tok::Fn) {
             let name = match self.bump() {
@@ -335,25 +395,39 @@ impl Parser {
                         Tok::Id(s) => s,
                         x => return Err(format!("expected parameter name, got {x:?}")),
                     };
-                    if self.eat(&Tok::Colon) {
-                        if !matches!(self.bump(), Tok::Id(_)) {
-                            return Err("expected parameter type".into());
+                    let param_type = if self.eat(&Tok::Colon) {
+                        match self.bump() {
+                            Tok::Id(s) => Some(s),
+                            _ => return Err("expected parameter type".into()),
                         }
-                    }
-                    params.push(param);
+                    } else {
+                        None
+                    };
+                    params.push((param, param_type));
                     if self.eat(&Tok::Rp) {
                         break;
                     }
                     self.need(&Tok::Comma, "expected ',' between parameters")?;
                 }
             }
-            if self.eat(&Tok::Arrow) {
-                if !matches!(self.bump(), Tok::Id(_)) {
-                    return Err("expected return type".into());
+            let return_type = if self.eat(&Tok::Arrow) {
+                match self.bump() {
+                    Tok::Id(s) => Some(s),
+                    _ => return Err("expected return type".into()),
                 }
-            }
+            } else {
+                None
+            };
             let body = self.block()?;
-            return Ok(Stmt::Fn(name, params, body));
+            return Ok(Stmt::Fn(name, params, return_type, body));
+        }
+        if self.eat(&Tok::Break) {
+            self.eat(&Tok::Semi);
+            return Ok(Stmt::Break);
+        }
+        if self.eat(&Tok::Continue) {
+            self.eat(&Tok::Semi);
+            return Ok(Stmt::Continue);
         }
         if self.eat(&Tok::Return) {
             if matches!(self.cur(), Tok::Semi | Tok::Rb) {
@@ -385,22 +459,36 @@ impl Parser {
                 x => return Err(format!("expected loop variable, got {x:?}")),
             };
             self.need(&Tok::In, "expected 'in'")?;
-            let range_name = match self.bump() {
-                Tok::Id(s) if s == "range" => s,
-                x => {
-                    return Err(format!(
-                        "native for currently expects range(...), got {x:?}"
-                    ));
-                }
-            };
-            let _ = range_name;
-            self.need(&Tok::Lp, "expected '(' after range")?;
-            let start = self.expr()?;
-            self.need(&Tok::Comma, "expected ',' in range")?;
-            let end = self.expr()?;
-            self.need(&Tok::Rp, "expected ')' after range")?;
+            if matches!(self.cur(), Tok::Id(s) if s == "range")
+                && self.i + 1 < self.t.len()
+                && matches!(self.t[self.i + 1], Tok::Lp)
+            {
+                self.i += 2;
+                let start = self.expr()?;
+                self.need(&Tok::Comma, "expected ',' in range")?;
+                let end = self.expr()?;
+                self.need(&Tok::Rp, "expected ')' after range")?;
+                let body = self.block()?;
+                return Ok(Stmt::ForRange(name, start, end, body));
+            }
+            let iterable = self.expr()?;
             let body = self.block()?;
-            return Ok(Stmt::ForRange(name, start, end, body));
+            return Ok(Stmt::ForEach(name, iterable, body));
+        }
+        if self.eat(&Tok::Try) {
+            let body = self.block()?;
+            self.need(&Tok::Catch, "expected 'catch' after try block")?;
+            let error_name = match self.bump() {
+                Tok::Id(s) => s,
+                x => return Err(format!("expected catch variable, got {x:?}")),
+            };
+            let handler = self.block()?;
+            return Ok(Stmt::Try(body, error_name, handler));
+        }
+        if self.eat(&Tok::Throw) {
+            let value = self.expr()?;
+            self.eat(&Tok::Semi);
+            return Ok(Stmt::Throw(value));
         }
         if let Tok::Id(n) = self.cur().clone() {
             if self.i + 1 < self.t.len() && matches!(self.t[self.i + 1], Tok::Eq) {
@@ -411,6 +499,14 @@ impl Parser {
             }
         }
         let e = self.expr()?;
+        if self.eat(&Tok::Eq) {
+            let value = self.expr()?;
+            self.eat(&Tok::Semi);
+            if let Expr::Member(obj, name) = e {
+                return Ok(Stmt::SetMember(*obj, name, value));
+            }
+            return Err("invalid assignment target".into());
+        }
         self.eat(&Tok::Semi);
         Ok(Stmt::Expr(e))
     }
@@ -491,6 +587,9 @@ impl Parser {
         Ok(e)
     }
     fn unary(&mut self) -> Result<Expr, String> {
+        if self.eat(&Tok::Await) {
+            return Ok(Expr::Await(Box::new(self.unary()?)));
+        }
         if self.eat(&Tok::Bang) || self.eat(&Tok::Not) {
             return Ok(Expr::Unary("!".into(), Box::new(self.unary()?)));
         }
@@ -501,10 +600,36 @@ impl Parser {
     }
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
-        while self.eat(&Tok::Ls) {
-            let key = self.expr()?;
-            self.need(&Tok::Rs, "expected ']' after index")?;
-            e = Expr::Index(Box::new(e), Box::new(key));
+        loop {
+            if self.eat(&Tok::Ls) {
+                let key = self.expr()?;
+                self.need(&Tok::Rs, "expected ']' after index")?;
+                e = Expr::Index(Box::new(e), Box::new(key));
+                continue;
+            }
+            if self.eat(&Tok::Dot) {
+                let name = match self.bump() {
+                    Tok::Id(s) => s,
+                    x => return Err(format!("expected member name, got {x:?}")),
+                };
+                if self.eat(&Tok::Lp) {
+                    let mut args = vec![];
+                    if !self.eat(&Tok::Rp) {
+                        loop {
+                            args.push(self.expr()?);
+                            if self.eat(&Tok::Rp) {
+                                break;
+                            }
+                            self.need(&Tok::Comma, "expected ',' between arguments")?;
+                        }
+                    }
+                    e = Expr::MethodCall(Box::new(e), name, args);
+                } else {
+                    e = Expr::Member(Box::new(e), name);
+                }
+                continue;
+            }
+            break;
         }
         Ok(e)
     }
@@ -579,6 +704,7 @@ enum Val {
     Null,
     List(Vec<Val>),
     Map(Vec<(Val, Val)>),
+    Object(u64),
 }
 fn val_to_json(v: &Val) -> JsonValue {
     match v {
@@ -587,6 +713,7 @@ fn val_to_json(v: &Val) -> JsonValue {
         Val::Bool(b) => JsonValue::from(*b),
         Val::Null => JsonValue::Null,
         Val::List(xs) => JsonValue::Array(xs.iter().map(val_to_json).collect()),
+        Val::Object(id) => JsonValue::String(format!("<object:{id}>")),
         Val::Map(pairs) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in pairs {
@@ -595,6 +722,10 @@ fn val_to_json(v: &Val) -> JsonValue {
             JsonValue::Object(obj)
         }
     }
+}
+
+fn json_stringify_value(v: &Val) -> Result<String, String> {
+    serde_json::to_string(&val_to_json(v)).map_err(|e| e.to_string())
 }
 
 fn json_to_val(v: &JsonValue) -> Val {
@@ -664,6 +795,7 @@ impl Val {
             Val::Str(s) => !s.is_empty(),
             Val::List(v) => !v.is_empty(),
             Val::Map(v) => !v.is_empty(),
+            Val::Object(_) => true,
         }
     }
     fn show(&self) -> String {
@@ -689,6 +821,7 @@ impl Val {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Val::Object(id) => format!("<object:{id}>"),
         }
     }
 }
@@ -697,7 +830,7 @@ impl Val {
 enum Op {
     Const(Val),
     Load(String),
-    Define(String, bool),
+    Define(String, bool, Option<String>),
     Store(String),
     Pop,
     Add,
@@ -716,20 +849,93 @@ enum Op {
     And,
     Or,
     Index,
+    GetMember(String),
+    SetMember(String),
     Call(String, usize),
-    Def(String, Vec<String>, Vec<Op>),
+    CallMethod(String, usize),
+    Def(
+        String,
+        Vec<(String, Option<String>)>,
+        Option<String>,
+        Vec<Op>,
+    ),
+    DefClass(
+        String,
+        Option<String>,
+        Vec<(
+            String,
+            Vec<(String, Option<String>)>,
+            Option<String>,
+            Vec<Op>,
+        )>,
+    ),
     Return,
+    PushHandler(usize, String),
+    PopHandler,
+    Throw,
     JumpIfFalse(usize),
     Jump(usize),
     Halt,
 }
 
+#[derive(Clone, Debug)]
+struct FunctionDef {
+    params: Vec<(String, Option<String>)>,
+    return_type: Option<String>,
+    code: Vec<Op>,
+    captures: HashMap<String, Val>,
+    capture_types: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct ClassDef {
+    parent: Option<String>,
+    methods: HashMap<String, FunctionDef>,
+}
+
+#[derive(Clone, Debug)]
+struct ObjectData {
+    class_name: String,
+    fields: HashMap<String, Val>,
+}
+
+static OBJECT_IDS: AtomicU64 = AtomicU64::new(1);
+static TASK_IDS: AtomicU64 = AtomicU64::new(1);
+static CHANNEL_IDS: AtomicU64 = AtomicU64::new(1);
+static TASKS: OnceLock<Mutex<HashMap<u64, thread::JoinHandle<Result<Val, String>>>>> =
+    OnceLock::new();
+static CHANNELS: OnceLock<Mutex<HashMap<u64, (Sender<Val>, Arc<Mutex<Receiver<Val>>>)>>> =
+    OnceLock::new();
+
+fn tasks() -> &'static Mutex<HashMap<u64, thread::JoinHandle<Result<Val, String>>>> {
+    TASKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn channels() -> &'static Mutex<HashMap<u64, (Sender<Val>, Arc<Mutex<Receiver<Val>>>)>> {
+    CHANNELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct LoopCtx {
+    breaks: Vec<usize>,
+    continues: Vec<usize>,
+}
+
 struct Compiler {
     code: Vec<Op>,
+    next_temp: usize,
+    loops: Vec<LoopCtx>,
 }
 impl Compiler {
     fn new() -> Self {
-        Self { code: vec![] }
+        Self {
+            code: vec![],
+            next_temp: 0,
+            loops: vec![],
+        }
+    }
+    fn temp(&mut self, prefix: &str) -> String {
+        let n = self.next_temp;
+        self.next_temp += 1;
+        format!("__{prefix}_{n}")
     }
     fn emit_expr(&mut self, e: &Expr) -> Result<(), String> {
         match e {
@@ -754,6 +960,21 @@ impl Compiler {
                 self.emit_expr(obj)?;
                 self.emit_expr(key)?;
                 self.code.push(Op::Index);
+            }
+            Expr::Member(obj, name) => {
+                self.emit_expr(obj)?;
+                self.code.push(Op::GetMember(name.clone()));
+            }
+            Expr::MethodCall(obj, name, args) => {
+                self.emit_expr(obj)?;
+                for a in args {
+                    self.emit_expr(a)?;
+                }
+                self.code.push(Op::CallMethod(name.clone(), args.len()));
+            }
+            Expr::Await(task) => {
+                self.emit_expr(task)?;
+                self.code.push(Op::Call("await_task".into(), 1));
             }
             Expr::Var(n) => self.code.push(Op::Load(n.clone())),
             Expr::Unary(op, x) => {
@@ -797,9 +1018,9 @@ impl Compiler {
     }
     fn emit_stmt(&mut self, s: &Stmt) -> Result<(), String> {
         match s {
-            Stmt::Let(n, e, c) => {
+            Stmt::Let(n, ty, e, c) => {
                 self.emit_expr(e)?;
-                self.code.push(Op::Define(n.clone(), *c));
+                self.code.push(Op::Define(n.clone(), *c, ty.clone()));
             }
             Stmt::Assign(n, e) => {
                 self.emit_expr(e)?;
@@ -827,10 +1048,21 @@ impl Compiler {
                 self.emit_expr(c)?;
                 let jf = self.code.len();
                 self.code.push(Op::JumpIfFalse(0));
+                self.loops.push(LoopCtx {
+                    breaks: vec![],
+                    continues: vec![],
+                });
                 self.emit_stmts(b)?;
+                let ctx = self.loops.pop().unwrap();
+                for p in ctx.continues {
+                    self.code[p] = Op::Jump(start);
+                }
                 self.code.push(Op::Jump(start));
                 let end = self.code.len();
                 self.code[jf] = Op::JumpIfFalse(end);
+                for p in ctx.breaks {
+                    self.code[p] = Op::Jump(end);
+                }
             }
             Stmt::ForRange(name, start_expr, end_expr, body) => {
                 self.emit_expr(start_expr)?;
@@ -841,7 +1073,16 @@ impl Compiler {
                 self.code.push(Op::Lt);
                 let jf = self.code.len();
                 self.code.push(Op::JumpIfFalse(0));
+                self.loops.push(LoopCtx {
+                    breaks: vec![],
+                    continues: vec![],
+                });
                 self.emit_stmts(body)?;
+                let ctx = self.loops.pop().unwrap();
+                let continue_target = self.code.len();
+                for p in ctx.continues {
+                    self.code[p] = Op::Jump(continue_target);
+                }
                 self.code.push(Op::Load(name.clone()));
                 self.code.push(Op::Const(Val::Num(1.0)));
                 self.code.push(Op::Add);
@@ -849,14 +1090,103 @@ impl Compiler {
                 self.code.push(Op::Jump(loop_start));
                 let end = self.code.len();
                 self.code[jf] = Op::JumpIfFalse(end);
+                for p in ctx.breaks {
+                    self.code[p] = Op::Jump(end);
+                }
             }
-            Stmt::Fn(name, params, body) => {
+            Stmt::ForEach(name, iterable, body) => {
+                let iter_name = self.temp("iter");
+                let idx_name = self.temp("idx");
+                self.emit_expr(iterable)?;
+                self.code.push(Op::Define(iter_name.clone(), false, None));
+                self.code.push(Op::Const(Val::Num(0.0)));
+                self.code.push(Op::Define(idx_name.clone(), false, None));
+                let loop_start = self.code.len();
+                self.code.push(Op::Load(idx_name.clone()));
+                self.code.push(Op::Load(iter_name.clone()));
+                self.code.push(Op::Call("len".into(), 1));
+                self.code.push(Op::Lt);
+                let jf = self.code.len();
+                self.code.push(Op::JumpIfFalse(0));
+                self.code.push(Op::Load(iter_name.clone()));
+                self.code.push(Op::Load(idx_name.clone()));
+                self.code.push(Op::Index);
+                self.code.push(Op::Store(name.clone()));
+                self.loops.push(LoopCtx {
+                    breaks: vec![],
+                    continues: vec![],
+                });
+                self.emit_stmts(body)?;
+                let ctx = self.loops.pop().unwrap();
+                let continue_target = self.code.len();
+                for p in ctx.continues {
+                    self.code[p] = Op::Jump(continue_target);
+                }
+                self.code.push(Op::Load(idx_name.clone()));
+                self.code.push(Op::Const(Val::Num(1.0)));
+                self.code.push(Op::Add);
+                self.code.push(Op::Store(idx_name));
+                self.code.push(Op::Jump(loop_start));
+                let end = self.code.len();
+                self.code[jf] = Op::JumpIfFalse(end);
+                for p in ctx.breaks {
+                    self.code[p] = Op::Jump(end);
+                }
+            }
+            Stmt::Try(body, error_name, handler) => {
+                let push = self.code.len();
+                self.code.push(Op::PushHandler(0, error_name.clone()));
+                self.emit_stmts(body)?;
+                self.code.push(Op::PopHandler);
+                let jump = self.code.len();
+                self.code.push(Op::Jump(0));
+                let handler_start = self.code.len();
+                self.code[push] = Op::PushHandler(handler_start, error_name.clone());
+                self.emit_stmts(handler)?;
+                let end = self.code.len();
+                self.code[jump] = Op::Jump(end);
+            }
+            Stmt::Throw(value) => {
+                self.emit_expr(value)?;
+                self.code.push(Op::Throw);
+            }
+            Stmt::SetMember(obj, name, value) => {
+                self.emit_expr(obj)?;
+                self.emit_expr(value)?;
+                self.code.push(Op::SetMember(name.clone()));
+            }
+            Stmt::Class(name, parent, body) => {
+                let mut methods = vec![];
+                for item in body {
+                    if let Stmt::Fn(method, params, return_type, statements) = item {
+                        let mut child = Compiler::new();
+                        child.emit_stmts(statements)?;
+                        child.code.push(Op::Const(Val::Null));
+                        child.code.push(Op::Return);
+                        methods.push((
+                            method.clone(),
+                            params.clone(),
+                            return_type.clone(),
+                            child.code,
+                        ));
+                    } else {
+                        return Err("class bodies currently contain methods only".into());
+                    }
+                }
+                self.code
+                    .push(Op::DefClass(name.clone(), parent.clone(), methods));
+            }
+            Stmt::Fn(name, params, return_type, body) => {
                 let mut child = Compiler::new();
                 child.emit_stmts(body)?;
                 child.code.push(Op::Const(Val::Null));
                 child.code.push(Op::Return);
-                self.code
-                    .push(Op::Def(name.clone(), params.clone(), child.code));
+                self.code.push(Op::Def(
+                    name.clone(),
+                    params.clone(),
+                    return_type.clone(),
+                    child.code,
+                ));
             }
             Stmt::Return(value) => {
                 if let Some(expr) = value {
@@ -865,6 +1195,21 @@ impl Compiler {
                     self.code.push(Op::Const(Val::Null));
                 }
                 self.code.push(Op::Return);
+            }
+            Stmt::Break => {
+                let p = self.code.len();
+                self.code.push(Op::Jump(0));
+                let ctx = self.loops.last_mut().ok_or("'break' used outside loop")?;
+                ctx.breaks.push(p);
+            }
+            Stmt::Continue => {
+                let p = self.code.len();
+                self.code.push(Op::Jump(0));
+                let ctx = self
+                    .loops
+                    .last_mut()
+                    .ok_or("'continue' used outside loop")?;
+                ctx.continues.push(p);
             }
         }
         Ok(())
@@ -880,8 +1225,12 @@ struct Vm {
     ip: usize,
     stack: Vec<Val>,
     vars: HashMap<String, Val>,
+    var_types: HashMap<String, String>,
     consts: HashSet<String>,
-    funcs: HashMap<String, (Vec<String>, Vec<Op>)>,
+    funcs: HashMap<String, FunctionDef>,
+    classes: HashMap<String, ClassDef>,
+    objects: Arc<Mutex<HashMap<u64, ObjectData>>>,
+    handlers: Vec<(usize, String)>,
 }
 impl Vm {
     fn new(code: Vec<Op>) -> Self {
@@ -890,22 +1239,32 @@ impl Vm {
             ip: 0,
             stack: vec![],
             vars: HashMap::new(),
+            var_types: HashMap::new(),
             consts: HashSet::new(),
             funcs: HashMap::new(),
+            classes: HashMap::new(),
+            objects: Arc::new(Mutex::new(HashMap::new())),
+            handlers: vec![],
         }
     }
     fn nested(
         code: Vec<Op>,
         vars: HashMap<String, Val>,
-        funcs: HashMap<String, (Vec<String>, Vec<Op>)>,
+        funcs: HashMap<String, FunctionDef>,
+        classes: HashMap<String, ClassDef>,
+        objects: Arc<Mutex<HashMap<u64, ObjectData>>>,
     ) -> Self {
         Self {
             code,
             ip: 0,
             stack: vec![],
             vars,
+            var_types: HashMap::new(),
             consts: HashSet::new(),
             funcs,
+            classes,
+            objects,
+            handlers: vec![],
         }
     }
     fn pop(&mut self) -> Result<Val, String> {
@@ -920,6 +1279,125 @@ impl Vm {
         } else {
             Err("numeric operands required".into())
         }
+    }
+    fn class_is_a(&self, class_name: &str, target: &str) -> bool {
+        let mut current = Some(class_name.to_string());
+        while let Some(name) = current {
+            if name == target {
+                return true;
+            }
+            current = self.classes.get(&name).and_then(|c| c.parent.clone());
+        }
+        false
+    }
+    fn value_matches(&self, value: &Val, ty: &str) -> bool {
+        match ty {
+            "Any" => true,
+            "Number" | "Float" => matches!(value, Val::Num(_)),
+            "Int" => matches!(value,Val::Num(n) if n.fract()==0.0),
+            "String" => matches!(value, Val::Str(_)),
+            "Bool" => matches!(value, Val::Bool(_)),
+            "List" => matches!(value, Val::List(_)),
+            "Map" => matches!(value, Val::Map(_)),
+            "Null" | "Void" => matches!(value, Val::Null),
+            "Object" => matches!(value, Val::Object(_)),
+            custom => match value {
+                Val::Object(id) => {
+                    let Ok(heap) = self.objects.lock() else {
+                        return false;
+                    };
+                    heap.get(id)
+                        .map(|o| self.class_is_a(&o.class_name, custom))
+                        .unwrap_or(false)
+                }
+                _ => false,
+            },
+        }
+    }
+    fn find_method(&self, class_name: &str, method: &str) -> Option<FunctionDef> {
+        let mut current = Some(class_name.to_string());
+        while let Some(name) = current {
+            let class = self.classes.get(&name)?;
+            if let Some(def) = class.methods.get(method) {
+                return Some(def.clone());
+            }
+            current = class.parent.clone();
+        }
+        None
+    }
+    fn call_def(&self, def: FunctionDef, args: Vec<Val>) -> Result<Val, String> {
+        if def.params.len() != args.len() {
+            return Err(format!(
+                "function expects {} arguments, got {}",
+                def.params.len(),
+                args.len()
+            ));
+        }
+        let mut vars = def.captures.clone();
+        let mut var_types = def.capture_types.clone();
+        let return_type = def.return_type.clone();
+        for ((param, ty), value) in def.params.into_iter().zip(args.into_iter()) {
+            if let Some(ref expected) = ty {
+                if !self.value_matches(&value, expected) {
+                    return Err(format!(
+                        "argument '{param}' expected {expected}, got {}",
+                        value.show()
+                    ));
+                }
+                var_types.insert(param.clone(), expected.clone());
+            }
+            vars.insert(param, value);
+        }
+        let mut nested = Vm::nested(
+            def.code,
+            vars,
+            self.funcs.clone(),
+            self.classes.clone(),
+            self.objects.clone(),
+        );
+        nested.var_types = var_types;
+        let result = nested.execute()?;
+        if let Some(expected) = return_type {
+            if !self.value_matches(&result, &expected) {
+                return Err(format!(
+                    "return value expected {expected}, got {}",
+                    result.show()
+                ));
+            }
+        }
+        Ok(result)
+    }
+    fn instantiate(&self, class_name: &str, args: Vec<Val>) -> Result<Val, String> {
+        if !self.classes.contains_key(class_name) {
+            return Err(format!("unknown class '{class_name}'"));
+        }
+        let id = OBJECT_IDS.fetch_add(1, Ordering::Relaxed);
+        self.objects
+            .lock()
+            .map_err(|_| "object heap poisoned")?
+            .insert(
+                id,
+                ObjectData {
+                    class_name: class_name.to_string(),
+                    fields: HashMap::new(),
+                },
+            );
+        if let Some(init) = self.find_method(class_name, "init") {
+            let mut call_args = vec![Val::Object(id)];
+            call_args.extend(args);
+            let _ = self.call_def(init, call_args)?;
+        } else if !args.is_empty() {
+            return Err(format!("{class_name} has no init method"));
+        }
+        Ok(Val::Object(id))
+    }
+    fn invoke(&self, name: &str, args: Vec<Val>) -> Result<Val, String> {
+        let def = self
+            .funcs
+            .get(name)
+            .cloned()
+            .ok_or(format!("unknown function '{name}'"))?;
+        self.call_def(def, args)
     }
     fn run(&mut self) -> Result<(), String> {
         self.execute().map(|_| ())
@@ -940,10 +1418,19 @@ impl Vm {
                         .cloned()
                         .ok_or(format!("undefined name '{n}'"))?,
                 ),
-                Op::Define(n, is_const) => {
+                Op::Define(n, is_const, ty) => {
                     let v = self.pop()?;
                     if self.vars.contains_key(&n) {
                         return Err(format!("name '{n}' already defined"));
+                    }
+                    if let Some(ref expected) = ty {
+                        if !self.value_matches(&v, expected) {
+                            return Err(format!(
+                                "declaration '{n}' expected {expected}, got {}",
+                                v.show()
+                            ));
+                        }
+                        self.var_types.insert(n.clone(), expected.clone());
                     }
                     self.vars.insert(n.clone(), v);
                     if is_const {
@@ -955,6 +1442,14 @@ impl Vm {
                         return Err(format!("cannot assign to constant '{n}'"));
                     }
                     let v = self.pop()?;
+                    if let Some(expected) = self.var_types.get(&n).cloned() {
+                        if !self.value_matches(&v, &expected) {
+                            return Err(format!(
+                                "assignment '{n}' expected {expected}, got {}",
+                                v.show()
+                            ));
+                        }
+                    }
                     self.vars.insert(n, v);
                 }
                 Op::Pop => {
@@ -1046,6 +1541,62 @@ impl Vm {
                     };
                     self.stack.push(value);
                 }
+                Op::GetMember(name) => {
+                    let obj = self.pop()?;
+                    let value = match obj {
+                        Val::Object(id) => {
+                            let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                            let data = heap.get(&id).ok_or("dangling object")?;
+                            data.fields
+                                .get(&name)
+                                .cloned()
+                                .ok_or(format!("undefined field '{name}'"))?
+                        }
+                        Val::Map(pairs) => pairs
+                            .iter()
+                            .find(|(k, _)| *k == Val::Str(name.clone()))
+                            .map(|(_, v)| v.clone())
+                            .ok_or(format!("undefined key '{name}'"))?,
+                        _ => return Err("member access requires object or map".into()),
+                    };
+                    self.stack.push(value);
+                }
+                Op::SetMember(name) => {
+                    let value = self.pop()?;
+                    let obj = self.pop()?;
+                    match obj {
+                        Val::Object(id) => {
+                            let mut heap =
+                                self.objects.lock().map_err(|_| "object heap poisoned")?;
+                            let data = heap.get_mut(&id).ok_or("dangling object")?;
+                            data.fields.insert(name, value);
+                        }
+                        _ => return Err("member assignment requires object".into()),
+                    }
+                }
+                Op::CallMethod(name, k) => {
+                    let mut args = vec![];
+                    for _ in 0..k {
+                        args.push(self.pop()?);
+                    }
+                    args.reverse();
+                    let receiver = self.pop()?;
+                    let id = match receiver {
+                        Val::Object(id) => id,
+                        _ => return Err("method call requires object".into()),
+                    };
+                    let class_name = {
+                        let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                        heap.get(&id).ok_or("dangling object")?.class_name.clone()
+                    };
+                    let method = self
+                        .find_method(&class_name, &name)
+                        .ok_or(format!("undefined method '{name}' on {class_name}"))?;
+                    let mut call_args = vec![Val::Object(id)];
+                    call_args.extend(args);
+                    let value = self.call_def(method, call_args)?;
+                    self.stack.push(value);
+                }
                 Op::JumpIfFalse(p) => {
                     let a = self.pop()?;
                     if !a.truthy() {
@@ -1080,6 +1631,171 @@ impl Vm {
                                 return Err("str expects 1 argument".into());
                             }
                             Val::Str(a[0].show())
+                        }
+                        "type_of" => {
+                            if a.len() != 1 {
+                                return Err("type_of expects 1 argument".into());
+                            }
+                            let name = match &a[0] {
+                                Val::Num(n) => {
+                                    if n.fract() == 0.0 {
+                                        "Int".to_string()
+                                    } else {
+                                        "Number".to_string()
+                                    }
+                                }
+                                Val::Str(_) => "String".to_string(),
+                                Val::Bool(_) => "Bool".to_string(),
+                                Val::Null => "Null".to_string(),
+                                Val::List(_) => "List".to_string(),
+                                Val::Map(_) => "Map".to_string(),
+                                Val::Object(id) => {
+                                    let heap =
+                                        self.objects.lock().map_err(|_| "object heap poisoned")?;
+                                    heap.get(id)
+                                        .map(|o| o.class_name.clone())
+                                        .unwrap_or_else(|| "Object".into())
+                                }
+                            };
+                            Val::Str(name)
+                        }
+                        "is_instance" => {
+                            if a.len() != 2 {
+                                return Err("is_instance expects value,type".into());
+                            }
+                            let ty = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("type must be String".into()),
+                            };
+                            Val::Bool(self.value_matches(&a[0], ty))
+                        }
+                        "has_field" => {
+                            if a.len() != 2 {
+                                return Err("has_field expects object,name".into());
+                            }
+                            let id = match a[0] {
+                                Val::Object(id) => id,
+                                _ => return Err("has_field expects Object".into()),
+                            };
+                            let name = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("field name must be String".into()),
+                            };
+                            let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                            Val::Bool(
+                                heap.get(&id)
+                                    .map(|o| o.fields.contains_key(name))
+                                    .unwrap_or(false),
+                            )
+                        }
+                        "int" => {
+                            if a.len() != 1 {
+                                return Err("int expects 1 argument".into());
+                            }
+                            Val::Num(match &a[0] {
+                                Val::Num(n) => n.trunc(),
+                                Val::Bool(b) => {
+                                    if *b {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
+                                }
+                                Val::Str(s) => s
+                                    .trim()
+                                    .parse::<f64>()
+                                    .map_err(|_| "int could not parse String")?
+                                    .trunc(),
+                                _ => return Err("int supports Number/Bool/String".into()),
+                            })
+                        }
+                        "float" => {
+                            if a.len() != 1 {
+                                return Err("float expects 1 argument".into());
+                            }
+                            Val::Num(match &a[0] {
+                                Val::Num(n) => *n,
+                                Val::Bool(b) => {
+                                    if *b {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
+                                }
+                                Val::Str(s) => s
+                                    .trim()
+                                    .parse::<f64>()
+                                    .map_err(|_| "float could not parse String")?,
+                                _ => return Err("float supports Number/Bool/String".into()),
+                            })
+                        }
+                        "bool" => {
+                            if a.len() != 1 {
+                                return Err("bool expects 1 argument".into());
+                            }
+                            Val::Bool(a[0].truthy())
+                        }
+                        "assert" => {
+                            if a.is_empty() || a.len() > 2 {
+                                return Err("assert expects condition[,message]".into());
+                            }
+                            if !a[0].truthy() {
+                                let message = if a.len() == 2 {
+                                    a[1].show()
+                                } else {
+                                    "assertion failed".into()
+                                };
+                                return Err(message);
+                            }
+                            Val::Null
+                        }
+                        "sum" => {
+                            if a.len() != 1 {
+                                return Err("sum expects list".into());
+                            }
+                            Val::Num(as_num_list(&a[0])?.iter().sum())
+                        }
+                        "min" => {
+                            if a.len() != 1 {
+                                return Err("min expects list".into());
+                            }
+                            let xs = as_num_list(&a[0])?;
+                            Val::Num(
+                                xs.into_iter()
+                                    .reduce(f64::min)
+                                    .ok_or("min requires non-empty list")?,
+                            )
+                        }
+                        "max" => {
+                            if a.len() != 1 {
+                                return Err("max expects list".into());
+                            }
+                            let xs = as_num_list(&a[0])?;
+                            Val::Num(
+                                xs.into_iter()
+                                    .reduce(f64::max)
+                                    .ok_or("max requires non-empty list")?,
+                            )
+                        }
+                        "all" => {
+                            if a.len() != 1 {
+                                return Err("all expects list".into());
+                            }
+                            let xs = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("all expects List".into()),
+                            };
+                            Val::Bool(xs.iter().all(Val::truthy))
+                        }
+                        "any" => {
+                            if a.len() != 1 {
+                                return Err("any expects list".into());
+                            }
+                            let xs = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("any expects List".into()),
+                            };
+                            Val::Bool(xs.iter().any(Val::truthy))
                         }
                         "__list" => Val::List(a),
                         "__map" => {
@@ -1128,6 +1844,268 @@ impl Vm {
                                 }
                                 _ => return Err("values expects a map".into()),
                             }
+                        }
+                        "tuple" => {
+                            if a.len() != 1 {
+                                return Err("tuple expects list".into());
+                            }
+                            match &a[0] {
+                                Val::List(v) => Val::List(v.clone()),
+                                _ => return Err("tuple expects List".into()),
+                            }
+                        }
+                        "set" => {
+                            if a.len() != 1 {
+                                return Err("set expects list".into());
+                            }
+                            let xs = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("set expects List".into()),
+                            };
+                            let mut out = vec![];
+                            for x in xs {
+                                if !out.contains(x) {
+                                    out.push(x.clone());
+                                }
+                            }
+                            Val::List(out)
+                        }
+                        "contains" => {
+                            if a.len() != 2 {
+                                return Err("contains expects collection,value".into());
+                            }
+                            Val::Bool(match &a[0] {
+                                Val::List(v) => v.contains(&a[1]),
+                                Val::Str(s) => match &a[1] {
+                                    Val::Str(x) => s.contains(x),
+                                    _ => false,
+                                },
+                                Val::Map(p) => p.iter().any(|(k, _)| *k == a[1]),
+                                _ => return Err("contains supports List/String/Map".into()),
+                            })
+                        }
+                        "index_of" => {
+                            if a.len() != 2 {
+                                return Err("index_of expects collection,value".into());
+                            }
+                            match &a[0] {
+                                Val::List(v) => v
+                                    .iter()
+                                    .position(|x| x == &a[1])
+                                    .map(|i| Val::Num(i as f64))
+                                    .unwrap_or(Val::Null),
+                                Val::Str(s) => match &a[1] {
+                                    Val::Str(x) => {
+                                        s.find(x).map(|i| Val::Num(i as f64)).unwrap_or(Val::Null)
+                                    }
+                                    _ => Val::Null,
+                                },
+                                _ => return Err("index_of supports List/String".into()),
+                            }
+                        }
+                        "append" => {
+                            if a.len() != 2 {
+                                return Err("append expects list,value".into());
+                            }
+                            let mut xs = match &a[0] {
+                                Val::List(v) => v.clone(),
+                                _ => return Err("append expects List".into()),
+                            };
+                            xs.push(a[1].clone());
+                            Val::List(xs)
+                        }
+                        "concat" => {
+                            if a.len() != 2 {
+                                return Err("concat expects two lists".into());
+                            }
+                            let mut x = match &a[0] {
+                                Val::List(v) => v.clone(),
+                                _ => return Err("concat expects Lists".into()),
+                            };
+                            let y = match &a[1] {
+                                Val::List(v) => v.clone(),
+                                _ => return Err("concat expects Lists".into()),
+                            };
+                            x.extend(y);
+                            Val::List(x)
+                        }
+                        "slice" => {
+                            if a.len() != 3 {
+                                return Err("slice expects value,start,end".into());
+                            }
+                            let start = match a[1] {
+                                Val::Num(n) => n.max(0.0) as usize,
+                                _ => return Err("start must be Number".into()),
+                            };
+                            let end = match a[2] {
+                                Val::Num(n) => n.max(0.0) as usize,
+                                _ => return Err("end must be Number".into()),
+                            };
+                            match &a[0] {
+                                Val::List(v) => Val::List(
+                                    v[start.min(v.len())..end.min(v.len()).max(start.min(v.len()))]
+                                        .to_vec(),
+                                ),
+                                Val::Str(s) => {
+                                    let chars: Vec<char> = s.chars().collect();
+                                    Val::Str(
+                                        chars[start.min(chars.len())
+                                            ..end.min(chars.len()).max(start.min(chars.len()))]
+                                            .iter()
+                                            .collect(),
+                                    )
+                                }
+                                _ => return Err("slice supports List/String".into()),
+                            }
+                        }
+                        "reverse" => {
+                            if a.len() != 1 {
+                                return Err("reverse expects list".into());
+                            }
+                            let mut xs = match &a[0] {
+                                Val::List(v) => v.clone(),
+                                _ => return Err("reverse expects List".into()),
+                            };
+                            xs.reverse();
+                            Val::List(xs)
+                        }
+                        "sort" => {
+                            if a.len() != 1 {
+                                return Err("sort expects list".into());
+                            }
+                            let mut xs = match &a[0] {
+                                Val::List(v) => v.clone(),
+                                _ => return Err("sort expects List".into()),
+                            };
+                            xs.sort_by(|x, y| match (x, y) {
+                                (Val::Num(a), Val::Num(b)) => {
+                                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                }
+                                (Val::Str(a), Val::Str(b)) => a.cmp(b),
+                                _ => std::cmp::Ordering::Equal,
+                            });
+                            Val::List(xs)
+                        }
+                        "unique" => {
+                            if a.len() != 1 {
+                                return Err("unique expects list".into());
+                            }
+                            let xs = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("unique expects List".into()),
+                            };
+                            let mut out = vec![];
+                            for x in xs {
+                                if !out.contains(x) {
+                                    out.push(x.clone());
+                                }
+                            }
+                            Val::List(out)
+                        }
+                        "enumerate" => {
+                            if a.len() != 1 {
+                                return Err("enumerate expects list".into());
+                            }
+                            let xs = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("enumerate expects List".into()),
+                            };
+                            Val::List(
+                                xs.iter()
+                                    .enumerate()
+                                    .map(|(i, v)| Val::List(vec![Val::Num(i as f64), v.clone()]))
+                                    .collect(),
+                            )
+                        }
+                        "zip" => {
+                            if a.len() != 2 {
+                                return Err("zip expects two lists".into());
+                            }
+                            let x = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("zip expects Lists".into()),
+                            };
+                            let y = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("zip expects Lists".into()),
+                            };
+                            Val::List(
+                                x.iter()
+                                    .zip(y.iter())
+                                    .map(|(a, b)| Val::List(vec![a.clone(), b.clone()]))
+                                    .collect(),
+                            )
+                        }
+                        "map_call" => {
+                            if a.len() != 2 {
+                                return Err("map_call expects function_name,list".into());
+                            }
+                            let name = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("function_name must be String".into()),
+                            };
+                            let xs = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("map_call expects List".into()),
+                            };
+                            let def = self
+                                .funcs
+                                .get(name)
+                                .cloned()
+                                .ok_or(format!("unknown function '{name}'"))?;
+                            let mut out = vec![];
+                            for x in xs {
+                                out.push(self.call_def(def.clone(), vec![x.clone()])?);
+                            }
+                            Val::List(out)
+                        }
+                        "filter_call" => {
+                            if a.len() != 2 {
+                                return Err("filter_call expects function_name,list".into());
+                            }
+                            let name = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("function_name must be String".into()),
+                            };
+                            let xs = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("filter_call expects List".into()),
+                            };
+                            let def = self
+                                .funcs
+                                .get(name)
+                                .cloned()
+                                .ok_or(format!("unknown function '{name}'"))?;
+                            let mut out = vec![];
+                            for x in xs {
+                                if self.call_def(def.clone(), vec![x.clone()])?.truthy() {
+                                    out.push(x.clone());
+                                }
+                            }
+                            Val::List(out)
+                        }
+                        "reduce_call" => {
+                            if a.len() != 3 {
+                                return Err("reduce_call expects function_name,list,initial".into());
+                            }
+                            let name = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("function_name must be String".into()),
+                            };
+                            let xs = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("reduce_call expects List".into()),
+                            };
+                            let def = self
+                                .funcs
+                                .get(name)
+                                .cloned()
+                                .ok_or(format!("unknown function '{name}'"))?;
+                            let mut acc = a[2].clone();
+                            for x in xs {
+                                acc = self.call_def(def.clone(), vec![acc, x.clone()])?;
+                            }
+                            acc
                         }
                         "json_stringify" => {
                             if a.len() != 1 {
@@ -1211,6 +2189,92 @@ impl Vm {
                             let v =
                                 xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / xs.len() as f64;
                             Val::Num(v.sqrt())
+                        }
+                        "vec_median" => {
+                            if a.len() != 1 {
+                                return Err("vec_median expects list".into());
+                            }
+                            let mut xs = as_num_list(&a[0])?;
+                            if xs.is_empty() {
+                                return Err("vec_median requires non-empty list".into());
+                            }
+                            xs.sort_by(|x, y| {
+                                x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let n = xs.len();
+                            Val::Num(if n % 2 == 1 {
+                                xs[n / 2]
+                            } else {
+                                (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+                            })
+                        }
+                        "vec_percentile" => {
+                            if a.len() != 2 {
+                                return Err("vec_percentile expects list,p".into());
+                            }
+                            let mut xs = as_num_list(&a[0])?;
+                            let p = match a[1] {
+                                Val::Num(n) => n.clamp(0.0, 100.0),
+                                _ => return Err("p must be Number".into()),
+                            };
+                            if xs.is_empty() {
+                                return Err("vec_percentile requires non-empty list".into());
+                            }
+                            xs.sort_by(|x, y| {
+                                x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let pos = (p / 100.0) * (xs.len() - 1) as f64;
+                            let lo = pos.floor() as usize;
+                            let hi = pos.ceil() as usize;
+                            let value = if lo == hi {
+                                xs[lo]
+                            } else {
+                                xs[lo] + (xs[hi] - xs[lo]) * (pos - lo as f64)
+                            };
+                            Val::Num(value)
+                        }
+                        "covariance" => {
+                            if a.len() != 2 {
+                                return Err("covariance expects two lists".into());
+                            }
+                            let x = as_num_list(&a[0])?;
+                            let y = as_num_list(&a[1])?;
+                            if x.len() != y.len() || x.is_empty() {
+                                return Err("covariance length mismatch".into());
+                            }
+                            let mx = x.iter().sum::<f64>() / x.len() as f64;
+                            let my = y.iter().sum::<f64>() / y.len() as f64;
+                            Val::Num(
+                                x.iter()
+                                    .zip(y.iter())
+                                    .map(|(a, b)| (a - mx) * (b - my))
+                                    .sum::<f64>()
+                                    / x.len() as f64,
+                            )
+                        }
+                        "correlation" => {
+                            if a.len() != 2 {
+                                return Err("correlation expects two lists".into());
+                            }
+                            let x = as_num_list(&a[0])?;
+                            let y = as_num_list(&a[1])?;
+                            if x.len() != y.len() || x.is_empty() {
+                                return Err("correlation length mismatch".into());
+                            }
+                            let mx = x.iter().sum::<f64>() / x.len() as f64;
+                            let my = y.iter().sum::<f64>() / y.len() as f64;
+                            let cov = x
+                                .iter()
+                                .zip(y.iter())
+                                .map(|(a, b)| (a - mx) * (b - my))
+                                .sum::<f64>();
+                            let sx = x.iter().map(|a| (a - mx) * (a - mx)).sum::<f64>().sqrt();
+                            let sy = y.iter().map(|b| (b - my) * (b - my)).sum::<f64>().sqrt();
+                            Val::Num(if sx == 0.0 || sy == 0.0 {
+                                0.0
+                            } else {
+                                cov / (sx * sy)
+                            })
                         }
                         "vec_dot" => {
                             if a.len() != 2 {
@@ -1659,6 +2723,244 @@ impl Vm {
                             fs::write(path, svg).map_err(|e| e.to_string())?;
                             Val::Null
                         }
+                        "logreg_fit" => {
+                            if a.len() != 4 {
+                                return Err(
+                                    "logreg_fit expects X,y,iterations,learning_rate".into()
+                                );
+                            }
+                            let x = as_matrix(&a[0])?;
+                            let y = as_num_list(&a[1])?;
+                            let iterations = match a[2] {
+                                Val::Num(n) => n.max(1.0) as usize,
+                                _ => return Err("iterations must be Number".into()),
+                            };
+                            let lr = match a[3] {
+                                Val::Num(n) => n,
+                                _ => return Err("learning_rate must be Number".into()),
+                            };
+                            if x.is_empty() || x.len() != y.len() {
+                                return Err("logreg_fit row mismatch".into());
+                            }
+                            let dims = x[0].len();
+                            if dims == 0 || x.iter().any(|r| r.len() != dims) {
+                                return Err("invalid feature matrix".into());
+                            }
+                            let mut w = vec![0.0; dims];
+                            let mut b = 0.0;
+                            for _ in 0..iterations {
+                                let mut gw = vec![0.0; dims];
+                                let mut gb = 0.0;
+                                for (row, target) in x.iter().zip(y.iter()) {
+                                    let z = b + w
+                                        .iter()
+                                        .zip(row.iter())
+                                        .map(|(wi, xi)| wi * xi)
+                                        .sum::<f64>();
+                                    let p = 1.0 / (1.0 + (-z).exp());
+                                    let e = p - target;
+                                    for j in 0..dims {
+                                        gw[j] += e * row[j];
+                                    }
+                                    gb += e;
+                                }
+                                let n = x.len() as f64;
+                                for j in 0..dims {
+                                    w[j] -= lr * gw[j] / n;
+                                }
+                                b -= lr * gb / n;
+                            }
+                            Val::Map(vec![
+                                (Val::Str("weights".into()), nums_to_val(w)),
+                                (Val::Str("bias".into()), Val::Num(b)),
+                            ])
+                        }
+                        "logreg_predict" => {
+                            if a.len() != 2 {
+                                return Err("logreg_predict expects model,features".into());
+                            }
+                            let model = match &a[0] {
+                                Val::Map(p) => p,
+                                _ => return Err("model must be Map".into()),
+                            };
+                            let features = as_num_list(&a[1])?;
+                            let weights = map_lookup(model, &Val::Str("weights".into()))
+                                .ok_or("model missing weights")?;
+                            let weights = as_num_list(weights)?;
+                            let bias = map_lookup(model, &Val::Str("bias".into()))
+                                .and_then(|v| if let Val::Num(n) = v { Some(*n) } else { None })
+                                .ok_or("model missing bias")?;
+                            if weights.len() != features.len() {
+                                return Err("logreg_predict dimension mismatch".into());
+                            }
+                            let z = bias
+                                + weights
+                                    .iter()
+                                    .zip(features.iter())
+                                    .map(|(w, x)| w * x)
+                                    .sum::<f64>();
+                            Val::Num(1.0 / (1.0 + (-z).exp()))
+                        }
+                        "table_group_count" => {
+                            if a.len() != 2 {
+                                return Err("table_group_count expects rows,name".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let key = match &a[1] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("name must be String".into()),
+                            };
+                            let mut groups: Vec<(Val, usize)> = vec![];
+                            for row in rows {
+                                let pairs = match row {
+                                    Val::Map(p) => p,
+                                    _ => return Err("rows must contain Maps".into()),
+                                };
+                                let value = map_lookup(pairs, &key).cloned().unwrap_or(Val::Null);
+                                if let Some((_, n)) = groups.iter_mut().find(|(v, _)| *v == value) {
+                                    *n += 1
+                                } else {
+                                    groups.push((value, 1))
+                                }
+                            }
+                            Val::List(
+                                groups
+                                    .into_iter()
+                                    .map(|(value, count)| {
+                                        Val::Map(vec![
+                                            (Val::Str("value".into()), value),
+                                            (Val::Str("count".into()), Val::Num(count as f64)),
+                                        ])
+                                    })
+                                    .collect(),
+                            )
+                        }
+                        "table_sort" => {
+                            if a.len() != 2 {
+                                return Err("table_sort expects rows,name".into());
+                            }
+                            let mut rows = match &a[0] {
+                                Val::List(v) => v.clone(),
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let key = match &a[1] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("name must be String".into()),
+                            };
+                            rows.sort_by(|ra, rb| {
+                                let av = if let Val::Map(p) = ra {
+                                    map_lookup(p, &key)
+                                } else {
+                                    None
+                                };
+                                let bv = if let Val::Map(p) = rb {
+                                    map_lookup(p, &key)
+                                } else {
+                                    None
+                                };
+                                match (av, bv) {
+                                    (Some(Val::Num(a)), Some(Val::Num(b))) => {
+                                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                    }
+                                    (Some(Val::Str(a)), Some(Val::Str(b))) => a.cmp(b),
+                                    _ => std::cmp::Ordering::Equal,
+                                }
+                            });
+                            Val::List(rows)
+                        }
+                        "table_select" => {
+                            if a.len() != 2 {
+                                return Err("table_select expects rows,names".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let names = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("names must be List".into()),
+                            };
+                            let keys: Result<Vec<String>, String> = names
+                                .iter()
+                                .map(|v| match v {
+                                    Val::Str(s) => Ok(s.clone()),
+                                    _ => Err("column names must be Strings".into()),
+                                })
+                                .collect();
+                            let keys = keys?;
+                            let mut out = vec![];
+                            for row in rows {
+                                let pairs = match row {
+                                    Val::Map(p) => p,
+                                    _ => return Err("rows must contain Maps".into()),
+                                };
+                                let mut selected = vec![];
+                                for name in &keys {
+                                    let k = Val::Str(name.clone());
+                                    selected.push((
+                                        k.clone(),
+                                        map_lookup(pairs, &k).cloned().unwrap_or(Val::Null),
+                                    ));
+                                }
+                                out.push(Val::Map(selected));
+                            }
+                            Val::List(out)
+                        }
+                        "table_inner_join" => {
+                            if a.len() != 4 {
+                                return Err(
+                                    "table_inner_join expects left,right,left_key,right_key".into(),
+                                );
+                            }
+                            let left = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("left must be List".into()),
+                            };
+                            let right = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("right must be List".into()),
+                            };
+                            let lk = match &a[2] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("left_key must be String".into()),
+                            };
+                            let rk = match &a[3] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("right_key must be String".into()),
+                            };
+                            let mut out = vec![];
+                            for lrow in left {
+                                let lp = match lrow {
+                                    Val::Map(p) => p,
+                                    _ => return Err("left rows must be Maps".into()),
+                                };
+                                let lv = map_lookup(lp, &lk);
+                                for rrow in right {
+                                    let rp = match rrow {
+                                        Val::Map(p) => p,
+                                        _ => return Err("right rows must be Maps".into()),
+                                    };
+                                    if lv.is_some() && lv == map_lookup(rp, &rk) {
+                                        let mut merged = lp.clone();
+                                        for (k, v) in rp {
+                                            let key =
+                                                if merged.iter().any(|(existing, _)| existing == k)
+                                                {
+                                                    Val::Str(format!("right.{}", k.show()))
+                                                } else {
+                                                    k.clone()
+                                                };
+                                            merged.push((key, v.clone()));
+                                        }
+                                        out.push(Val::Map(merged));
+                                    }
+                                }
+                            }
+                            Val::List(out)
+                        }
                         "csv_read" => {
                             if a.len() != 1 {
                                 return Err("csv_read expects path".into());
@@ -1972,20 +3274,6 @@ impl Vm {
                             };
                             Val::Str(xs.iter().map(Val::show).collect::<Vec<_>>().join(sep))
                         }
-                        "contains" => {
-                            if a.len() != 2 {
-                                return Err("contains expects container,value".into());
-                            }
-                            Val::Bool(match &a[0] {
-                                Val::Str(s) => match &a[1] {
-                                    Val::Str(x) => s.contains(x),
-                                    _ => false,
-                                },
-                                Val::List(xs) => xs.contains(&a[1]),
-                                Val::Map(pairs) => pairs.iter().any(|(k, _)| *k == a[1]),
-                                _ => false,
-                            })
-                        }
                         "read_file" => {
                             if a.len() != 1 {
                                 return Err("read_file expects path".into());
@@ -2106,6 +3394,43 @@ impl Vm {
                                 .map_err(|e| e.to_string())?;
                             Val::Str(text)
                         }
+                        "http_post" => {
+                            if a.len() != 2 {
+                                return Err("http_post expects url,body".into());
+                            }
+                            let url = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("url must be String".into()),
+                            };
+                            let body = match &a[1] {
+                                Val::Str(s) => s.clone(),
+                                other => json_stringify_value(other)?,
+                            };
+                            let text = reqwest::blocking::Client::new()
+                                .post(url)
+                                .body(body)
+                                .send()
+                                .map_err(|e| e.to_string())?
+                                .text()
+                                .map_err(|e| e.to_string())?;
+                            Val::Str(text)
+                        }
+                        "sleep_ms" => {
+                            if a.len() != 1 {
+                                return Err("sleep_ms expects milliseconds".into());
+                            }
+                            let ms = match a[0] {
+                                Val::Num(n) => n.max(0.0) as u64,
+                                _ => return Err("milliseconds must be Number".into()),
+                            };
+                            thread::sleep(std::time::Duration::from_millis(ms));
+                            Val::Null
+                        }
+                        "cpu_count" => Val::Num(
+                            thread::available_parallelism()
+                                .map(|n| n.get())
+                                .unwrap_or(1) as f64,
+                        ),
                         "sqlite_exec" => {
                             if a.len() != 2 {
                                 return Err("sqlite_exec expects path,sql".into());
@@ -2166,33 +3491,433 @@ impl Vm {
                             }
                             Val::List(out)
                         }
-                        _ => {
-                            let (params, code) = self
+                        "spawn" => {
+                            if a.len() != 2 {
+                                return Err("spawn expects function_name,args".into());
+                            }
+                            let name = match &a[0] {
+                                Val::Str(s) => s.clone(),
+                                _ => return Err("spawn function_name must be String".into()),
+                            };
+                            let args = match &a[1] {
+                                Val::List(v) => v.clone(),
+                                _ => return Err("spawn args must be List".into()),
+                            };
+                            let def = self
                                 .funcs
-                                .get(&n)
+                                .get(&name)
                                 .cloned()
-                                .ok_or(format!("unknown function '{n}'"))?;
-                            if params.len() != a.len() {
+                                .ok_or(format!("unknown function '{name}'"))?;
+                            if def.params.len() != args.len() {
                                 return Err(format!(
-                                    "{n} expects {} arguments, got {}",
-                                    params.len(),
-                                    a.len()
+                                    "{name} expects {} arguments, got {}",
+                                    def.params.len(),
+                                    args.len()
                                 ));
                             }
-                            let mut vars = self.vars.clone();
-                            for (param, value) in params.into_iter().zip(a.into_iter()) {
-                                vars.insert(param, value);
+                            for ((param, ty), value) in def.params.iter().zip(args.iter()) {
+                                if let Some(expected) = ty {
+                                    if !self.value_matches(value, expected) {
+                                        return Err(format!(
+                                            "argument '{param}' expected {expected}, got {}",
+                                            value.show()
+                                        ));
+                                    }
+                                }
                             }
-                            let mut nested = Vm::nested(code, vars, self.funcs.clone());
-                            nested.execute()?
+                            let funcs = self.funcs.clone();
+                            let classes = self.classes.clone();
+                            let objects = self.objects.clone();
+                            let id = TASK_IDS.fetch_add(1, Ordering::Relaxed);
+                            let handle = thread::spawn(move || {
+                                let mut vars = def.captures.clone();
+                                let mut var_types = def.capture_types.clone();
+                                let return_type = def.return_type.clone();
+                                for ((param, ty), value) in
+                                    def.params.into_iter().zip(args.into_iter())
+                                {
+                                    if let Some(expected) = ty {
+                                        var_types.insert(param.clone(), expected);
+                                    }
+                                    vars.insert(param, value);
+                                }
+                                let mut nested =
+                                    Vm::nested(def.code, vars, funcs, classes, objects);
+                                nested.var_types = var_types;
+                                let result = nested.execute()?;
+                                if let Some(expected) = return_type {
+                                    if !nested.value_matches(&result, &expected) {
+                                        return Err(format!(
+                                            "task return value expected {expected}, got {}",
+                                            result.show()
+                                        ));
+                                    }
+                                }
+                                Ok(result)
+                            });
+                            tasks()
+                                .lock()
+                                .map_err(|_| "task registry poisoned")?
+                                .insert(id, handle);
+                            Val::Num(id as f64)
+                        }
+                        "task_done" => {
+                            if a.len() != 1 {
+                                return Err("task_done expects task id".into());
+                            }
+                            let id = match a[0] {
+                                Val::Num(n) => n as u64,
+                                _ => return Err("task id must be Number".into()),
+                            };
+                            let guard = tasks().lock().map_err(|_| "task registry poisoned")?;
+                            Val::Bool(guard.get(&id).map(|h| h.is_finished()).unwrap_or(true))
+                        }
+                        "await_task" => {
+                            if a.len() != 1 {
+                                return Err("await_task expects task id".into());
+                            }
+                            let id = match a[0] {
+                                Val::Num(n) => n as u64,
+                                _ => return Err("task id must be Number".into()),
+                            };
+                            let handle = tasks()
+                                .lock()
+                                .map_err(|_| "task registry poisoned")?
+                                .remove(&id)
+                                .ok_or(format!("unknown task {id}"))?;
+                            handle.join().map_err(|_| "task panicked".to_string())??
+                        }
+                        "channel" => {
+                            if !a.is_empty() {
+                                return Err("channel expects no arguments".into());
+                            }
+                            let (tx, rx) = mpsc::channel::<Val>();
+                            let id = CHANNEL_IDS.fetch_add(1, Ordering::Relaxed);
+                            channels()
+                                .lock()
+                                .map_err(|_| "channel registry poisoned")?
+                                .insert(id, (tx, Arc::new(Mutex::new(rx))));
+                            Val::Num(id as f64)
+                        }
+                        "send" => {
+                            if a.len() != 2 {
+                                return Err("send expects channel,value".into());
+                            }
+                            let id = match a[0] {
+                                Val::Num(n) => n as u64,
+                                _ => return Err("channel id must be Number".into()),
+                            };
+                            let tx = channels()
+                                .lock()
+                                .map_err(|_| "channel registry poisoned")?
+                                .get(&id)
+                                .map(|(tx, _)| tx.clone())
+                                .ok_or(format!("unknown channel {id}"))?;
+                            tx.send(a[1].clone()).map_err(|e| e.to_string())?;
+                            Val::Null
+                        }
+                        "recv" => {
+                            if a.len() != 1 {
+                                return Err("recv expects channel".into());
+                            }
+                            let id = match a[0] {
+                                Val::Num(n) => n as u64,
+                                _ => return Err("channel id must be Number".into()),
+                            };
+                            let rx = channels()
+                                .lock()
+                                .map_err(|_| "channel registry poisoned")?
+                                .get(&id)
+                                .map(|(_, rx)| rx.clone())
+                                .ok_or(format!("unknown channel {id}"))?;
+                            let value = rx
+                                .lock()
+                                .map_err(|_| "channel receiver poisoned")?
+                                .recv()
+                                .map_err(|e| e.to_string())?;
+                            value
+                        }
+                        "try_recv" => {
+                            if a.len() != 1 {
+                                return Err("try_recv expects channel".into());
+                            }
+                            let id = match a[0] {
+                                Val::Num(n) => n as u64,
+                                _ => return Err("channel id must be Number".into()),
+                            };
+                            let rx = channels()
+                                .lock()
+                                .map_err(|_| "channel registry poisoned")?
+                                .get(&id)
+                                .map(|(_, rx)| rx.clone())
+                                .ok_or(format!("unknown channel {id}"))?;
+                            match rx
+                                .lock()
+                                .map_err(|_| "channel receiver poisoned")?
+                                .try_recv()
+                            {
+                                Ok(v) => v,
+                                Err(TryRecvError::Empty) => Val::Null,
+                                Err(TryRecvError::Disconnected) => {
+                                    return Err("channel disconnected".into());
+                                }
+                            }
+                        }
+                        "ffi_available" => {
+                            if a.len() != 1 {
+                                return Err("ffi_available expects library path".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("library path must be String".into()),
+                            };
+                            Val::Bool(unsafe { Library::new(path) }.is_ok())
+                        }
+                        "ffi_i32" => {
+                            if a.len() != 3 {
+                                return Err("ffi_i32 expects library,symbol,args".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("library path must be String".into()),
+                            };
+                            let symbol = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("symbol must be String".into()),
+                            };
+                            let vals = match &a[2] {
+                                Val::List(v) => v,
+                                _ => return Err("ffi args must be List".into()),
+                            };
+                            let nums: Result<Vec<i32>, String> = vals
+                                .iter()
+                                .map(|v| match v {
+                                    Val::Num(n) => Ok(*n as i32),
+                                    _ => Err("ffi_i32 arguments must be Numbers".into()),
+                                })
+                                .collect();
+                            let nums = nums?;
+                            let mut sym = symbol.as_bytes().to_vec();
+                            sym.push(0);
+                            let lib = unsafe { Library::new(path) }.map_err(|e| e.to_string())?;
+                            let result: i32 = unsafe {
+                                match nums.as_slice() {
+                                    [] => {
+                                        let f: libloading::Symbol<unsafe extern "C" fn() -> i32> =
+                                            lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f()
+                                    }
+                                    [a] => {
+                                        let f: libloading::Symbol<
+                                            unsafe extern "C" fn(i32) -> i32,
+                                        > = lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f(*a)
+                                    }
+                                    [a, b] => {
+                                        let f: libloading::Symbol<
+                                            unsafe extern "C" fn(i32, i32) -> i32,
+                                        > = lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f(*a, *b)
+                                    }
+                                    [a, b, c] => {
+                                        let f: libloading::Symbol<
+                                            unsafe extern "C" fn(i32, i32, i32) -> i32,
+                                        > = lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f(*a, *b, *c)
+                                    }
+                                    [a, b, c, e] => {
+                                        let f: libloading::Symbol<
+                                            unsafe extern "C" fn(i32, i32, i32, i32) -> i32,
+                                        > = lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f(*a, *b, *c, *e)
+                                    }
+                                    _ => {
+                                        return Err(
+                                            "ffi_i32 supports 0..4 integer arguments".into()
+                                        );
+                                    }
+                                }
+                            };
+                            Val::Num(result as f64)
+                        }
+                        "ffi_i64" => {
+                            if a.len() != 3 {
+                                return Err("ffi_i64 expects library,symbol,args".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("library path must be String".into()),
+                            };
+                            let symbol = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("symbol must be String".into()),
+                            };
+                            let vals = match &a[2] {
+                                Val::List(v) => v,
+                                _ => return Err("ffi args must be List".into()),
+                            };
+                            let nums: Result<Vec<i64>, String> = vals
+                                .iter()
+                                .map(|v| match v {
+                                    Val::Num(n) => Ok(*n as i64),
+                                    _ => Err("ffi_i64 arguments must be Numbers".into()),
+                                })
+                                .collect();
+                            let nums = nums?;
+                            let mut sym = symbol.as_bytes().to_vec();
+                            sym.push(0);
+                            let lib = unsafe { Library::new(path) }.map_err(|e| e.to_string())?;
+                            let result: i64 = unsafe {
+                                match nums.as_slice() {
+                                    [] => {
+                                        let f: libloading::Symbol<unsafe extern "C" fn() -> i64> =
+                                            lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f()
+                                    }
+                                    [a] => {
+                                        let f: libloading::Symbol<
+                                            unsafe extern "C" fn(i64) -> i64,
+                                        > = lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f(*a)
+                                    }
+                                    [a, b] => {
+                                        let f: libloading::Symbol<
+                                            unsafe extern "C" fn(i64, i64) -> i64,
+                                        > = lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f(*a, *b)
+                                    }
+                                    _ => {
+                                        return Err(
+                                            "ffi_i64 supports 0..2 integer arguments".into()
+                                        );
+                                    }
+                                }
+                            };
+                            Val::Num(result as f64)
+                        }
+                        "ffi_f64" => {
+                            if a.len() != 3 {
+                                return Err("ffi_f64 expects library,symbol,args".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("library path must be String".into()),
+                            };
+                            let symbol = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("symbol must be String".into()),
+                            };
+                            let vals = match &a[2] {
+                                Val::List(v) => v,
+                                _ => return Err("ffi args must be List".into()),
+                            };
+                            let nums: Result<Vec<f64>, String> = vals
+                                .iter()
+                                .map(|v| match v {
+                                    Val::Num(n) => Ok(*n),
+                                    _ => Err("ffi_f64 arguments must be Numbers".into()),
+                                })
+                                .collect();
+                            let nums = nums?;
+                            let mut sym = symbol.as_bytes().to_vec();
+                            sym.push(0);
+                            let lib = unsafe { Library::new(path) }.map_err(|e| e.to_string())?;
+                            let result: f64 = unsafe {
+                                match nums.as_slice() {
+                                    [] => {
+                                        let f: libloading::Symbol<unsafe extern "C" fn() -> f64> =
+                                            lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f()
+                                    }
+                                    [a] => {
+                                        let f: libloading::Symbol<
+                                            unsafe extern "C" fn(f64) -> f64,
+                                        > = lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f(*a)
+                                    }
+                                    [a, b] => {
+                                        let f: libloading::Symbol<
+                                            unsafe extern "C" fn(f64, f64) -> f64,
+                                        > = lib.get(&sym).map_err(|e| e.to_string())?;
+                                        f(*a, *b)
+                                    }
+                                    _ => {
+                                        return Err(
+                                            "ffi_f64 supports 0..2 floating arguments".into()
+                                        );
+                                    }
+                                }
+                            };
+                            Val::Num(result)
+                        }
+                        _ => {
+                            if self.classes.contains_key(&n) {
+                                self.instantiate(&n, a)?
+                            } else {
+                                let def = self
+                                    .funcs
+                                    .get(&n)
+                                    .cloned()
+                                    .ok_or(format!("unknown function or class '{n}'"))?;
+                                self.call_def(def, a)?
+                            }
                         }
                     };
                     self.stack.push(v);
                 }
-                Op::Def(name, params, code) => {
-                    self.funcs.insert(name, (params, code));
+                Op::Def(name, params, return_type, code) => {
+                    self.funcs.insert(
+                        name,
+                        FunctionDef {
+                            params,
+                            return_type,
+                            code,
+                            captures: self.vars.clone(),
+                            capture_types: self.var_types.clone(),
+                        },
+                    );
+                }
+                Op::DefClass(name, parent, methods) => {
+                    if let Some(ref p) = parent {
+                        if !self.classes.contains_key(p) {
+                            return Err(format!("unknown parent class '{p}'"));
+                        }
+                    }
+                    let mut compiled = HashMap::new();
+                    for (method, params, return_type, code) in methods {
+                        compiled.insert(
+                            method,
+                            FunctionDef {
+                                params,
+                                return_type,
+                                code,
+                                captures: self.vars.clone(),
+                                capture_types: self.var_types.clone(),
+                            },
+                        );
+                    }
+                    self.classes.insert(
+                        name,
+                        ClassDef {
+                            parent,
+                            methods: compiled,
+                        },
+                    );
                 }
                 Op::Return => return self.pop(),
+                Op::PushHandler(target, name) => self.handlers.push((target, name)),
+                Op::PopHandler => {
+                    let _ = self.handlers.pop();
+                }
+                Op::Throw => {
+                    let value = self.pop()?;
+                    if let Some((target, name)) = self.handlers.pop() {
+                        self.vars.insert(name, value);
+                        self.ip = target;
+                    } else {
+                        return Err(format!("uncaught throw: {}", value.show()));
+                    }
+                }
                 Op::Halt => return Ok(Val::Null),
             }
         }
@@ -2255,13 +3980,155 @@ fn load_source(path: &str) -> Result<String, String> {
     load(Path::new(path), &mut HashSet::new())
 }
 
+fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
+    fn known(scopes: &[HashSet<String>], name: &str) -> bool {
+        scopes.iter().rev().any(|s| s.contains(name))
+    }
+    fn check_expr(e: &Expr, scopes: &[HashSet<String>], errors: &mut Vec<String>) {
+        match e {
+            Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => {}
+            Expr::Var(n) => {
+                if !known(scopes, n) {
+                    errors.push(format!("undefined name '{n}'"));
+                }
+            }
+            Expr::List(xs) => {
+                for x in xs {
+                    check_expr(x, scopes, errors)
+                }
+            }
+            Expr::Map(xs) => {
+                for (k, v) in xs {
+                    check_expr(k, scopes, errors);
+                    check_expr(v, scopes, errors)
+                }
+            }
+            Expr::Index(a, b) | Expr::Bin(a, _, b) => {
+                check_expr(a, scopes, errors);
+                check_expr(b, scopes, errors)
+            }
+            Expr::Member(obj, _) => check_expr(obj, scopes, errors),
+            Expr::MethodCall(obj, _, args) => {
+                check_expr(obj, scopes, errors);
+                for a in args {
+                    check_expr(a, scopes, errors)
+                }
+            }
+            Expr::Unary(_, x) | Expr::Await(x) => check_expr(x, scopes, errors),
+            Expr::Call(_, args) => {
+                for a in args {
+                    check_expr(a, scopes, errors)
+                }
+            }
+        }
+    }
+    fn check_block(stmts: &[Stmt], parent: &[HashSet<String>], errors: &mut Vec<String>) {
+        let mut scopes = parent.to_vec();
+        let mut local = HashSet::new();
+        for s in stmts {
+            match s {
+                Stmt::Fn(n, _, _, _) | Stmt::Class(n, _, _) => {
+                    local.insert(n.clone());
+                }
+                _ => {}
+            }
+        }
+        scopes.push(local);
+        for s in stmts {
+            match s {
+                Stmt::Let(n, _, e, _) => {
+                    check_expr(e, &scopes, errors);
+                    let current = scopes.last_mut().unwrap();
+                    if current.contains(n) {
+                        errors.push(format!("duplicate declaration '{n}'"));
+                    } else {
+                        current.insert(n.clone());
+                    }
+                }
+                Stmt::Assign(n, e) => {
+                    if !known(&scopes, n) {
+                        errors.push(format!("assignment to undefined name '{n}'"));
+                    }
+                    check_expr(e, &scopes, errors);
+                }
+                Stmt::Expr(e) | Stmt::Throw(e) => check_expr(e, &scopes, errors),
+                Stmt::SetMember(obj, _, value) => {
+                    check_expr(obj, &scopes, errors);
+                    check_expr(value, &scopes, errors);
+                }
+                Stmt::If(c, a, b) => {
+                    check_expr(c, &scopes, errors);
+                    check_block(a, &scopes, errors);
+                    check_block(b, &scopes, errors);
+                }
+                Stmt::While(c, b) => {
+                    check_expr(c, &scopes, errors);
+                    check_block(b, &scopes, errors);
+                }
+                Stmt::ForRange(n, a, b, body) => {
+                    check_expr(a, &scopes, errors);
+                    check_expr(b, &scopes, errors);
+                    let mut nested = scopes.clone();
+                    nested.push(HashSet::from([n.clone()]));
+                    check_block(body, &nested, errors);
+                }
+                Stmt::ForEach(n, e, body) => {
+                    check_expr(e, &scopes, errors);
+                    let mut nested = scopes.clone();
+                    nested.push(HashSet::from([n.clone()]));
+                    check_block(body, &nested, errors);
+                }
+                Stmt::Try(body, n, handler) => {
+                    check_block(body, &scopes, errors);
+                    let mut nested = scopes.clone();
+                    nested.push(HashSet::from([n.clone()]));
+                    check_block(handler, &nested, errors);
+                }
+                Stmt::Fn(_, params, _, body) => {
+                    let mut nested = scopes.clone();
+                    nested.push(params.iter().map(|(name, _)| name.clone()).collect());
+                    check_block(body, &nested, errors);
+                }
+                Stmt::Class(_, _, body) => {
+                    for method in body {
+                        if let Stmt::Fn(_, params, _, method_body) = method {
+                            let mut nested = scopes.clone();
+                            nested.push(params.iter().map(|(name, _)| name.clone()).collect());
+                            check_block(method_body, &nested, errors);
+                        }
+                    }
+                }
+                Stmt::Return(Some(e)) => check_expr(e, &scopes, errors),
+                Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
+            }
+        }
+    }
+    let root = HashSet::new();
+    let mut errors = vec![];
+    check_block(ast, &[root], &mut errors);
+    errors.sort();
+    errors.dedup();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("semantic errors: {}", errors.join("; ")))
+    }
+}
+
 fn compile_source(src: &str) -> Result<Vec<Op>, String> {
     let t = lex(src)?;
     let ast = Parser::new(t).program()?;
+    semantic_check_ast(&ast)?;
     let mut c = Compiler::new();
     c.emit_stmts(&ast)?;
     Ok(c.finish())
 }
+fn prepare_vm(src: &str) -> Result<Vm, String> {
+    let mut vm = Vm::new(compile_source(src)?);
+    let _ = vm.execute()?;
+    Ok(vm)
+}
+
 fn run_source(src: &str) -> Result<(), String> {
     Vm::new(compile_source(src)?).run()
 }
@@ -2271,6 +4138,126 @@ fn disasm_source(src: &str) -> Result<(), String> {
     for (i, op) in code.iter().enumerate() {
         println!("{i:04}  {op:?}");
     }
+    Ok(())
+}
+
+fn lint_file(path: &Path) -> Result<(), String> {
+    let src = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let loaded = load_source(path.to_string_lossy().as_ref())?;
+    compile_source(&loaded)?;
+    let mut issues = vec![];
+    for (i, line) in src.lines().enumerate() {
+        if line.contains('\t') {
+            issues.push(format!("{}:{}: tab character", path.display(), i + 1));
+        }
+        if line.len() > 120 {
+            issues.push(format!(
+                "{}:{}: line exceeds 120 characters",
+                path.display(),
+                i + 1
+            ));
+        }
+        if line.trim_end() != line {
+            issues.push(format!("{}:{}: trailing whitespace", path.display(), i + 1));
+        }
+    }
+    if issues.is_empty() {
+        println!("{}: lint OK", path.display());
+        Ok(())
+    } else {
+        for issue in &issues {
+            println!("{issue}");
+        }
+        Err(format!("{} lint issue(s)", issues.len()))
+    }
+}
+
+fn bench_file(path: &Path, iterations: usize) -> Result<(), String> {
+    let src = load_source(path.to_string_lossy().as_ref())?;
+    let code = compile_source(&src)?;
+    let n = iterations.max(1);
+    let mut times = Vec::with_capacity(n);
+    for _ in 0..n {
+        let start = Instant::now();
+        Vm::new(code.clone()).run()?;
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    let best = times.iter().copied().fold(f64::INFINITY, f64::min);
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    println!(
+        "{}: {n} run(s) | best={best:.3}ms | mean={mean:.3}ms | bytecode_ops={}",
+        path.display(),
+        code.len()
+    );
+    Ok(())
+}
+
+fn profile_file(path: &Path) -> Result<(), String> {
+    let src = load_source(path.to_string_lossy().as_ref())?;
+    let start_compile = Instant::now();
+    let code = compile_source(&src)?;
+    let compile_ms = start_compile.elapsed().as_secs_f64() * 1000.0;
+    let start_run = Instant::now();
+    Vm::new(code.clone()).run()?;
+    let run_ms = start_run.elapsed().as_secs_f64() * 1000.0;
+    println!("profile {}", path.display());
+    println!("  source_bytes: {}", src.len());
+    println!("  bytecode_ops: {}", code.len());
+    println!("  compile_ms: {compile_ms:.3}");
+    println!("  run_ms: {run_ms:.3}");
+    Ok(())
+}
+
+fn doc_file(path: &Path) -> Result<(), String> {
+    let src = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let ast = Parser::new(lex(&src)?).program()?;
+    let mut out = format!(
+        "# API — {}\n\n",
+        path.file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or("module")
+    );
+    for stmt in ast {
+        match stmt {
+            Stmt::Fn(name, params, return_type, _) => {
+                let rendered = params
+                    .iter()
+                    .map(|(n, t)| match t {
+                        Some(t) => format!("{n}: {t}"),
+                        None => n.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ret = return_type.unwrap_or_else(|| "Any".into());
+                out.push_str(&format!("## fn {name}({rendered}) -> {ret}\n\n"));
+            }
+            Stmt::Class(name, parent, body) => {
+                match parent {
+                    Some(p) => out.push_str(&format!("## class {name}: {p}\n\n")),
+                    None => out.push_str(&format!("## class {name}\n\n")),
+                }
+                for item in body {
+                    if let Stmt::Fn(method, params, return_type, _) = item {
+                        let rendered = params
+                            .iter()
+                            .map(|(n, t)| match t {
+                                Some(t) => format!("{n}: {t}"),
+                                None => n.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let ret = return_type.unwrap_or_else(|| "Any".into());
+                        out.push_str(&format!("- `{method}({rendered}) -> {ret}`\n"));
+                    }
+                }
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    let target = path.with_extension("api.md");
+    fs::write(&target, out).map_err(|e| e.to_string())?;
+    println!("Generated {}", target.display());
     Ok(())
 }
 
@@ -2344,11 +4331,53 @@ fn pkg_index() -> Result<(PathBuf, JsonValue), String> {
     Ok((path, json))
 }
 
+fn hash_directory(dir: &Path) -> Result<String, String> {
+    fn collect(base: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.is_dir() {
+                collect(base, &path, files)?;
+            } else {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+    if !dir.exists() {
+        return Err(format!("missing directory {}", dir.display()));
+    }
+    let mut files = vec![];
+    collect(dir, dir, &mut files)?;
+    files.sort();
+    let mut h = Sha256::new();
+    for path in files {
+        let rel = path
+            .strip_prefix(dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        h.update(rel.as_bytes());
+        h.update([0]);
+        h.update(fs::read(&path).map_err(|e| e.to_string())?);
+        h.update([0]);
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
+
 fn write_package_lock(root: &Path, manifest: &JsonValue) -> Result<(), String> {
+    let mut locked = serde_json::Map::new();
+    if let Some(packages) = manifest.get("packages").and_then(JsonValue::as_object) {
+        for (name, meta) in packages {
+            let mut entry = meta.clone();
+            let hash = hash_directory(&root.join("vendor").join(name))?;
+            entry["sha256"] = JsonValue::String(hash);
+            locked.insert(name.clone(), entry);
+        }
+    }
     let lock = serde_json::json!({
-        "format": 1,
+        "format": 2,
         "engine": VERSION,
-        "packages": manifest.get("packages").cloned().unwrap_or_else(|| serde_json::json!({}))
+        "packages": JsonValue::Object(locked)
     });
     fs::write(
         root.join("veyra.lock"),
@@ -2534,6 +4563,35 @@ fn pkg_publish() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     println!("Published {name} {version} to {}", index_path.display());
+    Ok(())
+}
+
+fn pkg_audit() -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    let lock_path = root.join("veyra.lock");
+    if !lock_path.exists() {
+        return Err("veyra.lock not found; run veyra install/add first".into());
+    }
+    let lock: JsonValue =
+        serde_json::from_str(&fs::read_to_string(&lock_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let packages = lock
+        .get("packages")
+        .and_then(JsonValue::as_object)
+        .ok_or("invalid lockfile packages")?;
+    let mut checked = 0usize;
+    for (name, meta) in packages {
+        let expected = meta
+            .get("sha256")
+            .and_then(JsonValue::as_str)
+            .ok_or(format!("package {name} has no sha256"))?;
+        let actual = hash_directory(&root.join("vendor").join(name))?;
+        if actual != expected {
+            return Err(format!("package integrity mismatch: {name}"));
+        }
+        checked += 1;
+    }
+    println!("Audit OK: {checked} package(s), content hashes verified");
     Ok(())
 }
 
@@ -2736,6 +4794,97 @@ fn serve_routes(routes_file: &Path, port: u16) -> Result<(), String> {
     Ok(())
 }
 
+fn serve_veyra_app(app_file: &Path, routes_file: &Path, port: u16) -> Result<(), String> {
+    let src = load_source(app_file.to_string_lossy().as_ref())?;
+    let vm = prepare_vm(&src)?;
+    let config: JsonValue =
+        serde_json::from_str(&fs::read_to_string(routes_file).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let routes = config
+        .get("routes")
+        .and_then(JsonValue::as_object)
+        .ok_or("app routes file requires a 'routes' object")?;
+    let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
+    println!("Veyra dynamic app: http://127.0.0.1:{port}");
+    println!("Handlers: {}", routes.len());
+    for mut req in server.incoming_requests() {
+        let full_url = req.url().to_string();
+        let path = full_url.split('?').next().unwrap_or("/").to_string();
+        let method = req.method().as_str().to_string();
+        let key = format!("{method} {path}");
+        let handler = routes
+            .get(&key)
+            .or_else(|| routes.get(&path))
+            .and_then(JsonValue::as_str);
+        let response = if let Some(handler) = handler {
+            let mut body = String::new();
+            req.as_reader()
+                .read_to_string(&mut body)
+                .map_err(|e| e.to_string())?;
+            let request = Val::Map(vec![
+                (Val::Str("method".into()), Val::Str(method)),
+                (Val::Str("path".into()), Val::Str(path)),
+                (Val::Str("url".into()), Val::Str(full_url)),
+                (Val::Str("body".into()), Val::Str(body)),
+            ]);
+            match vm.invoke(handler, vec![request]) {
+                Ok(value) => {
+                    let (status, content_type, body) = match value {
+                        Val::Map(pairs) => {
+                            let status = map_lookup(&pairs, &Val::Str("status".into()))
+                                .and_then(|v| {
+                                    if let Val::Num(n) = v {
+                                        Some(*n as u16)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(200);
+                            let content_type = map_lookup(&pairs, &Val::Str("content_type".into()))
+                                .and_then(|v| {
+                                    if let Val::Str(s) = v {
+                                        Some(s.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_else(|| "application/json; charset=utf-8".into());
+                            let body = map_lookup(&pairs, &Val::Str("body".into()))
+                                .cloned()
+                                .unwrap_or(Val::Null);
+                            let text = match body {
+                                Val::Str(s) => s,
+                                other => serde_json::to_string(&val_to_json(&other))
+                                    .map_err(|e| e.to_string())?,
+                            };
+                            (status, content_type, text)
+                        }
+                        Val::Str(s) => (200, "text/plain; charset=utf-8".into(), s),
+                        other => (
+                            200,
+                            "application/json; charset=utf-8".into(),
+                            serde_json::to_string(&val_to_json(&other))
+                                .map_err(|e| e.to_string())?,
+                        ),
+                    };
+                    let mut r = Response::from_string(body).with_status_code(StatusCode(status));
+                    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
+                    {
+                        r.add_header(h);
+                    }
+                    r
+                }
+                Err(e) => Response::from_string(format!("Veyra handler error: {e}"))
+                    .with_status_code(StatusCode(500)),
+            }
+        } else {
+            Response::from_string("404 Not Found").with_status_code(StatusCode(404))
+        };
+        req.respond(response).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn new_project(name: &str) -> Result<(), String> {
     let p = PathBuf::from(name);
     if p.exists() {
@@ -2806,7 +4955,7 @@ fn repl() -> Result<(), String> {
 
 fn usage() {
     println!(
-        "Veyra {VERSION}\n\nUsage:\n  veyra run [file.vy]\n  veyra check [file.vy]\n  veyra test\n  veyra build\n  veyra serve [dir] [port]\n  veyra web <routes.json> [port]\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg add <name>\n  veyra pkg remove <name>\n  veyra pkg installed\n  veyra doctor\n  veyra repl\n  veyra --version"
+        "Veyra {VERSION}\n\nUsage:\n  veyra run [file.vy]\n  veyra check [file.vy]\n  veyra lint [file.vy]\n  veyra test\n  veyra bench [file.vy] [iterations]\n  veyra profile [file.vy]\n  veyra doc [file.vy]\n  veyra build\n  veyra audit\n  veyra serve [dir] [port]\n  veyra web <routes.json> [port]\n  veyra app <app.vy> <routes.json> [port]\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg add <name>\n  veyra pkg remove <name>\n  veyra pkg installed\n  veyra doctor\n  veyra repl\n  veyra --version"
     );
 }
 fn main() -> ExitCode {
@@ -2874,8 +5023,38 @@ fn main() -> ExitCode {
             path.and_then(|p| load_source(p.to_string_lossy().as_ref()))
                 .and_then(|s| run_source(&s))
         }
+        Some("lint") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| lint_file(&p))
+        }
         Some("test") => test_project(),
+        Some("bench") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            let iterations = a.get(3).and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
+            path.and_then(|p| bench_file(&p, iterations))
+        }
+        Some("profile") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| profile_file(&p))
+        }
+        Some("doc") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| doc_file(&p))
+        }
         Some("build") => build_project(),
+        Some("audit") => pkg_audit(),
         Some("serve") => {
             let dir = a
                 .get(2)
@@ -2888,6 +5067,17 @@ fn main() -> ExitCode {
             let port = a.get(3).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8080);
             serve_routes(Path::new(p), port)
         }),
+        Some("app") => {
+            let app = a.get(2).ok_or("missing app.vy".into());
+            let routes = a.get(3).ok_or("missing routes.json".into());
+            match (app, routes) {
+                (Ok(app), Ok(routes)) => {
+                    let port = a.get(4).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8080);
+                    serve_veyra_app(Path::new(app), Path::new(routes), port)
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        }
         Some("disasm") => {
             let path = match a.get(2) {
                 Some(p) => Ok(PathBuf::from(p)),
@@ -3018,5 +5208,95 @@ mod tests {
         assert!(run_source(&s).is_ok());
         assert!(p.exists());
         let _ = fs::remove_file(p);
+    }
+    #[test]
+    fn general_iteration() {
+        assert!(run_source("let total=0; for x in [1,2,3,4] { total=total+x; }").is_ok());
+        assert!(run_source("let out=\"\"; for ch in \"abc\" { out=out+ch; }").is_ok());
+    }
+    #[test]
+    fn explicit_exceptions() {
+        assert!(
+            run_source(
+                "let caught=false; try { throw \"boom\"; } catch err { caught = err == \"boom\"; }"
+            )
+            .is_ok()
+        );
+        assert!(run_source("throw \"uncaught\";").is_err());
+    }
+    #[test]
+    fn lexical_capture() {
+        assert!(run_source("fn outer(x: Int) -> Int { let y=3; fn add(z: Int) -> Int { return y+z; } return add(x); } let result=outer(4);").is_ok());
+    }
+    #[test]
+    fn native_tasks() {
+        assert!(run_source("fn square(n: Int) -> Int { return n*n; } let task=spawn(\"square\",[9]); let result=await_task(task);").is_ok());
+    }
+    #[test]
+    fn native_ffi_i32() {
+        if cfg!(target_os = "windows") {
+            assert!(run_source("let ok=ffi_available(\"msvcrt.dll\"); let x=ffi_i32(\"msvcrt.dll\",\"abs\",[-7]);").is_ok());
+        }
+    }
+    #[test]
+    fn native_classes_inheritance() {
+        let src = "class Animal { fn init(self, name: String) -> Null { self.name = name; return null; } fn speak(self) -> String { return self.name; } } class Dog: Animal { fn rename(self, name: String) -> String { self.name = name; return self.name; } } let d=Dog(\"Rex\"); let a=d.speak(); let b=d.rename(\"Max\"); let c=d.name;";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn loop_control() {
+        assert!(
+            run_source(
+                "let s=0; for n in range(0,10) { if n==2 { continue; } if n==5 { break; } s=s+n; }"
+            )
+            .is_ok()
+        );
+        assert!(compile_source("break;").is_err());
+        assert!(compile_source("continue;").is_err());
+    }
+    #[test]
+    fn runtime_type_enforcement() {
+        assert!(run_source("let x: Int=1; x=2;").is_ok());
+        assert!(run_source("let x: Int=1; x=\"bad\";").is_err());
+        assert!(run_source("let x: Int=\"bad\";").is_err());
+        assert!(run_source("fn f(x: Int)->Int{return x+1;} let y=f(3);").is_ok());
+        assert!(run_source("fn f(x: Int)->Int{return x+1;} let y=f(\"bad\");").is_err());
+        assert!(run_source("fn f()->Int{return \"bad\";} let y=f();").is_err());
+        assert!(
+            run_source(
+                "class A {} class B: A {} fn use_a(x: A)->A{return x;} let b=B(); let x=use_a(b);"
+            )
+            .is_ok()
+        );
+        assert!(
+            run_source(
+                "class A {} class C {} fn use_a(x: A)->A{return x;} let c=C(); let x=use_a(c);"
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn functional_collections() {
+        let src = "fn twice(x: Int)->Int{return x*2;} fn even(x: Int)->Bool{return x%2==0;} fn add(a: Int,b: Int)->Int{return a+b;} let a=append([1,2],3); let b=slice(a,1,3); let c=reverse(b); let d=sort([3,1,2]); let e=unique([1,1,2,2,3]); let f=enumerate([7,8]); let g=zip([1,2],[3,4]); let h=map_call(\"twice\",[1,2,3]); let i=filter_call(\"even\",[1,2,3,4]); let j=reduce_call(\"add\",[1,2,3],0);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn everyday_builtins() {
+        let src = "let a=int(\"7\"); let b=float(\"2.5\"); let c=bool(1); assert(a==7); let s=sum([1,2,3]); let lo=min([4,2,9]); let hi=max([4,2,9]); let aa=all([true,1,\"x\"]); let an=any([false,0,3]); let t=tuple([1,2]); let st=set([1,1,2]); let has=contains(st,2); let ix=index_of([9,8,7],8);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn expanded_science_data_ml() {
+        let src = "let med=vec_median([1,2,9,4]); let p=vec_percentile([1,2,3,4],75); let c=correlation([1,2,3],[2,4,6]); let rows=[{\"id\":1,\"g\":\"a\"},{\"id\":2,\"g\":\"b\"},{\"id\":3,\"g\":\"a\"}]; let groups=table_group_count(rows,\"g\"); let sorted=table_sort(rows,\"id\"); let selected=table_select(rows,[\"id\"]); let joined=table_inner_join(rows,[{\"rid\":1,\"v\":9}],\"id\",\"rid\"); let model=logreg_fit([[0],[1],[2],[3]],[0,0,1,1],100,0.1); let prob=logreg_predict(model,[3]);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn channels_work() {
+        assert!(run_source("let ch=channel(); send(ch,\"hello\"); let x=recv(ch);").is_ok());
+    }
+    #[test]
+    fn await_syntax_and_introspection() {
+        let src = "class A {} class B: A {} fn square(n: Int)->Int{return n*n;} let task=spawn(\"square\",[6]); let result=await task; let b=B(); let t=type_of(b); let yes=is_instance(b,\"A\"); let field=has_field(b,\"x\");";
+        assert!(run_source(src).is_ok());
     }
 }

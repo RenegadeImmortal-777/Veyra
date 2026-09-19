@@ -1,6 +1,6 @@
 [package]
 name = "veyra"
-version = "5.0.0"
+version = "6.0.0"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 csv = "1"
 tiny_http = "0.12"
 tinyfiledialogs = "3"
+libloading = "0.8"
 
 [profile.release]
 lto = true

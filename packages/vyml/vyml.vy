@@ -1,5 +1,9 @@
 fn linear_fit(x: List, y: List) -> Map { return linreg_fit(x, y); }
 fn linear_predict(model: Map, x: Number) -> Number { return linreg_predict(model, x); }
+fn logistic_fit(features: List, labels: List, iterations: Number, learning_rate: Number) -> Map {
+    return logreg_fit(features, labels, iterations, learning_rate);
+}
+fn logistic_predict(model: Map, features: List) -> Number { return logreg_predict(model, features); }
 fn nearest_class(train_x: List, train_y: List, point: List, k: Int) -> Any {
     return knn_predict(train_x, train_y, point, k);
 }

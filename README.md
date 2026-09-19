@@ -1,69 +1,76 @@
-# Veyra 5.0 Frontier
+# Veyra 6.0 Apex
 
-Veyra is a native-first programming language platform. The default `veyra` command runs the standalone Rust compiler/bytecode VM and does not require Python.
+Veyra is a native-first programming language and application platform built around its own Rust lexer, parser, semantic pass, bytecode compiler and VM.
 
-## What Veyra owns now
+The default `veyra` execution path does not require Python.
 
-The native platform includes its lexer, parser, AST, bytecode compiler, VM, project system, package registry, package manager, standard services, data/science primitives, introductory ML toolkit, web server path, desktop utility GUI layer and VS Code integration.
+## Language
 
-### Native project workflow
+Veyra now supports functions and recursion, constants and typed variables, lists/maps/indexing, modules, native classes and inheritance, constructors and mutable object fields, lexical captures, try/catch/throw, general iteration, break/continue and native `await` over background tasks.
+
+Example:
+
+    class Patient {
+        fn init(self, name: String, age: Int) -> Null {
+            self.name = name;
+            self.age = age;
+            return null;
+        }
+
+        fn label(self) -> String {
+            return self.name;
+        }
+    }
+
+    let patient: Patient = Patient("Ama", 24);
+
+Types are enforced for annotated declarations, assignments, function arguments, return values and class inheritance relationships.
+
+## Concurrency
+
+    fn square(n: Int) -> Int {
+        return n * n;
+    }
+
+    let task = spawn("square", [9]);
+    let result = await task;
+
+Message-passing channels are available through `channel`, `send`, `recv` and `try_recv`.
+
+## Native interop
+
+Veyra can call native dynamic libraries directly with constrained C-ABI entrypoints:
+
+    ffi_i32(library, symbol, args)
+    ffi_i64(library, symbol, args)
+    ffi_f64(library, symbol, args)
+
+## Dynamic web applications
+
+    veyra app app.vy routes.json 8080
+
+Routes can invoke functions implemented directly in Veyra and return text, JSON or structured response maps. Veyra objects can persist state across requests.
+
+## Data / science / ML
+
+The native runtime includes vector/matrix operations, descriptive statistics, CSV, dataframe-style table transforms and joins, SVG plotting, linear/logistic regression, k-NN, k-means and neural-inference primitives.
+
+Packages include `vyscience`, `vydata`, `vyplot` and `vyml`.
+
+## Tooling
 
     veyra new app
-    cd app
-    veyra add vyscience
-    veyra add vyml
     veyra add vydata
-    veyra add vyweb
     veyra check
+    veyra lint
     veyra run
     veyra test
+    veyra bench
+    veyra profile
+    veyra doc
+    veyra audit
     veyra build
 
-### Science/data
+Veyra lockfiles include package-content SHA-256 hashes and `veyra audit` verifies vendored package integrity.
 
-Native primitives include vector sums/means/variance/stddev/dot/add/scale, matrix transpose/multiply, CSV read/write, table column/filter/describe and SVG plotting.
-
-Packages:
-- vyscience
-- vydata
-- vyplot
-- vystats
-- vymath
-- vyalgo
-
-### AI/ML
-
-Native primitives include linear regression, k-NN prediction, k-means clustering, normalization, sigmoid, MSE, dense-layer inference, ReLU and softmax.
-
-Package:
-- vyml
-
-### Web
-
-    veyra serve public 8080
-    veyra web routes.json 8080
-
-Veyra can serve static files and declarative method/path API routes with text, HTML and JSON responses. `vyweb` provides HTML helpers.
-
-### Desktop utility GUI
-
-The vygui package exposes native OS-backed alerts, confirm dialogs, input/password prompts, forms, open/save dialogs, folder selection and color selection.
-
-### Native package ecosystem
-
-    veyra registry
-    veyra pkg search science
-    veyra add vyscience
-    veyra packages
-    veyra install
-    veyra publish
-
-Packages are vendored into projects and captured in `veyra.lock`.
-
-## Compatibility
-
-The older Python-backed Convergence runtime remains available as `veyra-convergence` for compatibility. It is optional and is not the default execution path.
-
-## Verification
-
-The native Rust suite covers the language/runtime plus JSON, regex, hashing, file I/O, CSV, science math, ML and table/plot functionality. See `STATUS-50-ALL.md` for the exact interpretation of the 50%-class milestone.
+See `STATUS-6-APEX.md` for the exact release scope.

@@ -2,19 +2,24 @@ const vscode = require('vscode');
 const cp = require('child_process');
 
 const keywords = [
-  'let','const','fn','if','else','while','for','in','return','use',
+  'let','const','fn','class','if','else','while','for','in','return','use',
+  'try','catch','throw','break','continue','await',
   'and','or','not','true','false','null'
 ];
 const builtins = [
-  'print','len','str','range','keys','values','get',
+  'print','len','str','int','float','bool','assert','sum','min','max','all','any',
+  'range','keys','values','get','tuple','set','contains','index_of','append','concat','slice','reverse','sort','unique','enumerate','zip','map_call','filter_call','reduce_call',
+  'type_of','is_instance','has_field',
   'json_parse','json_stringify','regex_findall',
   'sqrt','abs','floor','ceil','lower','upper','trim','split','join','contains',
   'read_file','write_file','path_exists','mkdir','remove_file','list_dir','cwd','env_get',
-  'http_get','shell','clock','random','randint','sha256','sqlite_exec','sqlite_query',
-  'vec_sum','vec_mean','vec_variance','vec_std','vec_dot','vec_add','vec_scale',
+  'http_get','http_post','shell','clock','random','randint','sha256','sqlite_exec','sqlite_query',
+  'spawn','await_task','task_done','channel','send','recv','try_recv','sleep_ms','cpu_count',
+  'ffi_available','ffi_i32','ffi_i64','ffi_f64',
+  'vec_sum','vec_mean','vec_variance','vec_std','vec_median','vec_percentile','covariance','correlation','vec_dot','vec_add','vec_scale',
   'transpose','matmul','linreg_fit','linreg_predict','knn_predict','kmeans',
-  'normalize','dense','relu','softmax','sigmoid','mse','csv_read','csv_write',
-  'table_column','table_filter_eq','table_describe','plot_svg',
+  'normalize','dense','relu','softmax','sigmoid','mse','logreg_fit','logreg_predict','csv_read','csv_write',
+  'table_column','table_filter_eq','table_describe','table_group_count','table_sort','table_select','table_inner_join','plot_svg',
   'gui_message','gui_confirm','gui_input','gui_password','gui_form',
   'gui_open_file','gui_save_file','gui_folder','gui_color'
 ];

@@ -1,70 +1,110 @@
 {
-  "packages": {
-    "vyalgo": {
-      "entry": "vyalgo.vy",
-      "source": "../packages/vyalgo",
-      "version": "0.1.0"
-    },
-    "vycollections": {
-      "entry": "vycollections.vy",
-      "source": "../packages/vycollections",
-      "version": "0.1.0"
-    },
-    "vyhello": {
-      "entry": "src/main.vy",
-      "source": "../packages/vyhello",
-      "version": "0.1.0"
-    },
-    "vymath": {
-      "entry": "vymath.vy",
-      "source": "../packages/vymath",
-      "version": "0.2.0"
-    },
-    "vystats": {
-      "entry": "vystats.vy",
-      "source": "../packages/vystats",
-      "version": "0.1.0"
-    },
-    "vytest": {
-      "entry": "vytest.vy",
-      "source": "../packages/vytest",
-      "version": "0.2.0"
-    },
-    "vytext": {
-      "entry": "vytext.vy",
-      "source": "../packages/vytext",
-      "version": "0.1.0"
-    },
-    "vyscience": {
-      "version": "0.1.0",
-      "entry": "vyscience.vy",
-      "source": "../packages/vyscience"
-    },
-    "vyml": {
-      "version": "0.1.0",
-      "entry": "vyml.vy",
-      "source": "../packages/vyml"
-    },
-    "vydata": {
-      "version": "0.2.0",
-      "entry": "vydata.vy",
-      "source": "../packages/vydata"
-    },
-    "vygui": {
-      "version": "0.1.0",
-      "entry": "vygui.vy",
-      "source": "../packages/vygui"
-    },
-    "vyweb": {
-      "version": "0.1.0",
-      "entry": "vyweb.vy",
-      "source": "../packages/vyweb"
-    },
-    "vyplot": {
-      "version": "0.1.0",
-      "entry": "vyplot.vy",
-      "source": "../packages/vyplot"
-    }
-  },
-  "registry_version": 1
+    "packages":  {
+                     "vyalgo":  {
+                                    "entry":  "vyalgo.vy",
+                                    "source":  "../packages/vyalgo",
+                                    "version":  "0.1.0"
+                                },
+                     "vycollections":  {
+                                           "entry":  "vycollections.vy",
+                                           "source":  "../packages/vycollections",
+                                           "version":  "0.1.0"
+                                       },
+                     "vyhello":  {
+                                     "entry":  "src/main.vy",
+                                     "source":  "../packages/vyhello",
+                                     "version":  "0.1.0"
+                                 },
+                     "vymath":  {
+                                    "entry":  "vymath.vy",
+                                    "source":  "../packages/vymath",
+                                    "version":  "0.2.0"
+                                },
+                     "vystats":  {
+                                     "entry":  "vystats.vy",
+                                     "source":  "../packages/vystats",
+                                     "version":  "0.1.0"
+                                 },
+                     "vytest":  {
+                                    "entry":  "vytest.vy",
+                                    "source":  "../packages/vytest",
+                                    "version":  "0.3.0"
+                                },
+                     "vytext":  {
+                                    "entry":  "vytext.vy",
+                                    "source":  "../packages/vytext",
+                                    "version":  "0.1.0"
+                                },
+                     "vyscience":  {
+                                       "version":  "0.2.0",
+                                       "entry":  "vyscience.vy",
+                                       "source":  "../packages/vyscience"
+                                   },
+                     "vyml":  {
+                                  "version":  "0.2.0",
+                                  "entry":  "vyml.vy",
+                                  "source":  "../packages/vyml"
+                              },
+                     "vydata":  {
+                                    "version":  "0.3.0",
+                                    "entry":  "vydata.vy",
+                                    "source":  "../packages/vydata"
+                                },
+                     "vygui":  {
+                                   "version":  "0.1.0",
+                                   "entry":  "vygui.vy",
+                                   "source":  "../packages/vygui"
+                               },
+                     "vyweb":  {
+                                   "version":  "0.1.0",
+                                   "entry":  "vyweb.vy",
+                                   "source":  "../packages/vyweb"
+                               },
+                     "vyplot":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vyplot.vy",
+                                    "source":  "../packages/vyplot"
+                                },
+                     "vyhttp":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vyhttp.vy",
+                                    "source":  "../packages/vyhttp"
+                                },
+                     "vyconcurrent":  {
+                                          "version":  "0.1.0",
+                                          "entry":  "vyconcurrent.vy",
+                                          "source":  "../packages/vyconcurrent"
+                                      },
+                     "vyffi":  {
+                                   "version":  "0.1.0",
+                                   "entry":  "vyffi.vy",
+                                   "source":  "../packages/vyffi"
+                               },
+                     "vyjson":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vyjson.vy",
+                                    "source":  "../packages/vyjson"
+                                },
+                     "vyregex":  {
+                                     "version":  "0.1.0",
+                                     "entry":  "vyregex.vy",
+                                     "source":  "../packages/vyregex"
+                                 },
+                     "vycrypto":  {
+                                      "version":  "0.1.0",
+                                      "entry":  "vycrypto.vy",
+                                      "source":  "../packages/vycrypto"
+                                  },
+                     "vysqlite":  {
+                                      "version":  "0.1.0",
+                                      "entry":  "vysqlite.vy",
+                                      "source":  "../packages/vysqlite"
+                                  },
+                     "vyos":  {
+                                  "version":  "0.1.0",
+                                  "entry":  "vyos.vy",
+                                  "source":  "../packages/vyos"
+                              }
+                 },
+    "registry_version":  1
 }
