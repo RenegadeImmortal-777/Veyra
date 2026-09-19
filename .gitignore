@@ -1,0 +1,8 @@
+# Veyra build artifacts
+engine-rs/target/
+__pycache__/
+tests/__pycache__/
+*.pyc
+dist/
+.veyra/
+*.vyc
