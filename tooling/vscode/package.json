@@ -2,13 +2,16 @@
   "name": "veyra-language",
   "displayName": "Veyra Language",
   "description": "Language support for Veyra",
-  "version": "2.0.0",
+  "version": "3.1.0",
   "publisher": "veyra",
   "engines": {"vscode": "^1.80.0"},
   "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:veyra"],
+  "main": "./extension.js",
   "contributes": {
     "languages": [{"id":"veyra","aliases":["Veyra","veyra"],"extensions":[".vy"],"configuration":"./language-configuration.json"}],
     "grammars": [{"language":"veyra","scopeName":"source.veyra","path":"./syntaxes/veyra.tmLanguage.json"}],
-    "snippets": [{"language":"veyra","path":"./snippets/veyra.json"}]
+    "snippets": [{"language":"veyra","path":"./snippets/veyra.json"}],
+    "commands": [{"command":"veyra.check","title":"Veyra: Check Current File"}]
   }
 }

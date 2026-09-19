@@ -46,4 +46,23 @@ class VeyraTests(unittest.TestCase):
         src='let m=py_import("math"); print(m.sqrt(81));'
         self.assertEqual(self.execute(src), '9.0')
 
+    def test_spawn_await(self):
+        src='fn square(n: Int) -> Int { return n*n; } let t=spawn(square,9); print(await_task(t));'
+        self.assertEqual(self.execute(src), '81')
+
+    def test_semantic_undefined(self):
+        with self.assertRaises(veyra.VeyraError):
+            veyra.semantic_check('print(missing_name);')
+
+    def test_semantic_valid(self):
+        veyra.semantic_check('fn f(x: Int) -> Int { return x+1; } let y=f(4); print(y);')
+
+    def test_json_regex(self):
+        src=r'let x=json_parse("{\"a\": 7}"); print(x.a); print(len(regex("[0-9]+","a12b34")));'
+        self.assertEqual(self.execute(src), '7\n2')
+
+    def test_sqlite_bridge(self):
+        src='let db=db_open(":memory:"); db.execute("create table t(x integer)"); db.close(); print("ok");'
+        self.assertEqual(self.execute(src), 'ok')
+
 if __name__ == '__main__': unittest.main()

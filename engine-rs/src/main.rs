@@ -1,12 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
-const VERSION: &str = "2.0.0-horizon";
+const VERSION: &str = "3.1.0-horizon";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -15,9 +15,16 @@ enum Tok {
     Id(String),
     Let,
     Const,
+    Fn,
+    Return,
     If,
     Else,
     While,
+    For,
+    In,
+    And,
+    Or,
+    Not,
     True,
     False,
     Null,
@@ -43,6 +50,7 @@ enum Tok {
     Gt,
     Ge,
     Bang,
+    Arrow,
     Eof,
 }
 
@@ -111,9 +119,16 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             out.push(match w.as_str() {
                 "let" => Tok::Let,
                 "const" => Tok::Const,
+                "fn" => Tok::Fn,
+                "return" => Tok::Return,
                 "if" => Tok::If,
                 "else" => Tok::Else,
                 "while" => Tok::While,
+                "for" => Tok::For,
+                "in" => Tok::In,
+                "and" => Tok::And,
+                "or" => Tok::Or,
+                "not" => Tok::Not,
                 "true" => Tok::True,
                 "false" => Tok::False,
                 "null" => Tok::Null,
@@ -175,8 +190,13 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 i += 1
             }
             '-' => {
-                out.push(Tok::Minus);
-                i += 1
+                if i + 1 < cs.len() && cs[i + 1] == '>' {
+                    out.push(Tok::Arrow);
+                    i += 2
+                } else {
+                    out.push(Tok::Minus);
+                    i += 1
+                }
             }
             '*' => {
                 out.push(Tok::Star);
@@ -209,6 +229,8 @@ enum Expr {
     Null,
     Var(String),
     List(Vec<Expr>),
+    Map(Vec<(Expr, Expr)>),
+    Index(Box<Expr>, Box<Expr>),
     Unary(String, Box<Expr>),
     Bin(Box<Expr>, String, Box<Expr>),
     Call(String, Vec<Expr>),
@@ -220,6 +242,9 @@ enum Stmt {
     Expr(Expr),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
     While(Expr, Vec<Stmt>),
+    ForRange(String, Expr, Expr, Vec<Stmt>),
+    Fn(String, Vec<String>, Vec<Stmt>),
+    Return(Option<Expr>),
 }
 
 struct Parser {
@@ -289,6 +314,48 @@ impl Parser {
             self.eat(&Tok::Semi);
             return Ok(Stmt::Let(name, e, is_const));
         }
+        if self.eat(&Tok::Fn) {
+            let name = match self.bump() {
+                Tok::Id(s) => s,
+                x => return Err(format!("expected function name, got {x:?}")),
+            };
+            self.need(&Tok::Lp, "expected '(' after function name")?;
+            let mut params = vec![];
+            if !self.eat(&Tok::Rp) {
+                loop {
+                    let param = match self.bump() {
+                        Tok::Id(s) => s,
+                        x => return Err(format!("expected parameter name, got {x:?}")),
+                    };
+                    if self.eat(&Tok::Colon) {
+                        if !matches!(self.bump(), Tok::Id(_)) {
+                            return Err("expected parameter type".into());
+                        }
+                    }
+                    params.push(param);
+                    if self.eat(&Tok::Rp) {
+                        break;
+                    }
+                    self.need(&Tok::Comma, "expected ',' between parameters")?;
+                }
+            }
+            if self.eat(&Tok::Arrow) {
+                if !matches!(self.bump(), Tok::Id(_)) {
+                    return Err("expected return type".into());
+                }
+            }
+            let body = self.block()?;
+            return Ok(Stmt::Fn(name, params, body));
+        }
+        if self.eat(&Tok::Return) {
+            if matches!(self.cur(), Tok::Semi | Tok::Rb) {
+                self.eat(&Tok::Semi);
+                return Ok(Stmt::Return(None));
+            }
+            let value = self.expr()?;
+            self.eat(&Tok::Semi);
+            return Ok(Stmt::Return(Some(value)));
+        }
         if self.eat(&Tok::If) {
             let c = self.expr()?;
             let a = self.block()?;
@@ -304,6 +371,29 @@ impl Parser {
             let b = self.block()?;
             return Ok(Stmt::While(c, b));
         }
+        if self.eat(&Tok::For) {
+            let name = match self.bump() {
+                Tok::Id(s) => s,
+                x => return Err(format!("expected loop variable, got {x:?}")),
+            };
+            self.need(&Tok::In, "expected 'in'")?;
+            let range_name = match self.bump() {
+                Tok::Id(s) if s == "range" => s,
+                x => {
+                    return Err(format!(
+                        "native for currently expects range(...), got {x:?}"
+                    ));
+                }
+            };
+            let _ = range_name;
+            self.need(&Tok::Lp, "expected '(' after range")?;
+            let start = self.expr()?;
+            self.need(&Tok::Comma, "expected ',' in range")?;
+            let end = self.expr()?;
+            self.need(&Tok::Rp, "expected ')' after range")?;
+            let body = self.block()?;
+            return Ok(Stmt::ForRange(name, start, end, body));
+        }
         if let Tok::Id(n) = self.cur().clone() {
             if self.i + 1 < self.t.len() && matches!(self.t[self.i + 1], Tok::Eq) {
                 self.i += 2;
@@ -317,7 +407,21 @@ impl Parser {
         Ok(Stmt::Expr(e))
     }
     fn expr(&mut self) -> Result<Expr, String> {
-        self.equality()
+        self.logic_or()
+    }
+    fn logic_or(&mut self) -> Result<Expr, String> {
+        let mut e = self.logic_and()?;
+        while self.eat(&Tok::Or) {
+            e = Expr::Bin(Box::new(e), "or".into(), Box::new(self.logic_and()?));
+        }
+        Ok(e)
+    }
+    fn logic_and(&mut self) -> Result<Expr, String> {
+        let mut e = self.equality()?;
+        while self.eat(&Tok::And) {
+            e = Expr::Bin(Box::new(e), "and".into(), Box::new(self.equality()?));
+        }
+        Ok(e)
     }
     fn equality(&mut self) -> Result<Expr, String> {
         let mut e = self.compare()?;
@@ -379,13 +483,22 @@ impl Parser {
         Ok(e)
     }
     fn unary(&mut self) -> Result<Expr, String> {
-        if self.eat(&Tok::Bang) {
+        if self.eat(&Tok::Bang) || self.eat(&Tok::Not) {
             return Ok(Expr::Unary("!".into(), Box::new(self.unary()?)));
         }
         if self.eat(&Tok::Minus) {
             return Ok(Expr::Unary("-".into(), Box::new(self.unary()?)));
         }
-        self.primary()
+        self.postfix()
+    }
+    fn postfix(&mut self) -> Result<Expr, String> {
+        let mut e = self.primary()?;
+        while self.eat(&Tok::Ls) {
+            let key = self.expr()?;
+            self.need(&Tok::Rs, "expected ']' after index")?;
+            e = Expr::Index(Box::new(e), Box::new(key));
+        }
+        Ok(e)
     }
     fn primary(&mut self) -> Result<Expr, String> {
         match self.bump() {
@@ -429,6 +542,22 @@ impl Parser {
                 }
                 Ok(Expr::List(a))
             }
+            Tok::Lb => {
+                let mut pairs = vec![];
+                if !self.eat(&Tok::Rb) {
+                    loop {
+                        let key = self.expr()?;
+                        self.need(&Tok::Colon, "expected ':' in map")?;
+                        let value = self.expr()?;
+                        pairs.push((key, value));
+                        if self.eat(&Tok::Rb) {
+                            break;
+                        }
+                        self.need(&Tok::Comma, "expected ',' in map")?;
+                    }
+                }
+                Ok(Expr::Map(pairs))
+            }
             x => Err(format!("expected expression, got {x:?}")),
         }
     }
@@ -441,6 +570,7 @@ enum Val {
     Bool(bool),
     Null,
     List(Vec<Val>),
+    Map(Vec<(Val, Val)>),
 }
 impl Val {
     fn truthy(&self) -> bool {
@@ -450,6 +580,7 @@ impl Val {
             Val::Num(n) => *n != 0.0,
             Val::Str(s) => !s.is_empty(),
             Val::List(v) => !v.is_empty(),
+            Val::Map(v) => !v.is_empty(),
         }
     }
     fn show(&self) -> String {
@@ -468,6 +599,13 @@ impl Val {
                 "[{}]",
                 v.iter().map(Val::show).collect::<Vec<_>>().join(", ")
             ),
+            Val::Map(v) => format!(
+                "{{{}}}",
+                v.iter()
+                    .map(|(k, x)| format!("{}: {}", k.show(), x.show()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }
@@ -476,6 +614,7 @@ impl Val {
 enum Op {
     Const(Val),
     Load(String),
+    Define(String, bool),
     Store(String),
     Pop,
     Add,
@@ -491,7 +630,12 @@ enum Op {
     Ge,
     Neg,
     Not,
+    And,
+    Or,
+    Index,
     Call(String, usize),
+    Def(String, Vec<String>, Vec<Op>),
+    Return,
     JumpIfFalse(usize),
     Jump(usize),
     Halt,
@@ -511,11 +655,22 @@ impl Compiler {
             Expr::Bool(b) => self.code.push(Op::Const(Val::Bool(*b))),
             Expr::Null => self.code.push(Op::Const(Val::Null)),
             Expr::List(items) => {
-                // list literal lowered through internal builtin
                 for x in items {
                     self.emit_expr(x)?
                 }
                 self.code.push(Op::Call("__list".into(), items.len()));
+            }
+            Expr::Map(pairs) => {
+                for (k, v) in pairs {
+                    self.emit_expr(k)?;
+                    self.emit_expr(v)?;
+                }
+                self.code.push(Op::Call("__map".into(), pairs.len() * 2));
+            }
+            Expr::Index(obj, key) => {
+                self.emit_expr(obj)?;
+                self.emit_expr(key)?;
+                self.code.push(Op::Index);
             }
             Expr::Var(n) => self.code.push(Op::Load(n.clone())),
             Expr::Unary(op, x) => {
@@ -537,6 +692,8 @@ impl Compiler {
                     "<=" => Op::Le,
                     ">" => Op::Gt,
                     ">=" => Op::Ge,
+                    "and" => Op::And,
+                    "or" => Op::Or,
                     _ => return Err("bad operator".into()),
                 });
             }
@@ -558,9 +715,8 @@ impl Compiler {
     fn emit_stmt(&mut self, s: &Stmt) -> Result<(), String> {
         match s {
             Stmt::Let(n, e, c) => {
-                let _ = *c;
                 self.emit_expr(e)?;
-                self.code.push(Op::Store(n.clone()));
+                self.code.push(Op::Define(n.clone(), *c));
             }
             Stmt::Assign(n, e) => {
                 self.emit_expr(e)?;
@@ -593,6 +749,40 @@ impl Compiler {
                 let end = self.code.len();
                 self.code[jf] = Op::JumpIfFalse(end);
             }
+            Stmt::ForRange(name, start_expr, end_expr, body) => {
+                self.emit_expr(start_expr)?;
+                self.code.push(Op::Store(name.clone()));
+                let loop_start = self.code.len();
+                self.code.push(Op::Load(name.clone()));
+                self.emit_expr(end_expr)?;
+                self.code.push(Op::Lt);
+                let jf = self.code.len();
+                self.code.push(Op::JumpIfFalse(0));
+                self.emit_stmts(body)?;
+                self.code.push(Op::Load(name.clone()));
+                self.code.push(Op::Const(Val::Num(1.0)));
+                self.code.push(Op::Add);
+                self.code.push(Op::Store(name.clone()));
+                self.code.push(Op::Jump(loop_start));
+                let end = self.code.len();
+                self.code[jf] = Op::JumpIfFalse(end);
+            }
+            Stmt::Fn(name, params, body) => {
+                let mut child = Compiler::new();
+                child.emit_stmts(body)?;
+                child.code.push(Op::Const(Val::Null));
+                child.code.push(Op::Return);
+                self.code
+                    .push(Op::Def(name.clone(), params.clone(), child.code));
+            }
+            Stmt::Return(value) => {
+                if let Some(expr) = value {
+                    self.emit_expr(expr)?;
+                } else {
+                    self.code.push(Op::Const(Val::Null));
+                }
+                self.code.push(Op::Return);
+            }
         }
         Ok(())
     }
@@ -607,6 +797,8 @@ struct Vm {
     ip: usize,
     stack: Vec<Val>,
     vars: HashMap<String, Val>,
+    consts: HashSet<String>,
+    funcs: HashMap<String, (Vec<String>, Vec<Op>)>,
 }
 impl Vm {
     fn new(code: Vec<Op>) -> Self {
@@ -615,6 +807,22 @@ impl Vm {
             ip: 0,
             stack: vec![],
             vars: HashMap::new(),
+            consts: HashSet::new(),
+            funcs: HashMap::new(),
+        }
+    }
+    fn nested(
+        code: Vec<Op>,
+        vars: HashMap<String, Val>,
+        funcs: HashMap<String, (Vec<String>, Vec<Op>)>,
+    ) -> Self {
+        Self {
+            code,
+            ip: 0,
+            stack: vec![],
+            vars,
+            consts: HashSet::new(),
+            funcs,
         }
     }
     fn pop(&mut self) -> Result<Val, String> {
@@ -631,6 +839,9 @@ impl Vm {
         }
     }
     fn run(&mut self) -> Result<(), String> {
+        self.execute().map(|_| ())
+    }
+    fn execute(&mut self) -> Result<Val, String> {
         loop {
             let op = self
                 .code
@@ -646,7 +857,20 @@ impl Vm {
                         .cloned()
                         .ok_or(format!("undefined name '{n}'"))?,
                 ),
+                Op::Define(n, is_const) => {
+                    let v = self.pop()?;
+                    if self.vars.contains_key(&n) {
+                        return Err(format!("name '{n}' already defined"));
+                    }
+                    self.vars.insert(n.clone(), v);
+                    if is_const {
+                        self.consts.insert(n);
+                    }
+                }
                 Op::Store(n) => {
+                    if self.consts.contains(&n) {
+                        return Err(format!("cannot assign to constant '{n}'"));
+                    }
                     let v = self.pop()?;
                     self.vars.insert(n, v);
                 }
@@ -703,6 +927,42 @@ impl Vm {
                     let a = self.pop()?;
                     self.stack.push(Val::Bool(!a.truthy()));
                 }
+                Op::And => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(Val::Bool(a.truthy() && b.truthy()));
+                }
+                Op::Or => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(Val::Bool(a.truthy() || b.truthy()));
+                }
+                Op::Index => {
+                    let key = self.pop()?;
+                    let obj = self.pop()?;
+                    let value = match (obj, key) {
+                        (Val::List(v), Val::Num(n)) => {
+                            let i = n as usize;
+                            v.get(i)
+                                .cloned()
+                                .ok_or(format!("list index {i} out of range"))?
+                        }
+                        (Val::Str(s), Val::Num(n)) => {
+                            let i = n as usize;
+                            s.chars()
+                                .nth(i)
+                                .map(|c| Val::Str(c.to_string()))
+                                .ok_or(format!("string index {i} out of range"))?
+                        }
+                        (Val::Map(pairs), k) => pairs
+                            .iter()
+                            .find(|(key, _)| *key == k)
+                            .map(|(_, v)| v.clone())
+                            .ok_or("map key not found")?,
+                        _ => return Err("value is not indexable".into()),
+                    };
+                    self.stack.push(value);
+                }
                 Op::JumpIfFalse(p) => {
                     let a = self.pop()?;
                     if !a.truthy() {
@@ -728,7 +988,8 @@ impl Vm {
                             Val::Num(match &a[0] {
                                 Val::Str(s) => s.chars().count() as f64,
                                 Val::List(v) => v.len() as f64,
-                                _ => return Err("len supports String/List".into()),
+                                Val::Map(v) => v.len() as f64,
+                                _ => return Err("len supports String/List/Map".into()),
                             })
                         }
                         "str" => {
@@ -738,15 +999,114 @@ impl Vm {
                             Val::Str(a[0].show())
                         }
                         "__list" => Val::List(a),
-                        _ => return Err(format!("unknown function '{n}'")),
+                        "__map" => {
+                            if a.len() % 2 != 0 {
+                                return Err("internal map arity error".into());
+                            }
+                            let mut pairs = vec![];
+                            let mut it = a.into_iter();
+                            while let Some(k) = it.next() {
+                                let v = it.next().ok_or("internal map value missing")?;
+                                pairs.push((k, v));
+                            }
+                            Val::Map(pairs)
+                        }
+                        "get" => {
+                            if a.len() != 2 {
+                                return Err("get expects map and key".into());
+                            }
+                            match &a[0] {
+                                Val::Map(pairs) => pairs
+                                    .iter()
+                                    .find(|(k, _)| *k == a[1])
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or(Val::Null),
+                                _ => return Err("get expects a map".into()),
+                            }
+                        }
+                        "keys" => {
+                            if a.len() != 1 {
+                                return Err("keys expects a map".into());
+                            }
+                            match &a[0] {
+                                Val::Map(pairs) => {
+                                    Val::List(pairs.iter().map(|(k, _)| k.clone()).collect())
+                                }
+                                _ => return Err("keys expects a map".into()),
+                            }
+                        }
+                        "values" => {
+                            if a.len() != 1 {
+                                return Err("values expects a map".into());
+                            }
+                            match &a[0] {
+                                Val::Map(pairs) => {
+                                    Val::List(pairs.iter().map(|(_, v)| v.clone()).collect())
+                                }
+                                _ => return Err("values expects a map".into()),
+                            }
+                        }
+                        _ => {
+                            let (params, code) = self
+                                .funcs
+                                .get(&n)
+                                .cloned()
+                                .ok_or(format!("unknown function '{n}'"))?;
+                            if params.len() != a.len() {
+                                return Err(format!(
+                                    "{n} expects {} arguments, got {}",
+                                    params.len(),
+                                    a.len()
+                                ));
+                            }
+                            let mut vars = self.vars.clone();
+                            for (param, value) in params.into_iter().zip(a.into_iter()) {
+                                vars.insert(param, value);
+                            }
+                            let mut nested = Vm::nested(code, vars, self.funcs.clone());
+                            nested.execute()?
+                        }
                     };
                     self.stack.push(v);
                 }
-                Op::Halt => break,
+                Op::Def(name, params, code) => {
+                    self.funcs.insert(name, (params, code));
+                }
+                Op::Return => return self.pop(),
+                Op::Halt => return Ok(Val::Null),
             }
         }
-        Ok(())
     }
+}
+
+fn load_source(path: &str) -> Result<String, String> {
+    fn load(path: &Path, seen: &mut HashSet<PathBuf>) -> Result<String, String> {
+        let full = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !seen.insert(full.clone()) {
+            return Ok(String::new());
+        }
+        let src = fs::read_to_string(&full).map_err(|e| e.to_string())?;
+        let base = full.parent().unwrap_or(Path::new("."));
+        let mut out = String::new();
+        for line in src.lines() {
+            let t = line.trim();
+            if t.starts_with("use ") {
+                if let Some(a) = t.find('"') {
+                    if let Some(b_rel) = t[a + 1..].find('"') {
+                        let b = a + 1 + b_rel;
+                        let rel = &t[a + 1..b];
+                        out.push_str(&load(&base.join(rel), seen)?);
+                        out.push('\n');
+                        continue;
+                    }
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+    load(Path::new(path), &mut HashSet::new())
 }
 
 fn compile_source(src: &str) -> Result<Vec<Op>, String> {
@@ -758,6 +1118,14 @@ fn compile_source(src: &str) -> Result<Vec<Op>, String> {
 }
 fn run_source(src: &str) -> Result<(), String> {
     Vm::new(compile_source(src)?).run()
+}
+
+fn disasm_source(src: &str) -> Result<(), String> {
+    let code = compile_source(src)?;
+    for (i, op) in code.iter().enumerate() {
+        println!("{i:04}  {op:?}");
+    }
+    Ok(())
 }
 
 fn fmt_source(src: &str) -> String {
@@ -834,7 +1202,7 @@ fn repl() -> Result<(), String> {
 
 fn usage() {
     println!(
-        "Veyra {VERSION}\n\nUsage:\n  veyra run <file.vy>\n  veyra check <file.vy>\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra doctor\n  veyra repl\n  veyra --version"
+        "Veyra {VERSION}\n\nUsage:\n  veyra run <file.vy>\n  veyra check <file.vy>\n  veyra disasm <file.vy>\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra doctor\n  veyra repl\n  veyra --version"
     );
 }
 fn main() -> ExitCode {
@@ -856,13 +1224,18 @@ fn main() -> ExitCode {
         Some("check") => a
             .get(2)
             .ok_or("missing file".into())
-            .and_then(|p| fs::read_to_string(p).map_err(|e| e.to_string()))
+            .and_then(|p| load_source(p))
             .and_then(|s| compile_source(&s).map(|_| println!("OK"))),
         Some("run") => a
             .get(2)
             .ok_or("missing file".into())
-            .and_then(|p| fs::read_to_string(p).map_err(|e| e.to_string()))
+            .and_then(|p| load_source(p))
             .and_then(|s| run_source(&s)),
+        Some("disasm") => a
+            .get(2)
+            .ok_or("missing file".into())
+            .and_then(|p| load_source(p))
+            .and_then(|s| disasm_source(&s)),
         Some("fmt") => a.get(2).ok_or("missing file".into()).and_then(|p| {
             let s = fs::read_to_string(p).map_err(|e| e.to_string())?;
             fs::write(p, fmt_source(&s)).map_err(|e| e.to_string())
@@ -902,5 +1275,37 @@ mod tests {
     #[test]
     fn list_builtin() {
         assert!(run_source("let x=[1,2,3]; let n=len(x);").is_ok());
+    }
+    #[test]
+    fn for_range_loop() {
+        assert!(run_source("let s=0; for n in range(0,5) { s=s+n; }").is_ok());
+    }
+    #[test]
+    fn user_function() {
+        assert!(
+            run_source("fn add(a: Int, b: Int) -> Int { return a+b; } let x=add(2,3);").is_ok()
+        );
+    }
+    #[test]
+    fn recursive_function() {
+        assert!(run_source("fn fib(n: Int) -> Int { if n<=1 { return n; } return fib(n-1)+fib(n-2); } let x=fib(8);").is_ok());
+    }
+    #[test]
+    fn map_builtin() {
+        assert!(run_source("let m={\"a\":1,\"b\":2}; let n=len(m); let x=get(m,\"b\");").is_ok());
+    }
+    #[test]
+    fn native_indexing() {
+        assert!(
+            run_source("let xs=[10,20,30]; let x=xs[1]; let m={\"a\":7}; let y=m[\"a\"];").is_ok()
+        );
+    }
+    #[test]
+    fn const_is_enforced() {
+        assert!(run_source("const x=1; x=2;").is_err());
+    }
+    #[test]
+    fn boolean_logic() {
+        assert!(run_source("let x=true and not false; let y=false or x;").is_ok());
     }
 }

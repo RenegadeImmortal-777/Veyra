@@ -4,7 +4,7 @@ import argparse, hashlib, json, os, platform, shutil, subprocess, sys, time
 from pathlib import Path
 import veyra as legacy
 
-VERSION = "3.0.0-convergence"
+VERSION = "3.2.0-convergence"
 ROOT = Path(__file__).resolve().parent
 NATIVE = ROOT / "bin" / "veyra-native.exe"
 
@@ -132,14 +132,50 @@ def cmd_bench(path,iterations=10):
         t=time.perf_counter(); legacy.run_file(str(path)); times.append(time.perf_counter()-t)
     print(f"{path}: {len(times)} runs | best={min(times)*1000:.3f}ms | mean={sum(times)/len(times)*1000:.3f}ms")
 
+def cmd_profile(path):
+    import cProfile, pstats
+    activate_env(Path(path).parent)
+    prof=cProfile.Profile(); prof.enable()
+    legacy.run_file(str(path))
+    prof.disable()
+    stats=pstats.Stats(prof).sort_stats("cumtime")
+    stats.print_stats(25)
+
+def cmd_trace(path):
+    activate_env(Path(path).parent)
+    source=Path(path).read_text(encoding="utf-8")
+    tree=legacy.parse(source,str(path))
+    print(f"TRACE {path}")
+    for i,s in enumerate(tree.body,1):
+        print(f"{i:04}: {type(s).__name__} {s}")
+    legacy.run_file(str(path))
+
+def cmd_doc(path):
+    p=Path(path); source=p.read_text(encoding="utf-8"); tree=legacy.parse(source,str(p))
+    lines=[f"# API — {p.name}",""]
+    for s in tree.body:
+        if isinstance(s,legacy.FunctionStmt):
+            params=", ".join(f"{n}: {t or 'Any'}" for n,t in s.params)
+            lines += [f"## fn {s.name}({params}) -> {s.return_type or 'Any'}",""]
+        elif isinstance(s,legacy.ClassStmt):
+            lines += [f"## class {s.name}",""]
+            for m in s.body.body:
+                if isinstance(m,legacy.FunctionStmt):
+                    params=", ".join(f"{n}: {t or 'Any'}" for n,t in m.params)
+                    lines += [f"- `{m.name}({params}) -> {m.return_type or 'Any'}`"]
+            lines.append("")
+    out=p.parent/(p.stem+".api.md")
+    out.write_text("\n".join(lines).rstrip()+"\n",encoding="utf-8")
+    print(f"Generated {out}")
+
 def resolve_file(arg=None):
     if arg: return Path(arg)
     m,p=manifest(); return p.parent/m.get("entry","src/main.vy")
 
 def cmd_check(path):
     source=Path(path).read_text(encoding="utf-8")
-    legacy.parse(source,str(path))
-    print(f"{path}: OK")
+    legacy.semantic_check(source,str(path))
+    print(f"{path}: semantic OK")
 
 def cmd_fmt(path,check=False):
     p=Path(path); before=p.read_text(encoding="utf-8"); after=fmt_text(before)
@@ -239,6 +275,15 @@ def main():
             p=resolve_file(a[1] if len(a)>1 else None)
             n=a[2] if len(a)>2 else 10
             return cmd_bench(p,n)
+        if a[0]=="profile":
+            p=resolve_file(a[1] if len(a)>1 else None); return cmd_profile(p)
+        if a[0]=="trace":
+            p=resolve_file(a[1] if len(a)>1 else None); return cmd_trace(p)
+        if a[0]=="doc":
+            p=resolve_file(a[1] if len(a)>1 else None); return cmd_doc(p)
+        if a[0]=="disasm":
+            p=resolve_file(a[1] if len(a)>1 else None)
+            raise SystemExit(native(["disasm",str(p)]).returncode)
         if a[0]=="env":
             root,py=ensure_env(); print(f"project={root}\npython={py}"); return
         if a[0]=="build": activate_env(); return cmd_build("--native" in a)
@@ -250,7 +295,7 @@ def main():
             if len(a)==1: return native(["repl"])
             raise SystemExit(native(a[1:]).returncode)
         if a[0].endswith(".vy"): return legacy.run_file(a[0])
-        print("Veyra commands: run, check, fmt, lint, test, bench, build, clean, new, add, remove, packages, lock, install, audit, env, native, doctor, info, --version")
+        print("Veyra commands: run, check, fmt, lint, test, bench, profile, trace, doc, disasm, build, clean, new, add, remove, packages, lock, install, audit, env, native, doctor, info, --version")
     except (legacy.VeyraError,OSError,json.JSONDecodeError) as e:
         print(f"veyra: error: {e}",file=sys.stderr); raise SystemExit(1)
 

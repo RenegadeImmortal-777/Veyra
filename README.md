@@ -55,3 +55,7 @@ Veyra exposes JSON, regex, files, environment access, HTTP GET, SQLite, subproce
 - tests/: regression suite
 
 The Python bridge is an interoperability strategy, not a claim that Veyra's native VM independently reimplements Python's ecosystem.
+
+## 90%-Practical milestone
+
+See STATUS-90.md for the exact distinction between practical capability reach and native implementation depth. Veyra can now reach much of the Python ecosystem while Horizon continues replacing fallback paths with native compiler/VM features.

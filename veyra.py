@@ -2,12 +2,12 @@
 from __future__ import annotations
 import argparse, math, os, sys, time, json, re, csv, sqlite3, subprocess, importlib, random
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
-VERSION = "3.0.0-convergence"
+VERSION = "3.2.0-convergence"
 
 class VeyraError(Exception):
     pass
@@ -509,6 +509,16 @@ class Runtime:
         def parallel_map(fn, items, workers=None):
             with ThreadPoolExecutor(max_workers=None if workers is None else int(workers)) as pool:
                 return list(pool.map(fn, list(items)))
+        _task_pool = ThreadPoolExecutor()
+        def spawn(fn, *args):
+            if not callable(fn): raise VeyraError("spawn expects a function")
+            return _task_pool.submit(fn, *args)
+        def await_task(task):
+            if not isinstance(task, Future): raise VeyraError("await_task expects a task")
+            return task.result()
+        def task_done(task):
+            if not isinstance(task, Future): raise VeyraError("task_done expects a task")
+            return task.done()
         def shell(command):
             r = subprocess.run(str(command), shell=True, text=True, capture_output=True)
             return {"code":r.returncode,"out":r.stdout,"err":r.stderr}
@@ -530,7 +540,8 @@ class Runtime:
             "py_get":lambda obj,name:getattr(obj,str(name)),
             "py_set":lambda obj,name,value:(setattr(obj,str(name),value) or value),
             "py_dir":lambda obj:list(dir(obj)),
-            "parallel_map":parallel_map,"shell":shell,"http_get":http_get,
+            "parallel_map":parallel_map,"spawn":spawn,"await_task":await_task,"task_done":task_done,
+            "shell":shell,"http_get":http_get,
             "db_open":db_open,"random":random.random,"randint":random.randint,
             "path_exists":lambda p:Path(str(p)).exists(),"cwd":lambda:os.getcwd(),
             "env":lambda k:os.environ.get(str(k))
@@ -674,6 +685,94 @@ class Runtime:
 
 def parse(source, filename="<input>"):
     return Parser(Lexer(source, filename).tokens(), filename).program()
+
+BUILTIN_NAMES = {
+    "print","len","str","int","float","bool","type","range","assert","push","pop","keys","values",
+    "input","clock","sqrt","abs","min","max","round","tuple","set","list","map","sorted","sum",
+    "read","write","json","json_parse","regex","py_import","py_call","py_get","py_set","py_dir",
+    "parallel_map","spawn","await_task","task_done","shell","http_get","db_open","random","randint",
+    "path_exists","cwd","env"
+}
+
+def semantic_check(source, filename="<input>"):
+    tree = parse(source, filename)
+    errors = []
+
+    def check_expr(e, scopes):
+        if isinstance(e, Literal): return
+        if isinstance(e, Var):
+            if not any(e.name in s for s in reversed(scopes)) and e.name not in BUILTIN_NAMES:
+                errors.append(f"undefined name '{e.name}'")
+            return
+        if isinstance(e, (ListExpr, TupleExpr, SetExpr)):
+            for x in e.items: check_expr(x, scopes)
+            return
+        if isinstance(e, MapExpr):
+            for k,v in e.pairs: check_expr(k, scopes); check_expr(v, scopes)
+            return
+        if isinstance(e, (Unary,)):
+            check_expr(e.right, scopes); return
+        if isinstance(e, Binary):
+            check_expr(e.left, scopes); check_expr(e.right, scopes); return
+        if isinstance(e, Call):
+            check_expr(e.fn, scopes)
+            for a in e.args: check_expr(a, scopes)
+            return
+        if isinstance(e, Index):
+            check_expr(e.obj, scopes); check_expr(e.key, scopes); return
+        if isinstance(e, Member):
+            check_expr(e.obj, scopes); return
+
+    def check_block(block, scopes, predeclare=True):
+        local = set()
+        scopes = scopes + [local]
+        if predeclare:
+            for s in block.body:
+                if isinstance(s, (FunctionStmt, ClassStmt)): local.add(s.name)
+        for s in block.body:
+            if isinstance(s, LetStmt):
+                check_expr(s.value, scopes)
+                if s.name in local: errors.append(f"duplicate declaration '{s.name}'")
+                local.add(s.name)
+            elif isinstance(s, AssignStmt):
+                check_expr(s.target, scopes); check_expr(s.value, scopes)
+            elif isinstance(s, ExprStmt): check_expr(s.expr, scopes)
+            elif isinstance(s, IfStmt):
+                check_expr(s.cond, scopes)
+                check_block(s.then, scopes)
+                if s.otherwise:
+                    if isinstance(s.otherwise, Block): check_block(s.otherwise, scopes)
+                    else: check_block(Block([s.otherwise]), scopes)
+            elif isinstance(s, WhileStmt):
+                check_expr(s.cond, scopes); check_block(s.body, scopes)
+            elif isinstance(s, ForStmt):
+                check_expr(s.iterable, scopes)
+                check_block(s.body, scopes + [{s.name}], predeclare=True)
+            elif isinstance(s, FunctionStmt):
+                fn_scope = {n for n,_ in s.params}
+                check_block(s.body, scopes + [fn_scope], predeclare=True)
+            elif isinstance(s, ClassStmt):
+                for item in s.body.body:
+                    if isinstance(item, FunctionStmt):
+                        fn_scope = {n for n,_ in item.params}
+                        check_block(item.body, scopes + [fn_scope], predeclare=True)
+            elif isinstance(s, ReturnStmt):
+                if s.value is not None: check_expr(s.value, scopes)
+            elif isinstance(s, TryStmt):
+                check_block(s.body, scopes)
+                check_block(s.handler, scopes + [{s.error_name}], predeclare=True)
+            elif isinstance(s, ThrowStmt): check_expr(s.value, scopes)
+            elif isinstance(s, UseStmt): pass
+        return scopes
+
+    root = set()
+    for s in tree.body:
+        if isinstance(s, (FunctionStmt, ClassStmt)): root.add(s.name)
+    check_block(tree, [root], predeclare=False)
+    if errors:
+        unique = list(dict.fromkeys(errors))
+        raise VeyraError(f"{filename}: semantic check failed: " + "; ".join(unique))
+    return tree
 
 def run_source(source, filename="<input>", env=None):
     rt = Runtime(filename, env)
