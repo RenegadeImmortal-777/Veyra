@@ -1,61 +1,84 @@
-# Veyra 3.0 Convergence
+# Veyra 4.0 Sovereign
 
-Veyra is a dual-engine programming language platform with a broad compatibility runtime and a native Rust bytecode VM.
+Veyra is now native-first. The default `veyra` command executes the standalone Rust compiler/bytecode VM and does not require Python.
 
-## Language
-Veyra supports variables/constants, typed functions, recursion, closures, classes and bound methods, lists/maps/tuples/sets, indexing and member access, modules, if/else, while, for/in, break/continue, try/catch/throw, comments, a REPL, and runtime type enforcement.
+## Native language platform
 
-## Python ecosystem bridge
-A Veyra program can import project-installed Python modules with:
+Veyra Sovereign includes its own lexer, parser, AST, bytecode compiler and stack VM with variables, constants, typed function syntax, user functions, recursion, if/else, while, native for/range loops, lists, maps, indexing, modules, boolean logic, strings and core operators.
 
-    let np = py_import("numpy");
+## Native standard services
 
-Member access and calls work directly:
+The standalone executable directly provides:
 
-    let math = py_import("math");
-    print(math.sqrt(81));
+- JSON parse/stringify
+- regular expressions
+- text case/trim/split/join/contains
+- file read/write
+- directory listing/creation and file removal
+- paths and environment variables
+- subprocess execution
+- HTTP GET over Rustls
+- time and random numbers
+- SHA-256 hashing
+- SQLite execute/query using bundled SQLite
+- core math including sqrt/abs/floor/ceil
 
-Keyword arguments are available through:
+These services execute inside Veyra's Rust runtime rather than through Python.
 
-    py_call(fn, [arg1, arg2], {"name": value});
+## Veyra package ecosystem
 
-Project dependencies are isolated under .veyra/venv.
+Veyra has its own registry under `registry/index.json`, its own package store, vendoring, manifest and lock file.
 
-## CLI
-    veyra new app
-    veyra run [file.vy]
-    veyra check [file.vy]
-    veyra fmt [file.vy]
-    veyra lint [file.vy]
-    veyra test
-    veyra bench [file.vy] [iterations]
-    veyra build
-    veyra add <python-package>
-    veyra remove <python-package>
+Commands:
+
+    veyra registry
+    veyra add vymath
+    veyra remove vymath
     veyra packages
-    veyra lock
     veyra install
-    veyra audit
-    veyra env
-    veyra native ...
-    veyra doctor
-    veyra info
+    veyra pkg search math
+    veyra publish
 
-## Runtime services
-Veyra exposes JSON, regex, files, environment access, HTTP GET, SQLite, subprocesses, random utilities, parallel_map and Python reflection helpers.
+Packages can be imported by name:
 
-## Architecture
-- veyra.py: Convergence compatibility runtime
-- veyra_cli.py: unified CLI and project environment manager
-- engine-rs/: native Rust lexer/parser/AST/bytecode compiler/VM
-- bin/veyra-native.exe: optimized native VM
-- stdlib/: Veyra standard-library seed
-- tooling/vscode/: local VS Code language support
-- spec/: architecture and language specification
-- tests/: regression suite
+    use "vymath";
+    use "vystats";
 
-The Python bridge is an interoperability strategy, not a claim that Veyra's native VM independently reimplements Python's ecosystem.
+Current native packages include vymath, vystats, vyalgo, vycollections, vytext, vytest and vyhello.
 
-## 90%-Practical milestone
+## Native project workflow
 
-See STATUS-90.md for the exact distinction between practical capability reach and native implementation depth. Veyra can now reach much of the Python ecosystem while Horizon continues replacing fallback paths with native compiler/VM features.
+    veyra new myapp
+    cd myapp
+    veyra add vymath
+    veyra check
+    veyra run
+    veyra test
+    veyra build
+
+`veyra build` creates a distributable directory containing the standalone `veyra.exe`, project source, manifest and vendored Veyra packages.
+
+## Independence proof
+
+A packaged Veyra application was executed successfully after Python was removed from PATH. The bundled `veyra.exe` loaded vendored Veyra packages, executed math/statistics package code and completed with exit code 0.
+
+## Compatibility bridge
+
+The earlier Python-backed Convergence runtime is preserved as an optional compatibility route. It is no longer the default launcher. This keeps access to Python interoperability while allowing normal Veyra programs and packages to depend on Veyra itself.
+
+## Repository layout
+
+- `engine-rs/` - native Rust compiler, VM, standard services and package CLI
+- `bin/veyra-native.exe` - standalone Windows runtime
+- `packages/` - Veyra-native package sources
+- `registry/` - Veyra package registry
+- `veyra.bat` - native-first repository launcher
+- `veyra-convergence.bat` - compatibility launcher
+- `veyra.py`, `veyra_cli.py` - optional Convergence compatibility stack
+- `tooling/vscode/` - Veyra editor integration
+- `spec/` - language/architecture documentation
+- `STATUS-50-INDEPENDENT.md` - independence milestone definition
+
+## Version
+
+Native runtime: Veyra 4.0.0-sovereign

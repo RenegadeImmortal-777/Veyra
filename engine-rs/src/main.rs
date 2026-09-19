@@ -3,10 +3,17 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: &str = "3.1.0-horizon";
+use rand::Rng;
+use regex::Regex;
+use rusqlite::Connection;
+use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
+
+const VERSION: &str = "4.0.0-sovereign";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -572,6 +579,38 @@ enum Val {
     List(Vec<Val>),
     Map(Vec<(Val, Val)>),
 }
+fn val_to_json(v: &Val) -> JsonValue {
+    match v {
+        Val::Num(n) => JsonValue::from(*n),
+        Val::Str(s) => JsonValue::from(s.clone()),
+        Val::Bool(b) => JsonValue::from(*b),
+        Val::Null => JsonValue::Null,
+        Val::List(xs) => JsonValue::Array(xs.iter().map(val_to_json).collect()),
+        Val::Map(pairs) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in pairs {
+                obj.insert(k.show(), val_to_json(v));
+            }
+            JsonValue::Object(obj)
+        }
+    }
+}
+
+fn json_to_val(v: &JsonValue) -> Val {
+    match v {
+        JsonValue::Null => Val::Null,
+        JsonValue::Bool(b) => Val::Bool(*b),
+        JsonValue::Number(n) => Val::Num(n.as_f64().unwrap_or(0.0)),
+        JsonValue::String(s) => Val::Str(s.clone()),
+        JsonValue::Array(xs) => Val::List(xs.iter().map(json_to_val).collect()),
+        JsonValue::Object(obj) => Val::Map(
+            obj.iter()
+                .map(|(k, v)| (Val::Str(k.clone()), json_to_val(v)))
+                .collect(),
+        ),
+    }
+}
+
 impl Val {
     fn truthy(&self) -> bool {
         match self {
@@ -1046,6 +1085,226 @@ impl Vm {
                                 _ => return Err("values expects a map".into()),
                             }
                         }
+                        "json_stringify" => {
+                            if a.len() != 1 {
+                                return Err("json_stringify expects 1 argument".into());
+                            }
+                            Val::Str(
+                                serde_json::to_string(&val_to_json(&a[0]))
+                                    .map_err(|e| e.to_string())?,
+                            )
+                        }
+                        "json_parse" => {
+                            if a.len() != 1 {
+                                return Err("json_parse expects 1 argument".into());
+                            }
+                            let s = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("json_parse expects String".into()),
+                            };
+                            json_to_val(
+                                &serde_json::from_str::<JsonValue>(s).map_err(|e| e.to_string())?,
+                            )
+                        }
+                        "regex_findall" => {
+                            if a.len() != 2 {
+                                return Err("regex_findall expects pattern,text".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("pattern must be String".into()),
+                            };
+                            let t = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let re = Regex::new(p).map_err(|e| e.to_string())?;
+                            Val::List(
+                                re.find_iter(t)
+                                    .map(|m| Val::Str(m.as_str().to_string()))
+                                    .collect(),
+                            )
+                        }
+                        "read_file" => {
+                            if a.len() != 1 {
+                                return Err("read_file expects path".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            Val::Str(fs::read_to_string(p).map_err(|e| e.to_string())?)
+                        }
+                        "write_file" => {
+                            if a.len() != 2 {
+                                return Err("write_file expects path,data".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let data = a[1].show();
+                            fs::write(p, data).map_err(|e| e.to_string())?;
+                            Val::Null
+                        }
+                        "path_exists" => {
+                            if a.len() != 1 {
+                                return Err("path_exists expects path".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            Val::Bool(Path::new(p).exists())
+                        }
+                        "cwd" => Val::Str(
+                            env::current_dir()
+                                .map_err(|e| e.to_string())?
+                                .display()
+                                .to_string(),
+                        ),
+                        "env_get" => {
+                            if a.len() != 1 {
+                                return Err("env_get expects key".into());
+                            }
+                            let k = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("key must be String".into()),
+                            };
+                            env::var(k).map(Val::Str).unwrap_or(Val::Null)
+                        }
+                        "clock" => {
+                            let t = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_err(|e| e.to_string())?;
+                            Val::Num(t.as_secs_f64())
+                        }
+                        "random" => Val::Num(rand::thread_rng().r#gen::<f64>()),
+                        "randint" => {
+                            if a.len() != 2 {
+                                return Err("randint expects min,max".into());
+                            }
+                            let lo = match a[0] {
+                                Val::Num(n) => n as i64,
+                                _ => return Err("min must be Number".into()),
+                            };
+                            let hi = match a[1] {
+                                Val::Num(n) => n as i64,
+                                _ => return Err("max must be Number".into()),
+                            };
+                            Val::Num(rand::thread_rng().gen_range(lo..=hi) as f64)
+                        }
+                        "sha256" => {
+                            if a.len() != 1 {
+                                return Err("sha256 expects value".into());
+                            }
+                            let mut h = Sha256::new();
+                            h.update(a[0].show().as_bytes());
+                            Val::Str(format!("{:x}", h.finalize()))
+                        }
+                        "shell" => {
+                            if a.len() != 1 {
+                                return Err("shell expects command".into());
+                            }
+                            let cmd = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("command must be String".into()),
+                            };
+                            let out = if cfg!(target_os = "windows") {
+                                Command::new("cmd").args(["/C", cmd]).output()
+                            } else {
+                                Command::new("sh").args(["-c", cmd]).output()
+                            }
+                            .map_err(|e| e.to_string())?;
+                            Val::Map(vec![
+                                (
+                                    Val::Str("code".into()),
+                                    Val::Num(out.status.code().unwrap_or(-1) as f64),
+                                ),
+                                (
+                                    Val::Str("out".into()),
+                                    Val::Str(String::from_utf8_lossy(&out.stdout).to_string()),
+                                ),
+                                (
+                                    Val::Str("err".into()),
+                                    Val::Str(String::from_utf8_lossy(&out.stderr).to_string()),
+                                ),
+                            ])
+                        }
+                        "http_get" => {
+                            if a.len() != 1 {
+                                return Err("http_get expects url".into());
+                            }
+                            let url = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("url must be String".into()),
+                            };
+                            let text = reqwest::blocking::get(url)
+                                .map_err(|e| e.to_string())?
+                                .text()
+                                .map_err(|e| e.to_string())?;
+                            Val::Str(text)
+                        }
+                        "sqlite_exec" => {
+                            if a.len() != 2 {
+                                return Err("sqlite_exec expects path,sql".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let sql = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("sql must be String".into()),
+                            };
+                            let conn = Connection::open(path).map_err(|e| e.to_string())?;
+                            let n = conn.execute(sql, []).map_err(|e| e.to_string())?;
+                            Val::Num(n as f64)
+                        }
+                        "sqlite_query" => {
+                            if a.len() != 2 {
+                                return Err("sqlite_query expects path,sql".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let sql = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("sql must be String".into()),
+                            };
+                            let conn = Connection::open(path).map_err(|e| e.to_string())?;
+                            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+                            let names: Vec<String> =
+                                stmt.column_names().iter().map(|s| s.to_string()).collect();
+                            let rows = stmt
+                                .query_map([], |row| {
+                                    let mut pairs = Vec::new();
+                                    for (i, name) in names.iter().enumerate() {
+                                        let val = match row.get_ref(i)? {
+                                            rusqlite::types::ValueRef::Null => Val::Null,
+                                            rusqlite::types::ValueRef::Integer(x) => {
+                                                Val::Num(x as f64)
+                                            }
+                                            rusqlite::types::ValueRef::Real(x) => Val::Num(x),
+                                            rusqlite::types::ValueRef::Text(x) => {
+                                                Val::Str(String::from_utf8_lossy(x).to_string())
+                                            }
+                                            rusqlite::types::ValueRef::Blob(x) => {
+                                                Val::Str(format!("<{} bytes>", x.len()))
+                                            }
+                                        };
+                                        pairs.push((Val::Str(name.clone()), val));
+                                    }
+                                    Ok(Val::Map(pairs))
+                                })
+                                .map_err(|e| e.to_string())?;
+                            let mut out = Vec::new();
+                            for row in rows {
+                                out.push(row.map_err(|e| e.to_string())?);
+                            }
+                            Val::List(out)
+                        }
                         _ => {
                             let (params, code) = self
                                 .funcs
@@ -1095,7 +1354,33 @@ fn load_source(path: &str) -> Result<String, String> {
                     if let Some(b_rel) = t[a + 1..].find('"') {
                         let b = a + 1 + b_rel;
                         let rel = &t[a + 1..b];
-                        out.push_str(&load(&base.join(rel), seen)?);
+                        let target =
+                            if !rel.contains('/') && !rel.contains('\\') && !rel.ends_with(".vy") {
+                                if let Ok(root) = project_root(base) {
+                                    let manifest_path = root.join("veyra.json");
+                                    let manifest: JsonValue = serde_json::from_str(
+                                        &fs::read_to_string(&manifest_path)
+                                            .map_err(|e| e.to_string())?,
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                    if let Some(meta) =
+                                        manifest.get("packages").and_then(|p| p.get(rel))
+                                    {
+                                        let entry = meta
+                                            .get("entry")
+                                            .and_then(JsonValue::as_str)
+                                            .unwrap_or("main.vy");
+                                        root.join("vendor").join(rel).join(entry)
+                                    } else {
+                                        base.join(rel)
+                                    }
+                                } else {
+                                    base.join(rel)
+                                }
+                            } else {
+                                base.join(rel)
+                            };
+                        out.push_str(&load(&target, seen)?);
                         out.push('\n');
                         continue;
                     }
@@ -1148,15 +1433,374 @@ fn fmt_source(src: &str) -> String {
     out
 }
 
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn project_root(start: &Path) -> Result<PathBuf, String> {
+    let mut p = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    loop {
+        if p.join("veyra.json").exists() {
+            return Ok(p);
+        }
+        if !p.pop() {
+            return Err("veyra.json not found".into());
+        }
+    }
+}
+
+fn veyra_home() -> PathBuf {
+    if let Ok(v) = env::var("VEYRA_HOME") {
+        return PathBuf::from(v);
+    }
+    if cfg!(target_os = "windows") {
+        if let Ok(v) = env::var("LOCALAPPDATA") {
+            return PathBuf::from(v).join("Veyra");
+        }
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn pkg_index() -> Result<(PathBuf, JsonValue), String> {
+    let path = veyra_home().join("registry").join("index.json");
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("registry unavailable at {}: {e}", path.display()))?;
+    let json = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok((path, json))
+}
+
+fn write_package_lock(root: &Path, manifest: &JsonValue) -> Result<(), String> {
+    let lock = serde_json::json!({
+        "format": 1,
+        "engine": VERSION,
+        "packages": manifest.get("packages").cloned().unwrap_or_else(|| serde_json::json!({}))
+    });
+    fs::write(
+        root.join("veyra.lock"),
+        serde_json::to_string_pretty(&lock).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn pkg_add(name: &str) -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    let (index_path, index) = pkg_index()?;
+    let pkg = index
+        .get("packages")
+        .and_then(|x| x.get(name))
+        .ok_or(format!("package '{name}' not found in Veyra registry"))?;
+    let version = pkg
+        .get("version")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("0.0.0");
+    let entry = pkg
+        .get("entry")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("main.vy");
+    let source = pkg
+        .get("source")
+        .and_then(JsonValue::as_str)
+        .ok_or("registry package missing source")?;
+    let source_path = index_path.parent().unwrap_or(Path::new(".")).join(source);
+    let dest = root.join("vendor").join(name);
+    if dest.exists() {
+        fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+    }
+    copy_dir_all(&source_path, &dest)?;
+
+    let manifest_path = root.join("veyra.json");
+    let mut manifest: JsonValue =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if !manifest
+        .get("packages")
+        .map(JsonValue::is_object)
+        .unwrap_or(false)
+    {
+        manifest["packages"] = JsonValue::Object(serde_json::Map::new());
+    }
+    manifest["packages"][name] = serde_json::json!({"version":version,"entry":entry});
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    write_package_lock(&root, &manifest)?;
+    println!("Added {name} {version} -> vendor/{name}/{entry}");
+    Ok(())
+}
+
+fn pkg_remove(name: &str) -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    let dest = root.join("vendor").join(name);
+    if dest.exists() {
+        fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+    }
+    let manifest_path = root.join("veyra.json");
+    let mut manifest: JsonValue =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if let Some(obj) = manifest
+        .get_mut("packages")
+        .and_then(JsonValue::as_object_mut)
+    {
+        obj.remove(name);
+    }
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    write_package_lock(&root, &manifest)?;
+    println!("Removed {name}");
+    Ok(())
+}
+
+fn pkg_list() -> Result<(), String> {
+    let (_, index) = pkg_index()?;
+    println!("Veyra Registry");
+    if let Some(pkgs) = index.get("packages").and_then(JsonValue::as_object) {
+        for (name, meta) in pkgs {
+            let version = meta
+                .get("version")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("?");
+            println!("  {name} {version}");
+        }
+    }
+    Ok(())
+}
+
+fn pkg_install() -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    let manifest: JsonValue = serde_json::from_str(
+        &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let names: Vec<String> = manifest
+        .get("packages")
+        .and_then(JsonValue::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    for name in names {
+        pkg_add(&name)?;
+    }
+    println!("Veyra packages restored");
+    Ok(())
+}
+
+fn pkg_search(term: &str) -> Result<(), String> {
+    let (_, index) = pkg_index()?;
+    println!("Veyra Registry search: {term}");
+    if let Some(pkgs) = index.get("packages").and_then(JsonValue::as_object) {
+        for (name, meta) in pkgs {
+            if name.to_lowercase().contains(&term.to_lowercase()) {
+                let version = meta
+                    .get("version")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("?");
+                println!("  {name} {version}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pkg_publish() -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    let manifest_path = root.join("veyra.json");
+    let manifest: JsonValue =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let name = manifest
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .ok_or("manifest missing name")?;
+    let version = manifest
+        .get("version")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("0.0.0");
+    let entry = manifest
+        .get("entry")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("src/main.vy");
+
+    let home = veyra_home();
+    let pkg_root = home.join("packages").join(name);
+    if pkg_root.exists() {
+        fs::remove_dir_all(&pkg_root).map_err(|e| e.to_string())?;
+    }
+    fs::create_dir_all(&pkg_root).map_err(|e| e.to_string())?;
+    copy_dir_all(&root.join("src"), &pkg_root.join("src"))?;
+
+    let index_path = home.join("registry").join("index.json");
+    fs::create_dir_all(index_path.parent().unwrap_or(Path::new("."))).map_err(|e| e.to_string())?;
+    let mut index: JsonValue = if index_path.exists() {
+        serde_json::from_str(&fs::read_to_string(&index_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        serde_json::json!({"registry_version":1,"packages":{}})
+    };
+    if !index
+        .get("packages")
+        .map(JsonValue::is_object)
+        .unwrap_or(false)
+    {
+        index["packages"] = JsonValue::Object(serde_json::Map::new());
+    }
+    index["packages"][name] = serde_json::json!({
+        "version": version,
+        "entry": entry,
+        "source": format!("../packages/{name}")
+    });
+    fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&index).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    println!("Published {name} {version} to {}", index_path.display());
+    Ok(())
+}
+
+fn project_packages() -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    let manifest: JsonValue = serde_json::from_str(
+        &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    println!("Installed Veyra packages");
+    if let Some(pkgs) = manifest.get("packages").and_then(JsonValue::as_object) {
+        for (name, meta) in pkgs {
+            let version = meta
+                .get("version")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("?");
+            println!("  {name} {version}");
+        }
+    }
+    Ok(())
+}
+
+fn project_entry() -> Result<PathBuf, String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    let manifest: JsonValue = serde_json::from_str(
+        &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let entry = manifest
+        .get("entry")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("src/main.vy");
+    Ok(root.join(entry))
+}
+
+fn test_project() -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    let dir = root.join("tests");
+    if !dir.exists() {
+        println!("No tests directory");
+        return Ok(());
+    }
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("vy") {
+            continue;
+        }
+        total += 1;
+        match load_source(path.to_string_lossy().as_ref()).and_then(|s| run_source(&s)) {
+            Ok(()) => {
+                passed += 1;
+                println!("PASS {}", path.display());
+            }
+            Err(e) => println!("FAIL {}: {e}", path.display()),
+        }
+    }
+    println!("{passed}/{total} passed");
+    if passed != total {
+        return Err("test suite failed".into());
+    }
+    Ok(())
+}
+
+fn build_project() -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    let manifest_path = root.join("veyra.json");
+    let manifest: JsonValue =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let name = manifest
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("app");
+    let version = manifest
+        .get("version")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("0.0.0");
+    let dist = root.join("dist").join(format!("{name}-{version}"));
+    if dist.exists() {
+        fs::remove_dir_all(&dist).map_err(|e| e.to_string())?;
+    }
+    fs::create_dir_all(&dist).map_err(|e| e.to_string())?;
+    copy_dir_all(&root.join("src"), &dist.join("src"))?;
+    if root.join("vendor").exists() {
+        copy_dir_all(&root.join("vendor"), &dist.join("vendor"))?;
+    }
+    fs::copy(&manifest_path, dist.join("veyra.json")).map_err(|e| e.to_string())?;
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    fs::copy(
+        &exe,
+        dist.join(if cfg!(target_os = "windows") {
+            "veyra.exe"
+        } else {
+            "veyra"
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+    println!("Built {}", dist.display());
+    Ok(())
+}
+
 fn new_project(name: &str) -> Result<(), String> {
     let p = PathBuf::from(name);
     if p.exists() {
         return Err(format!("'{name}' already exists"));
     }
+    let project_name = p
+        .file_name()
+        .and_then(|x| x.to_str())
+        .filter(|x| !x.is_empty())
+        .unwrap_or("veyra-app")
+        .to_string();
     fs::create_dir_all(p.join("src")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(p.join("tests")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(p.join("vendor")).map_err(|e| e.to_string())?;
+    let manifest = serde_json::json!({
+        "name": project_name,
+        "version": "0.1.0",
+        "entry": "src/main.vy",
+        "edition": "2026",
+        "engine": VERSION,
+        "packages": {}
+    });
     fs::write(
-        p.join("veyra.toml"),
-        format!("name = \"{name}\"\nversion = \"0.1.0\"\nentry = \"src/main.vy\"\n"),
+        p.join("veyra.json"),
+        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     fs::write(
@@ -1202,7 +1846,7 @@ fn repl() -> Result<(), String> {
 
 fn usage() {
     println!(
-        "Veyra {VERSION}\n\nUsage:\n  veyra run <file.vy>\n  veyra check <file.vy>\n  veyra disasm <file.vy>\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra doctor\n  veyra repl\n  veyra --version"
+        "Veyra {VERSION}\n\nUsage:\n  veyra run [file.vy]\n  veyra check [file.vy]\n  veyra test\n  veyra build\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg add <name>\n  veyra pkg remove <name>\n  veyra pkg installed\n  veyra doctor\n  veyra repl\n  veyra --version"
     );
 }
 fn main() -> ExitCode {
@@ -1221,21 +1865,65 @@ fn main() -> ExitCode {
             .get(2)
             .ok_or("missing project name".into())
             .and_then(|n| new_project(n)),
-        Some("check") => a
+        Some("pkg") => match a.get(2).map(String::as_str) {
+            Some("list") => pkg_list(),
+            Some("installed") => project_packages(),
+            Some("install") => pkg_install(),
+            Some("publish") => pkg_publish(),
+            Some("search") => a
+                .get(3)
+                .ok_or("missing search term".into())
+                .and_then(|q| pkg_search(q)),
+            Some("add") => a
+                .get(3)
+                .ok_or("missing package name".into())
+                .and_then(|n| pkg_add(n)),
+            Some("remove") => a
+                .get(3)
+                .ok_or("missing package name".into())
+                .and_then(|n| pkg_remove(n)),
+            _ => Err(
+                "usage: veyra pkg <list|search|installed|install|publish|add|remove> [name]".into(),
+            ),
+        },
+        Some("add") => a
             .get(2)
-            .ok_or("missing file".into())
-            .and_then(|p| load_source(p))
-            .and_then(|s| compile_source(&s).map(|_| println!("OK"))),
-        Some("run") => a
+            .ok_or("missing package name".into())
+            .and_then(|n| pkg_add(n)),
+        Some("remove") => a
             .get(2)
-            .ok_or("missing file".into())
-            .and_then(|p| load_source(p))
-            .and_then(|s| run_source(&s)),
-        Some("disasm") => a
-            .get(2)
-            .ok_or("missing file".into())
-            .and_then(|p| load_source(p))
-            .and_then(|s| disasm_source(&s)),
+            .ok_or("missing package name".into())
+            .and_then(|n| pkg_remove(n)),
+        Some("install") => pkg_install(),
+        Some("publish") => pkg_publish(),
+        Some("packages") => project_packages(),
+        Some("registry") => pkg_list(),
+        Some("check") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| load_source(p.to_string_lossy().as_ref()))
+                .and_then(|s| compile_source(&s).map(|_| println!("OK")))
+        }
+        Some("run") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| load_source(p.to_string_lossy().as_ref()))
+                .and_then(|s| run_source(&s))
+        }
+        Some("test") => test_project(),
+        Some("build") => build_project(),
+        Some("disasm") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| load_source(p.to_string_lossy().as_ref()))
+                .and_then(|s| disasm_source(&s))
+        }
         Some("fmt") => a.get(2).ok_or("missing file".into()).and_then(|p| {
             let s = fs::read_to_string(p).map_err(|e| e.to_string())?;
             fs::write(p, fmt_source(&s)).map_err(|e| e.to_string())
@@ -1307,5 +1995,22 @@ mod tests {
     #[test]
     fn boolean_logic() {
         assert!(run_source("let x=true and not false; let y=false or x;").is_ok());
+    }
+    #[test]
+    fn native_json_regex_hash() {
+        assert!(run_source(
+            "let j=json_parse(\"{\\\"a\\\":7}\"); let x=get(j,\"a\"); let m=regex_findall(\"[0-9]+\",\"a12b34\"); let h=sha256(\"veyra\");"
+        ).is_ok());
+    }
+    #[test]
+    fn native_file_io() {
+        let p = env::temp_dir().join("veyra_native_io_test.txt");
+        let s = format!(
+            "write_file(\"{}\",\"hello\"); let x=read_file(\"{}\");",
+            p.to_string_lossy().replace('\\', "\\\\"),
+            p.to_string_lossy().replace('\\', "\\\\")
+        );
+        assert!(run_source(&s).is_ok());
+        let _ = fs::remove_file(p);
     }
 }

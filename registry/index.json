@@ -1,0 +1,40 @@
+{
+  "packages": {
+    "vyalgo": {
+      "entry": "vyalgo.vy",
+      "source": "../packages/vyalgo",
+      "version": "0.1.0"
+    },
+    "vycollections": {
+      "entry": "vycollections.vy",
+      "source": "../packages/vycollections",
+      "version": "0.1.0"
+    },
+    "vyhello": {
+      "entry": "src/main.vy",
+      "source": "../packages/vyhello",
+      "version": "0.1.0"
+    },
+    "vymath": {
+      "entry": "vymath.vy",
+      "source": "../packages/vymath",
+      "version": "0.2.0"
+    },
+    "vystats": {
+      "entry": "vystats.vy",
+      "source": "../packages/vystats",
+      "version": "0.1.0"
+    },
+    "vytest": {
+      "entry": "vytest.vy",
+      "source": "../packages/vytest",
+      "version": "0.2.0"
+    },
+    "vytext": {
+      "entry": "vytext.vy",
+      "source": "../packages/vytext",
+      "version": "0.1.0"
+    }
+  },
+  "registry_version": 1
+}

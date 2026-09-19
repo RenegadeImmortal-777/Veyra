@@ -1,2 +1,2 @@
 @echo off
-python "%~dp0veyra_cli.py" %*
+"%~dp0bin\veyra-native.exe" %*
