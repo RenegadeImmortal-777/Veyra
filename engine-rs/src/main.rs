@@ -12,8 +12,9 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
+use tiny_http::{Header, Response, Server, StatusCode};
 
-const VERSION: &str = "4.0.0-sovereign";
+const VERSION: &str = "5.0.0-frontier";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -611,6 +612,49 @@ fn json_to_val(v: &JsonValue) -> Val {
     }
 }
 
+fn as_num_list(v: &Val) -> Result<Vec<f64>, String> {
+    match v {
+        Val::List(xs) => xs
+            .iter()
+            .map(|x| match x {
+                Val::Num(n) => Ok(*n),
+                _ => Err("expected numeric list".into()),
+            })
+            .collect(),
+        _ => Err("expected List".into()),
+    }
+}
+
+fn as_matrix(v: &Val) -> Result<Vec<Vec<f64>>, String> {
+    match v {
+        Val::List(rows) => rows.iter().map(as_num_list).collect(),
+        _ => Err("expected matrix as List<List<Number>>".into()),
+    }
+}
+
+fn nums_to_val(xs: Vec<f64>) -> Val {
+    Val::List(xs.into_iter().map(Val::Num).collect())
+}
+
+fn matrix_to_val(xs: Vec<Vec<f64>>) -> Val {
+    Val::List(xs.into_iter().map(nums_to_val).collect())
+}
+
+fn distance_sq(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+fn map_lookup<'a>(pairs: &'a [(Val, Val)], key: &Val) -> Option<&'a Val> {
+    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+fn svg_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 impl Val {
     fn truthy(&self) -> bool {
         match self {
@@ -1124,6 +1168,823 @@ impl Vm {
                                     .map(|m| Val::Str(m.as_str().to_string()))
                                     .collect(),
                             )
+                        }
+                        "vec_sum" => {
+                            if a.len() != 1 {
+                                return Err("vec_sum expects list".into());
+                            }
+                            let xs = as_num_list(&a[0])?;
+                            Val::Num(xs.iter().sum())
+                        }
+                        "vec_mean" => {
+                            if a.len() != 1 {
+                                return Err("vec_mean expects list".into());
+                            }
+                            let xs = as_num_list(&a[0])?;
+                            if xs.is_empty() {
+                                return Err("vec_mean requires non-empty list".into());
+                            }
+                            Val::Num(xs.iter().sum::<f64>() / xs.len() as f64)
+                        }
+                        "vec_variance" => {
+                            if a.len() != 1 {
+                                return Err("vec_variance expects list".into());
+                            }
+                            let xs = as_num_list(&a[0])?;
+                            if xs.is_empty() {
+                                return Err("vec_variance requires non-empty list".into());
+                            }
+                            let m = xs.iter().sum::<f64>() / xs.len() as f64;
+                            Val::Num(
+                                xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / xs.len() as f64,
+                            )
+                        }
+                        "vec_std" => {
+                            if a.len() != 1 {
+                                return Err("vec_std expects list".into());
+                            }
+                            let xs = as_num_list(&a[0])?;
+                            if xs.is_empty() {
+                                return Err("vec_std requires non-empty list".into());
+                            }
+                            let m = xs.iter().sum::<f64>() / xs.len() as f64;
+                            let v =
+                                xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / xs.len() as f64;
+                            Val::Num(v.sqrt())
+                        }
+                        "vec_dot" => {
+                            if a.len() != 2 {
+                                return Err("vec_dot expects two lists".into());
+                            }
+                            let x = as_num_list(&a[0])?;
+                            let y = as_num_list(&a[1])?;
+                            if x.len() != y.len() {
+                                return Err("vec_dot length mismatch".into());
+                            }
+                            Val::Num(x.iter().zip(y.iter()).map(|(a, b)| a * b).sum())
+                        }
+                        "vec_add" => {
+                            if a.len() != 2 {
+                                return Err("vec_add expects two lists".into());
+                            }
+                            let x = as_num_list(&a[0])?;
+                            let y = as_num_list(&a[1])?;
+                            if x.len() != y.len() {
+                                return Err("vec_add length mismatch".into());
+                            }
+                            nums_to_val(x.iter().zip(y.iter()).map(|(a, b)| a + b).collect())
+                        }
+                        "vec_scale" => {
+                            if a.len() != 2 {
+                                return Err("vec_scale expects list,scalar".into());
+                            }
+                            let x = as_num_list(&a[0])?;
+                            let s = match a[1] {
+                                Val::Num(n) => n,
+                                _ => return Err("scalar must be Number".into()),
+                            };
+                            nums_to_val(x.into_iter().map(|v| v * s).collect())
+                        }
+                        "transpose" => {
+                            if a.len() != 1 {
+                                return Err("transpose expects matrix".into());
+                            }
+                            let m = as_matrix(&a[0])?;
+                            if m.is_empty() {
+                                Val::List(vec![])
+                            } else {
+                                let cols = m[0].len();
+                                if m.iter().any(|r| r.len() != cols) {
+                                    return Err("ragged matrix".into());
+                                }
+                                let mut out = vec![vec![0.0; m.len()]; cols];
+                                for i in 0..m.len() {
+                                    for j in 0..cols {
+                                        out[j][i] = m[i][j];
+                                    }
+                                }
+                                matrix_to_val(out)
+                            }
+                        }
+                        "matmul" => {
+                            if a.len() != 2 {
+                                return Err("matmul expects two matrices".into());
+                            }
+                            let x = as_matrix(&a[0])?;
+                            let y = as_matrix(&a[1])?;
+                            if x.is_empty() || y.is_empty() {
+                                return Err("matmul requires non-empty matrices".into());
+                            }
+                            let n = x[0].len();
+                            if x.iter().any(|r| r.len() != n)
+                                || y.iter().any(|r| r.len() != y[0].len())
+                                || y.len() != n
+                            {
+                                return Err("matmul dimension mismatch".into());
+                            }
+                            let p = y[0].len();
+                            let mut out = vec![vec![0.0; p]; x.len()];
+                            for i in 0..x.len() {
+                                for j in 0..p {
+                                    for k in 0..n {
+                                        out[i][j] += x[i][k] * y[k][j];
+                                    }
+                                }
+                            }
+                            matrix_to_val(out)
+                        }
+                        "linreg_fit" => {
+                            if a.len() != 2 {
+                                return Err("linreg_fit expects x,y".into());
+                            }
+                            let x = as_num_list(&a[0])?;
+                            let y = as_num_list(&a[1])?;
+                            if x.len() != y.len() || x.len() < 2 {
+                                return Err("linreg_fit requires equal lists length >=2".into());
+                            }
+                            let mx = x.iter().sum::<f64>() / x.len() as f64;
+                            let my = y.iter().sum::<f64>() / y.len() as f64;
+                            let num = x
+                                .iter()
+                                .zip(y.iter())
+                                .map(|(a, b)| (a - mx) * (b - my))
+                                .sum::<f64>();
+                            let den = x.iter().map(|a| (a - mx) * (a - mx)).sum::<f64>();
+                            if den == 0.0 {
+                                return Err("linreg_fit zero x variance".into());
+                            }
+                            let slope = num / den;
+                            let intercept = my - slope * mx;
+                            let ss_tot = y.iter().map(|v| (v - my) * (v - my)).sum::<f64>();
+                            let ss_res = x
+                                .iter()
+                                .zip(y.iter())
+                                .map(|(xx, yy)| {
+                                    let e = yy - (intercept + slope * xx);
+                                    e * e
+                                })
+                                .sum::<f64>();
+                            let r2 = if ss_tot == 0.0 {
+                                1.0
+                            } else {
+                                1.0 - ss_res / ss_tot
+                            };
+                            Val::Map(vec![
+                                (Val::Str("slope".into()), Val::Num(slope)),
+                                (Val::Str("intercept".into()), Val::Num(intercept)),
+                                (Val::Str("r2".into()), Val::Num(r2)),
+                            ])
+                        }
+                        "linreg_predict" => {
+                            if a.len() != 2 {
+                                return Err("linreg_predict expects model,x".into());
+                            }
+                            let pairs = match &a[0] {
+                                Val::Map(p) => p,
+                                _ => return Err("model must be Map".into()),
+                            };
+                            let getn = |name: &str| -> Result<f64, String> {
+                                pairs
+                                    .iter()
+                                    .find(|(k, _)| *k == Val::Str(name.into()))
+                                    .and_then(
+                                        |(_, v)| if let Val::Num(n) = v { Some(*n) } else { None },
+                                    )
+                                    .ok_or(format!("model missing {name}"))
+                            };
+                            let x = match a[1] {
+                                Val::Num(n) => n,
+                                _ => return Err("x must be Number".into()),
+                            };
+                            Val::Num(getn("intercept")? + getn("slope")? * x)
+                        }
+                        "knn_predict" => {
+                            if a.len() != 4 {
+                                return Err("knn_predict expects train_x,train_y,point,k".into());
+                            }
+                            let xs = as_matrix(&a[0])?;
+                            let ys = match &a[1] {
+                                Val::List(v) => v.clone(),
+                                _ => return Err("train_y must be List".into()),
+                            };
+                            let point = as_num_list(&a[2])?;
+                            let k = match a[3] {
+                                Val::Num(n) => n as usize,
+                                _ => return Err("k must be Number".into()),
+                            };
+                            if xs.len() != ys.len() || xs.is_empty() || k == 0 {
+                                return Err("invalid knn data".into());
+                            }
+                            let mut pairs: Vec<(f64, Val)> = xs
+                                .iter()
+                                .zip(ys.iter())
+                                .map(|(x, y)| (distance_sq(x, &point), y.clone()))
+                                .collect();
+                            pairs.sort_by(|a, b| {
+                                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let mut counts: Vec<(Val, usize)> = vec![];
+                            for (_, label) in pairs.into_iter().take(k.min(xs.len())) {
+                                if let Some((_, c)) = counts.iter_mut().find(|(l, _)| *l == label) {
+                                    *c += 1
+                                } else {
+                                    counts.push((label, 1))
+                                }
+                            }
+                            counts
+                                .into_iter()
+                                .max_by_key(|(_, c)| *c)
+                                .map(|(l, _)| l)
+                                .unwrap_or(Val::Null)
+                        }
+                        "sigmoid" => {
+                            if a.len() != 1 {
+                                return Err("sigmoid expects number".into());
+                            }
+                            let x = match a[0] {
+                                Val::Num(n) => n,
+                                _ => return Err("sigmoid expects Number".into()),
+                            };
+                            Val::Num(1.0 / (1.0 + (-x).exp()))
+                        }
+                        "mse" => {
+                            if a.len() != 2 {
+                                return Err("mse expects actual,predicted".into());
+                            }
+                            let x = as_num_list(&a[0])?;
+                            let y = as_num_list(&a[1])?;
+                            if x.len() != y.len() || x.is_empty() {
+                                return Err("mse length mismatch".into());
+                            }
+                            Val::Num(
+                                x.iter()
+                                    .zip(y.iter())
+                                    .map(|(a, b)| (a - b) * (a - b))
+                                    .sum::<f64>()
+                                    / x.len() as f64,
+                            )
+                        }
+                        "normalize" => {
+                            if a.len() != 1 {
+                                return Err("normalize expects list".into());
+                            }
+                            let xs = as_num_list(&a[0])?;
+                            if xs.is_empty() {
+                                return Err("normalize requires non-empty list".into());
+                            }
+                            let min = xs.iter().fold(f64::INFINITY, |m, x| m.min(*x));
+                            let max = xs.iter().fold(f64::NEG_INFINITY, |m, x| m.max(*x));
+                            let span = max - min;
+                            if span == 0.0 {
+                                nums_to_val(vec![0.0; xs.len()])
+                            } else {
+                                nums_to_val(xs.into_iter().map(|x| (x - min) / span).collect())
+                            }
+                        }
+                        "relu" => {
+                            if a.len() != 1 {
+                                return Err("relu expects list".into());
+                            }
+                            nums_to_val(
+                                as_num_list(&a[0])?
+                                    .into_iter()
+                                    .map(|x| x.max(0.0))
+                                    .collect(),
+                            )
+                        }
+                        "softmax" => {
+                            if a.len() != 1 {
+                                return Err("softmax expects list".into());
+                            }
+                            let xs = as_num_list(&a[0])?;
+                            if xs.is_empty() {
+                                return Err("softmax requires non-empty list".into());
+                            }
+                            let m = xs.iter().fold(f64::NEG_INFINITY, |m, x| m.max(*x));
+                            let exps: Vec<f64> = xs.iter().map(|x| (x - m).exp()).collect();
+                            let sum: f64 = exps.iter().sum();
+                            nums_to_val(exps.into_iter().map(|x| x / sum).collect())
+                        }
+                        "dense" => {
+                            if a.len() != 3 {
+                                return Err("dense expects input,weights,bias".into());
+                            }
+                            let input = as_num_list(&a[0])?;
+                            let weights = as_matrix(&a[1])?;
+                            let bias = as_num_list(&a[2])?;
+                            if weights.len() != bias.len()
+                                || weights.iter().any(|r| r.len() != input.len())
+                            {
+                                return Err("dense dimension mismatch".into());
+                            }
+                            nums_to_val(
+                                weights
+                                    .iter()
+                                    .zip(bias.iter())
+                                    .map(|(row, b)| {
+                                        row.iter()
+                                            .zip(input.iter())
+                                            .map(|(w, x)| w * x)
+                                            .sum::<f64>()
+                                            + b
+                                    })
+                                    .collect(),
+                            )
+                        }
+                        "kmeans" => {
+                            if a.len() != 3 {
+                                return Err("kmeans expects data,k,iterations".into());
+                            }
+                            let data = as_matrix(&a[0])?;
+                            let k = match a[1] {
+                                Val::Num(n) => n as usize,
+                                _ => return Err("k must be Number".into()),
+                            };
+                            let iters = match a[2] {
+                                Val::Num(n) => n as usize,
+                                _ => return Err("iterations must be Number".into()),
+                            };
+                            if data.is_empty() || k == 0 || k > data.len() {
+                                return Err("invalid kmeans data".into());
+                            }
+                            let dims = data[0].len();
+                            if dims == 0 || data.iter().any(|r| r.len() != dims) {
+                                return Err("ragged kmeans data".into());
+                            }
+                            let mut centers = data[..k].to_vec();
+                            for _ in 0..iters {
+                                let mut sums = vec![vec![0.0; dims]; k];
+                                let mut counts = vec![0usize; k];
+                                for point in &data {
+                                    let mut best = 0usize;
+                                    let mut bestd = distance_sq(point, &centers[0]);
+                                    for i in 1..k {
+                                        let dist = distance_sq(point, &centers[i]);
+                                        if dist < bestd {
+                                            best = i;
+                                            bestd = dist;
+                                        }
+                                    }
+                                    counts[best] += 1;
+                                    for j in 0..dims {
+                                        sums[best][j] += point[j];
+                                    }
+                                }
+                                for i in 0..k {
+                                    if counts[i] > 0 {
+                                        for j in 0..dims {
+                                            centers[i][j] = sums[i][j] / counts[i] as f64;
+                                        }
+                                    }
+                                }
+                            }
+                            matrix_to_val(centers)
+                        }
+                        "table_column" => {
+                            if a.len() != 2 {
+                                return Err("table_column expects rows,name".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let name = match &a[1] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("name must be String".into()),
+                            };
+                            let mut out = vec![];
+                            for row in rows {
+                                let pairs = match row {
+                                    Val::Map(p) => p,
+                                    _ => return Err("rows must contain Map values".into()),
+                                };
+                                out.push(map_lookup(pairs, &name).cloned().unwrap_or(Val::Null));
+                            }
+                            Val::List(out)
+                        }
+                        "table_filter_eq" => {
+                            if a.len() != 3 {
+                                return Err("table_filter_eq expects rows,name,value".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let key = match &a[1] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("name must be String".into()),
+                            };
+                            let target = &a[2];
+                            Val::List(
+                                rows.iter()
+                                    .filter(|row| match row {
+                                        Val::Map(p) => map_lookup(p, &key)
+                                            .map(|v| v == target)
+                                            .unwrap_or(false),
+                                        _ => false,
+                                    })
+                                    .cloned()
+                                    .collect(),
+                            )
+                        }
+                        "table_describe" => {
+                            if a.len() != 2 {
+                                return Err("table_describe expects rows,name".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let key = match &a[1] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("name must be String".into()),
+                            };
+                            let nums: Vec<f64> = rows
+                                .iter()
+                                .filter_map(|row| match row {
+                                    Val::Map(p) => map_lookup(p, &key).and_then(|v| match v {
+                                        Val::Num(n) => Some(n.to_owned()),
+                                        _ => None,
+                                    }),
+                                    _ => None,
+                                })
+                                .collect();
+                            if nums.is_empty() {
+                                return Err("table_describe found no numeric values".into());
+                            }
+                            let count = nums.len() as f64;
+                            let mean = nums.iter().sum::<f64>() / count;
+                            let min = nums.iter().fold(f64::INFINITY, |m, x| m.min(*x));
+                            let max = nums.iter().fold(f64::NEG_INFINITY, |m, x| m.max(*x));
+                            Val::Map(vec![
+                                (Val::Str("count".into()), Val::Num(count)),
+                                (Val::Str("mean".into()), Val::Num(mean)),
+                                (Val::Str("min".into()), Val::Num(min)),
+                                (Val::Str("max".into()), Val::Num(max)),
+                            ])
+                        }
+                        "plot_svg" => {
+                            if a.len() != 3 {
+                                return Err("plot_svg expects path,xs,ys".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let xs = as_num_list(&a[1])?;
+                            let ys = as_num_list(&a[2])?;
+                            if xs.len() != ys.len() || xs.len() < 2 {
+                                return Err("plot_svg requires equal lists length >=2".into());
+                            }
+                            let xmin = xs.iter().fold(f64::INFINITY, |m, x| m.min(*x));
+                            let xmax = xs.iter().fold(f64::NEG_INFINITY, |m, x| m.max(*x));
+                            let ymin = ys.iter().fold(f64::INFINITY, |m, x| m.min(*x));
+                            let ymax = ys.iter().fold(f64::NEG_INFINITY, |m, x| m.max(*x));
+                            let sx = if xmax == xmin { 1.0 } else { xmax - xmin };
+                            let sy = if ymax == ymin { 1.0 } else { ymax - ymin };
+                            let pts = xs
+                                .iter()
+                                .zip(ys.iter())
+                                .map(|(x, y)| {
+                                    let px = 50.0 + 700.0 * (x - xmin) / sx;
+                                    let py = 450.0 - 400.0 * (y - ymin) / sy;
+                                    format!("{px:.2},{py:.2}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let svg = format!(
+                                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"800\" height=\"500\"><rect width=\"100%\" height=\"100%\" fill=\"white\"/><line x1=\"50\" y1=\"450\" x2=\"750\" y2=\"450\" stroke=\"black\"/><line x1=\"50\" y1=\"50\" x2=\"50\" y2=\"450\" stroke=\"black\"/><polyline fill=\"none\" stroke=\"black\" stroke-width=\"2\" points=\"{}\"/></svg>",
+                                svg_escape(&pts)
+                            );
+                            fs::write(path, svg).map_err(|e| e.to_string())?;
+                            Val::Null
+                        }
+                        "csv_read" => {
+                            if a.len() != 1 {
+                                return Err("csv_read expects path".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let mut rdr = csv::Reader::from_path(p).map_err(|e| e.to_string())?;
+                            let headers = rdr
+                                .headers()
+                                .map_err(|e| e.to_string())?
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>();
+                            let mut rows = vec![];
+                            for rec in rdr.records() {
+                                let rec = rec.map_err(|e| e.to_string())?;
+                                let pairs = headers
+                                    .iter()
+                                    .zip(rec.iter())
+                                    .map(|(h, v)| {
+                                        let val = v
+                                            .parse::<f64>()
+                                            .map(Val::Num)
+                                            .unwrap_or_else(|_| Val::Str(v.to_string()));
+                                        (Val::Str(h.clone()), val)
+                                    })
+                                    .collect();
+                                rows.push(Val::Map(pairs));
+                            }
+                            Val::List(rows)
+                        }
+                        "csv_write" => {
+                            if a.len() != 2 {
+                                return Err("csv_write expects path,rows".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let rows = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let mut w = csv::Writer::from_path(p).map_err(|e| e.to_string())?;
+                            if let Some(Val::Map(first)) = rows.first() {
+                                let headers =
+                                    first.iter().map(|(k, _)| k.show()).collect::<Vec<_>>();
+                                w.write_record(&headers).map_err(|e| e.to_string())?;
+                                for row in rows {
+                                    let map = match row {
+                                        Val::Map(p) => p,
+                                        _ => return Err("all csv rows must be Map".into()),
+                                    };
+                                    let vals = headers
+                                        .iter()
+                                        .map(|h| {
+                                            map.iter()
+                                                .find(|(k, _)| k.show() == *h)
+                                                .map(|(_, v)| v.show())
+                                                .unwrap_or_default()
+                                        })
+                                        .collect::<Vec<_>>();
+                                    w.write_record(vals).map_err(|e| e.to_string())?;
+                                }
+                            }
+                            w.flush().map_err(|e| e.to_string())?;
+                            Val::Null
+                        }
+                        "gui_message" => {
+                            if a.len() != 2 {
+                                return Err("gui_message expects title,message".into());
+                            }
+                            let title = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("title must be String".into()),
+                            };
+                            let msg = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("message must be String".into()),
+                            };
+                            tinyfiledialogs::message_box_ok(
+                                title,
+                                msg,
+                                tinyfiledialogs::MessageBoxIcon::Info,
+                            );
+                            Val::Null
+                        }
+                        "gui_input" => {
+                            if a.len() != 2 {
+                                return Err("gui_input expects title,message".into());
+                            }
+                            let title = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("title must be String".into()),
+                            };
+                            let msg = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("message must be String".into()),
+                            };
+                            tinyfiledialogs::input_box(title, msg, "")
+                                .map(Val::Str)
+                                .unwrap_or(Val::Null)
+                        }
+                        "gui_open_file" => {
+                            if a.len() != 1 {
+                                return Err("gui_open_file expects title".into());
+                            }
+                            let title = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("title must be String".into()),
+                            };
+                            tinyfiledialogs::open_file_dialog(title, "", None)
+                                .map(Val::Str)
+                                .unwrap_or(Val::Null)
+                        }
+                        "gui_save_file" => {
+                            if a.len() != 1 {
+                                return Err("gui_save_file expects title".into());
+                            }
+                            let title = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("title must be String".into()),
+                            };
+                            tinyfiledialogs::save_file_dialog(title, "")
+                                .map(Val::Str)
+                                .unwrap_or(Val::Null)
+                        }
+                        "gui_confirm" => {
+                            if a.len() != 2 {
+                                return Err("gui_confirm expects title,message".into());
+                            }
+                            let title = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("title must be String".into()),
+                            };
+                            let msg = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("message must be String".into()),
+                            };
+                            Val::Bool(matches!(
+                                tinyfiledialogs::message_box_yes_no(
+                                    title,
+                                    msg,
+                                    tinyfiledialogs::MessageBoxIcon::Question,
+                                    tinyfiledialogs::YesNo::Yes
+                                ),
+                                tinyfiledialogs::YesNo::Yes
+                            ))
+                        }
+                        "gui_password" => {
+                            if a.len() != 2 {
+                                return Err("gui_password expects title,message".into());
+                            }
+                            let title = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("title must be String".into()),
+                            };
+                            let msg = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("message must be String".into()),
+                            };
+                            tinyfiledialogs::password_box(title, msg)
+                                .map(Val::Str)
+                                .unwrap_or(Val::Null)
+                        }
+                        "gui_folder" => {
+                            if a.len() != 1 {
+                                return Err("gui_folder expects title".into());
+                            }
+                            let title = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("title must be String".into()),
+                            };
+                            tinyfiledialogs::select_folder_dialog(title, "")
+                                .map(Val::Str)
+                                .unwrap_or(Val::Null)
+                        }
+                        "gui_color" => {
+                            if a.len() != 1 {
+                                return Err("gui_color expects title".into());
+                            }
+                            let title = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("title must be String".into()),
+                            };
+                            match tinyfiledialogs::color_chooser_dialog(
+                                title,
+                                tinyfiledialogs::DefaultColorValue::Hex("#ffffff"),
+                            ) {
+                                Some((hex, _)) => Val::Str(hex),
+                                None => Val::Null,
+                            }
+                        }
+                        "gui_form" => {
+                            if a.len() != 2 {
+                                return Err("gui_form expects title,fields".into());
+                            }
+                            let title = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("title must be String".into()),
+                            };
+                            let fields = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("fields must be List".into()),
+                            };
+                            let mut out = vec![];
+                            for field in fields {
+                                let label = match field {
+                                    Val::Str(s) => s,
+                                    _ => return Err("field names must be String".into()),
+                                };
+                                match tinyfiledialogs::input_box(title, label, "") {
+                                    Some(value) => {
+                                        out.push((Val::Str(label.clone()), Val::Str(value)))
+                                    }
+                                    None => return Ok(Val::Null),
+                                }
+                            }
+                            Val::Map(out)
+                        }
+                        "sqrt" => {
+                            if a.len() != 1 {
+                                return Err("sqrt expects 1 argument".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.sqrt()),
+                                _ => return Err("sqrt expects Number".into()),
+                            }
+                        }
+                        "abs" => {
+                            if a.len() != 1 {
+                                return Err("abs expects 1 argument".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.abs()),
+                                _ => return Err("abs expects Number".into()),
+                            }
+                        }
+                        "floor" => {
+                            if a.len() != 1 {
+                                return Err("floor expects 1 argument".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.floor()),
+                                _ => return Err("floor expects Number".into()),
+                            }
+                        }
+                        "ceil" => {
+                            if a.len() != 1 {
+                                return Err("ceil expects 1 argument".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.ceil()),
+                                _ => return Err("ceil expects Number".into()),
+                            }
+                        }
+                        "lower" => {
+                            if a.len() != 1 {
+                                return Err("lower expects String".into());
+                            }
+                            match &a[0] {
+                                Val::Str(s) => Val::Str(s.to_lowercase()),
+                                _ => return Err("lower expects String".into()),
+                            }
+                        }
+                        "upper" => {
+                            if a.len() != 1 {
+                                return Err("upper expects String".into());
+                            }
+                            match &a[0] {
+                                Val::Str(s) => Val::Str(s.to_uppercase()),
+                                _ => return Err("upper expects String".into()),
+                            }
+                        }
+                        "trim" => {
+                            if a.len() != 1 {
+                                return Err("trim expects String".into());
+                            }
+                            match &a[0] {
+                                Val::Str(s) => Val::Str(s.trim().to_string()),
+                                _ => return Err("trim expects String".into()),
+                            }
+                        }
+                        "split" => {
+                            if a.len() != 2 {
+                                return Err("split expects text,separator".into());
+                            }
+                            let text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let sep = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("separator must be String".into()),
+                            };
+                            Val::List(text.split(sep).map(|x| Val::Str(x.to_string())).collect())
+                        }
+                        "join" => {
+                            if a.len() != 2 {
+                                return Err("join expects list,separator".into());
+                            }
+                            let xs = match &a[0] {
+                                Val::List(xs) => xs,
+                                _ => return Err("first argument must be List".into()),
+                            };
+                            let sep = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("separator must be String".into()),
+                            };
+                            Val::Str(xs.iter().map(Val::show).collect::<Vec<_>>().join(sep))
+                        }
+                        "contains" => {
+                            if a.len() != 2 {
+                                return Err("contains expects container,value".into());
+                            }
+                            Val::Bool(match &a[0] {
+                                Val::Str(s) => match &a[1] {
+                                    Val::Str(x) => s.contains(x),
+                                    _ => false,
+                                },
+                                Val::List(xs) => xs.contains(&a[1]),
+                                Val::Map(pairs) => pairs.iter().any(|(k, _)| *k == a[1]),
+                                _ => false,
+                            })
                         }
                         "read_file" => {
                             if a.len() != 1 {
@@ -1776,6 +2637,105 @@ fn build_project() -> Result<(), String> {
     Ok(())
 }
 
+fn serve_directory(dir: &Path, port: u16) -> Result<(), String> {
+    let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
+    println!("Veyra web server: http://127.0.0.1:{port}");
+    println!("Serving {}", dir.display());
+    for req in server.incoming_requests() {
+        let raw = req.url().split('?').next().unwrap_or("/");
+        let rel = raw.trim_start_matches('/');
+        let mut path = dir.join(if rel.is_empty() { "index.html" } else { rel });
+        if path.is_dir() {
+            path = path.join("index.html");
+        }
+        let response = if path.exists() && path.is_file() {
+            let data = fs::read(&path).map_err(|e| e.to_string())?;
+            let mut r = Response::from_data(data);
+            let content_type = match path.extension().and_then(|x| x.to_str()).unwrap_or("") {
+                "html" => "text/html; charset=utf-8",
+                "css" => "text/css; charset=utf-8",
+                "js" => "application/javascript; charset=utf-8",
+                "json" => "application/json; charset=utf-8",
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "svg" => "image/svg+xml",
+                _ => "application/octet-stream",
+            };
+            if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
+                r.add_header(h);
+            }
+            r
+        } else {
+            Response::from_string("404 Not Found").with_status_code(StatusCode(404))
+        };
+        req.respond(response).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn serve_routes(routes_file: &Path, port: u16) -> Result<(), String> {
+    let config: JsonValue =
+        serde_json::from_str(&fs::read_to_string(routes_file).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let routes = config
+        .get("routes")
+        .and_then(JsonValue::as_object)
+        .ok_or("web route file requires a 'routes' object")?;
+    let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
+    println!("Veyra API server: http://127.0.0.1:{port}");
+    println!("Routes: {}", routes.len());
+    for mut req in server.incoming_requests() {
+        let path = req.url().split('?').next().unwrap_or("/");
+        let method = req.method().as_str();
+        let method_key = format!("{method} {path}");
+        let route = routes.get(&method_key).or_else(|| routes.get(path));
+        let response = if let Some(route) = route {
+            let status = route
+                .get("status")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(200) as u16;
+            let content_type = route
+                .get("content_type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_else(|| {
+                    if route.get("json").is_some() {
+                        "application/json; charset=utf-8"
+                    } else {
+                        "text/plain; charset=utf-8"
+                    }
+                });
+            let body = if route
+                .get("echo")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false)
+            {
+                let mut text = String::new();
+                req.as_reader()
+                    .read_to_string(&mut text)
+                    .map_err(|e| e.to_string())?;
+                text
+            } else if let Some(j) = route.get("json") {
+                serde_json::to_string(j).map_err(|e| e.to_string())?
+            } else {
+                route
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let mut r = Response::from_string(body).with_status_code(StatusCode(status));
+            if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
+                r.add_header(h);
+            }
+            r
+        } else {
+            Response::from_string("404 Not Found").with_status_code(StatusCode(404))
+        };
+        req.respond(response).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn new_project(name: &str) -> Result<(), String> {
     let p = PathBuf::from(name);
     if p.exists() {
@@ -1846,7 +2806,7 @@ fn repl() -> Result<(), String> {
 
 fn usage() {
     println!(
-        "Veyra {VERSION}\n\nUsage:\n  veyra run [file.vy]\n  veyra check [file.vy]\n  veyra test\n  veyra build\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg add <name>\n  veyra pkg remove <name>\n  veyra pkg installed\n  veyra doctor\n  veyra repl\n  veyra --version"
+        "Veyra {VERSION}\n\nUsage:\n  veyra run [file.vy]\n  veyra check [file.vy]\n  veyra test\n  veyra build\n  veyra serve [dir] [port]\n  veyra web <routes.json> [port]\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg add <name>\n  veyra pkg remove <name>\n  veyra pkg installed\n  veyra doctor\n  veyra repl\n  veyra --version"
     );
 }
 fn main() -> ExitCode {
@@ -1916,6 +2876,18 @@ fn main() -> ExitCode {
         }
         Some("test") => test_project(),
         Some("build") => build_project(),
+        Some("serve") => {
+            let dir = a
+                .get(2)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let port = a.get(3).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8080);
+            serve_directory(&dir, port)
+        }
+        Some("web") => a.get(2).ok_or("missing routes.json".into()).and_then(|p| {
+            let port = a.get(3).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8080);
+            serve_routes(Path::new(p), port)
+        }),
         Some("disasm") => {
             let path = match a.get(2) {
                 Some(p) => Ok(PathBuf::from(p)),
@@ -2011,6 +2983,40 @@ mod tests {
             p.to_string_lossy().replace('\\', "\\\\")
         );
         assert!(run_source(&s).is_ok());
+        let _ = fs::remove_file(p);
+    }
+    #[test]
+    fn native_science_math() {
+        assert!(run_source(
+            "let x=[1,2,3,4]; let m=vec_mean(x); let s=vec_std(x); let d=vec_dot([1,2],[3,4]); let z=matmul([[1,2],[3,4]],[[5,6],[7,8]]);"
+        ).is_ok());
+    }
+    #[test]
+    fn native_ml() {
+        assert!(run_source(
+            "let model=linreg_fit([1,2,3,4],[3,5,7,9]); let p=linreg_predict(model,5); let c=knn_predict([[0,0],[1,1],[9,9]],[\"a\",\"a\",\"b\"],[0.5,0.5],2); let centers=kmeans([[0,0],[0,1],[9,9],[9,8]],2,5); let h=dense([1,2],[[1,0],[0,1]],[0,0]); let r=relu([-1,2]); let s=softmax([1,2,3]); let n=normalize([10,20,30]);"
+        ).is_ok());
+    }
+    #[test]
+    fn native_csv() {
+        let p = env::temp_dir().join("veyra_native_data.csv");
+        fs::write(&p, "x,y\n1,2\n3,4\n").unwrap();
+        let s = format!(
+            "let rows=csv_read(\"{}\"); let x=rows[0][\"x\"];",
+            p.to_string_lossy().replace('\\', "\\\\")
+        );
+        assert!(run_source(&s).is_ok());
+        let _ = fs::remove_file(p);
+    }
+    #[test]
+    fn native_table_plot() {
+        let p = env::temp_dir().join("veyra_native_plot.svg");
+        let s = format!(
+            "let rows=[{{\"x\":1,\"g\":\"a\"}},{{\"x\":3,\"g\":\"b\"}}]; let c=table_column(rows,\"x\"); let d=table_describe(rows,\"x\"); let f=table_filter_eq(rows,\"g\",\"a\"); plot_svg(\"{}\",[1,2,3],[2,4,3]);",
+            p.to_string_lossy().replace('\\', "\\\\")
+        );
+        assert!(run_source(&s).is_ok());
+        assert!(p.exists());
         let _ = fs::remove_file(p);
     }
 }

@@ -1,0 +1,9 @@
+fn alert(title: String, message: String) -> Void { gui_message(title, message); }
+fn confirm(title: String, message: String) -> Bool { return gui_confirm(title, message); }
+fn prompt(title: String, message: String) -> Any { return gui_input(title, message); }
+fn password(title: String, message: String) -> Any { return gui_password(title, message); }
+fn form(title: String, fields: List) -> Any { return gui_form(title, fields); }
+fn open_file(title: String) -> Any { return gui_open_file(title); }
+fn save_file(title: String) -> Any { return gui_save_file(title); }
+fn choose_folder(title: String) -> Any { return gui_folder(title); }
+fn choose_color(title: String) -> Any { return gui_color(title); }

@@ -1,84 +1,69 @@
-# Veyra 4.0 Sovereign
+# Veyra 5.0 Frontier
 
-Veyra is now native-first. The default `veyra` command executes the standalone Rust compiler/bytecode VM and does not require Python.
+Veyra is a native-first programming language platform. The default `veyra` command runs the standalone Rust compiler/bytecode VM and does not require Python.
 
-## Native language platform
+## What Veyra owns now
 
-Veyra Sovereign includes its own lexer, parser, AST, bytecode compiler and stack VM with variables, constants, typed function syntax, user functions, recursion, if/else, while, native for/range loops, lists, maps, indexing, modules, boolean logic, strings and core operators.
+The native platform includes its lexer, parser, AST, bytecode compiler, VM, project system, package registry, package manager, standard services, data/science primitives, introductory ML toolkit, web server path, desktop utility GUI layer and VS Code integration.
 
-## Native standard services
+### Native project workflow
 
-The standalone executable directly provides:
-
-- JSON parse/stringify
-- regular expressions
-- text case/trim/split/join/contains
-- file read/write
-- directory listing/creation and file removal
-- paths and environment variables
-- subprocess execution
-- HTTP GET over Rustls
-- time and random numbers
-- SHA-256 hashing
-- SQLite execute/query using bundled SQLite
-- core math including sqrt/abs/floor/ceil
-
-These services execute inside Veyra's Rust runtime rather than through Python.
-
-## Veyra package ecosystem
-
-Veyra has its own registry under `registry/index.json`, its own package store, vendoring, manifest and lock file.
-
-Commands:
-
-    veyra registry
-    veyra add vymath
-    veyra remove vymath
-    veyra packages
-    veyra install
-    veyra pkg search math
-    veyra publish
-
-Packages can be imported by name:
-
-    use "vymath";
-    use "vystats";
-
-Current native packages include vymath, vystats, vyalgo, vycollections, vytext, vytest and vyhello.
-
-## Native project workflow
-
-    veyra new myapp
-    cd myapp
-    veyra add vymath
+    veyra new app
+    cd app
+    veyra add vyscience
+    veyra add vyml
+    veyra add vydata
+    veyra add vyweb
     veyra check
     veyra run
     veyra test
     veyra build
 
-`veyra build` creates a distributable directory containing the standalone `veyra.exe`, project source, manifest and vendored Veyra packages.
+### Science/data
 
-## Independence proof
+Native primitives include vector sums/means/variance/stddev/dot/add/scale, matrix transpose/multiply, CSV read/write, table column/filter/describe and SVG plotting.
 
-A packaged Veyra application was executed successfully after Python was removed from PATH. The bundled `veyra.exe` loaded vendored Veyra packages, executed math/statistics package code and completed with exit code 0.
+Packages:
+- vyscience
+- vydata
+- vyplot
+- vystats
+- vymath
+- vyalgo
 
-## Compatibility bridge
+### AI/ML
 
-The earlier Python-backed Convergence runtime is preserved as an optional compatibility route. It is no longer the default launcher. This keeps access to Python interoperability while allowing normal Veyra programs and packages to depend on Veyra itself.
+Native primitives include linear regression, k-NN prediction, k-means clustering, normalization, sigmoid, MSE, dense-layer inference, ReLU and softmax.
 
-## Repository layout
+Package:
+- vyml
 
-- `engine-rs/` - native Rust compiler, VM, standard services and package CLI
-- `bin/veyra-native.exe` - standalone Windows runtime
-- `packages/` - Veyra-native package sources
-- `registry/` - Veyra package registry
-- `veyra.bat` - native-first repository launcher
-- `veyra-convergence.bat` - compatibility launcher
-- `veyra.py`, `veyra_cli.py` - optional Convergence compatibility stack
-- `tooling/vscode/` - Veyra editor integration
-- `spec/` - language/architecture documentation
-- `STATUS-50-INDEPENDENT.md` - independence milestone definition
+### Web
 
-## Version
+    veyra serve public 8080
+    veyra web routes.json 8080
 
-Native runtime: Veyra 4.0.0-sovereign
+Veyra can serve static files and declarative method/path API routes with text, HTML and JSON responses. `vyweb` provides HTML helpers.
+
+### Desktop utility GUI
+
+The vygui package exposes native OS-backed alerts, confirm dialogs, input/password prompts, forms, open/save dialogs, folder selection and color selection.
+
+### Native package ecosystem
+
+    veyra registry
+    veyra pkg search science
+    veyra add vyscience
+    veyra packages
+    veyra install
+    veyra publish
+
+Packages are vendored into projects and captured in `veyra.lock`.
+
+## Compatibility
+
+The older Python-backed Convergence runtime remains available as `veyra-convergence` for compatibility. It is optional and is not the default execution path.
+
+## Verification
+
+The native Rust suite covers the language/runtime plus JSON, regex, hashing, file I/O, CSV, science math, ML and table/plot functionality. See `STATUS-50-ALL.md` for the exact interpretation of the 50%-class milestone.

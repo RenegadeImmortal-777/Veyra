@@ -6,9 +6,9 @@
     {"name":"comment.line.double-slash.veyra","match":"//.*$"},
     {"name":"comment.block.veyra","begin":"/\\*","end":"\\*/"},
     {"name":"string.quoted.double.veyra","begin":"\"","end":"\""},
-    {"name":"keyword.control.veyra","match":"\\b(if|else|while|for|in|return|break|continue|use|as|try|catch|throw)\\b"},
+    {"name":"keyword.control.veyra","match":"\\b(if|else|while|for|in|return|use|and|or|not)\\b"},
     {"name":"storage.type.veyra","match":"\\b(Int|Float|Number|String|Bool|List|Map|Function|Null|Any|Void)\\b"},
-    {"name":"storage.modifier.veyra","match":"\\b(let|const|fn|class)\\b"},
+    {"name":"storage.modifier.veyra","match":"\\b(let|const|fn)\\b"},
     {"name":"constant.language.veyra","match":"\\b(true|false|null)\\b"},
     {"name":"constant.numeric.veyra","match":"\\b[0-9]+(?:\\.[0-9]+)?\\b"},
     {"name":"entity.name.function.veyra","match":"(?<=fn\\s)[A-Za-z_][A-Za-z0-9_]*"}

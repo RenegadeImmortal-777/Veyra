@@ -2,13 +2,21 @@ const vscode = require('vscode');
 const cp = require('child_process');
 
 const keywords = [
-  'let','const','fn','class','if','else','while','for','in','return','break','continue',
-  'try','catch','throw','use','true','false','null'
+  'let','const','fn','if','else','while','for','in','return','use',
+  'and','or','not','true','false','null'
 ];
 const builtins = [
-  'print','len','str','int','float','bool','type','range','assert','push','pop','keys','values',
-  'json','json_parse','regex','py_import','py_call','py_get','py_set','py_dir','parallel_map',
-  'spawn','await_task','task_done','http_get','db_open','shell','read','write','sqrt','sum','sorted'
+  'print','len','str','range','keys','values','get',
+  'json_parse','json_stringify','regex_findall',
+  'sqrt','abs','floor','ceil','lower','upper','trim','split','join','contains',
+  'read_file','write_file','path_exists','mkdir','remove_file','list_dir','cwd','env_get',
+  'http_get','shell','clock','random','randint','sha256','sqlite_exec','sqlite_query',
+  'vec_sum','vec_mean','vec_variance','vec_std','vec_dot','vec_add','vec_scale',
+  'transpose','matmul','linreg_fit','linreg_predict','knn_predict','kmeans',
+  'normalize','dense','relu','softmax','sigmoid','mse','csv_read','csv_write',
+  'table_column','table_filter_eq','table_describe','plot_svg',
+  'gui_message','gui_confirm','gui_input','gui_password','gui_form',
+  'gui_open_file','gui_save_file','gui_folder','gui_color'
 ];
 
 function executable() {
@@ -56,10 +64,11 @@ function activate(context) {
       const range = doc.getWordRangeAtPosition(pos);
       if (!range) return;
       const w = doc.getText(range);
-      if (w === 'py_import') return new vscode.Hover('**py_import(name)** — import a project-installed Python module into Veyra.');
-      if (w === 'spawn') return new vscode.Hover('**spawn(fn, ...args)** — run a callable as a background task.');
-      if (w === 'await_task') return new vscode.Hover('**await_task(task)** — wait for and return a spawned task result.');
-      if (w === 'class') return new vscode.Hover('**class** — declare a Veyra class; use `init(self, ...)` as its constructor.');
+      if (w === 'linreg_fit') return new vscode.Hover('**linreg_fit(x, y)** — fit native simple linear regression and return a model map.');
+      if (w === 'kmeans') return new vscode.Hover('**kmeans(data, k, iterations)** — native k-means clustering.');
+      if (w === 'dense') return new vscode.Hover('**dense(input, weights, bias)** — native dense neural-layer inference.');
+      if (w === 'csv_read') return new vscode.Hover('**csv_read(path)** — load a CSV file into Veyra row maps.');
+      if (w === 'gui_form') return new vscode.Hover('**gui_form(title, fields)** — collect multiple values using native desktop dialogs.');
       if (keywords.includes(w)) return new vscode.Hover('Veyra keyword: **' + w + '**');
     }
   }));

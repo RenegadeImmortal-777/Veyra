@@ -34,6 +34,36 @@
       "entry": "vytext.vy",
       "source": "../packages/vytext",
       "version": "0.1.0"
+    },
+    "vyscience": {
+      "version": "0.1.0",
+      "entry": "vyscience.vy",
+      "source": "../packages/vyscience"
+    },
+    "vyml": {
+      "version": "0.1.0",
+      "entry": "vyml.vy",
+      "source": "../packages/vyml"
+    },
+    "vydata": {
+      "version": "0.2.0",
+      "entry": "vydata.vy",
+      "source": "../packages/vydata"
+    },
+    "vygui": {
+      "version": "0.1.0",
+      "entry": "vygui.vy",
+      "source": "../packages/vygui"
+    },
+    "vyweb": {
+      "version": "0.1.0",
+      "entry": "vyweb.vy",
+      "source": "../packages/vyweb"
+    },
+    "vyplot": {
+      "version": "0.1.0",
+      "entry": "vyplot.vy",
+      "source": "../packages/vyplot"
     }
   },
   "registry_version": 1

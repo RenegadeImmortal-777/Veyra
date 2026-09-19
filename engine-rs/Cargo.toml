@@ -1,6 +1,6 @@
 [package]
 name = "veyra"
-version = "4.0.0"
+version = "5.0.0"
 edition = "2024"
 
 [dependencies]
@@ -10,6 +10,9 @@ rand = "0.8"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+csv = "1"
+tiny_http = "0.12"
+tinyfiledialogs = "3"
 
 [profile.release]
 lto = true
