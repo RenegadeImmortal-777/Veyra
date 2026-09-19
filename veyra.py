@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, math, os, sys, time, json
+from dataclasses import dataclass
+from typing import Any
+
+VERSION = "1.0.0"
+
+class VeyraError(Exception):
+    pass
+
+@dataclass
+class Token:
+    kind: str
+    value: Any
+    line: int
+    col: int
+
+KEYWORDS = {
+    "let","const","fn","if","else","while","for","in","return","true","false",
+    "null","break","continue","use","and","or","not"
+}
+
+class Lexer:
+    def __init__(self, source: str, filename: str = "<input>"):
+        self.s = source
+        self.file = filename
+        self.i = 0
+        self.line = 1
+        self.col = 1
+
+    def err(self, msg):
+        raise VeyraError(f"{self.file}:{self.line}:{self.col}: {msg}")
+
+    def peek(self, n=0):
+        j = self.i + n
+        return self.s[j] if j < len(self.s) else "\0"
+
+    def advance(self):
+        c = self.peek()
+        if c == "\0":
+            return c
+        self.i += 1
+        if c == "\n":
+            self.line += 1
+            self.col = 1
+        else:
+            self.col += 1
+        return c
+
+    def tokens(self):
+        out = []
+        while self.i < len(self.s):
+            c = self.peek()
+            if c in " \t\r\n":
+                self.advance(); continue
+            if c == "/" and self.peek(1) == "/":
+                while self.peek() not in ("\n", "\0"):
+                    self.advance()
+                continue
+            if c == "/" and self.peek(1) == "*":
+                self.advance(); self.advance()
+                while not (self.peek() == "*" and self.peek(1) == "/"):
+                    if self.peek() == "\0":
+                        self.err("unterminated block comment")
+                    self.advance()
+                self.advance(); self.advance(); continue
+            line, col = self.line, self.col
+            if c.isalpha() or c == "_":
+                text = ""
+                while self.peek().isalnum() or self.peek() == "_":
+                    text += self.advance()
+                out.append(Token(text if text in KEYWORDS else "IDENT", text, line, col)); continue
+            if c.isdigit():
+                text = ""
+                while self.peek().isdigit():
+                    text += self.advance()
+                if self.peek() == "." and self.peek(1).isdigit():
+                    text += self.advance()
+                    while self.peek().isdigit():
+                        text += self.advance()
+                    out.append(Token("NUMBER", float(text), line, col))
+                else:
+                    out.append(Token("NUMBER", int(text), line, col))
+                continue
+            if c in "\"'":
+                q = self.advance(); text = ""
+                while self.peek() != q:
+                    if self.peek() == "\0":
+                        self.err("unterminated string")
+                    if self.peek() == "\\":
+                        self.advance(); e = self.advance()
+                        text += {"n":"\n","t":"\t","r":"\r","\\":"\\","\"":"\"","'":"'","0":"\0"}.get(e, e)
+                    else:
+                        text += self.advance()
+                self.advance(); out.append(Token("STRING", text, line, col)); continue
+            matched = False
+            for op in ("==","!=","<=",">=","&&","||","->","**","+=","-=","*=","/="):
+                if self.s.startswith(op, self.i):
+                    for _ in op:
+                        self.advance()
+                    out.append(Token(op, op, line, col)); matched = True; break
+            if matched:
+                continue
+            if c in "+-*/%(){}[],:;.=<>!":
+                self.advance(); out.append(Token(c, c, line, col)); continue
+            self.err(f"unexpected character {c!r}")
+        out.append(Token("EOF", None, self.line, self.col))
+        return out
+
+@dataclass
+class Literal: value: Any
+@dataclass
+class Var: name: str
+@dataclass
+class Unary: op: str; right: Any
+@dataclass
+class Binary: left: Any; op: str; right: Any
+@dataclass
+class Call: fn: Any; args: list
+@dataclass
+class Index: obj: Any; key: Any
+@dataclass
+class ListExpr: items: list
+@dataclass
+class MapExpr: pairs: list
+@dataclass
+class LetStmt: name: str; type_name: str|None; value: Any; const: bool
+@dataclass
+class AssignStmt: target: Any; op: str; value: Any
+@dataclass
+class ExprStmt: expr: Any
+@dataclass
+class Block: body: list
+@dataclass
+class IfStmt: cond: Any; then: Block; otherwise: Any
+@dataclass
+class WhileStmt: cond: Any; body: Block
+@dataclass
+class ForStmt: name: str; iterable: Any; body: Block
+@dataclass
+class FunctionStmt: name: str; params: list; return_type: str|None; body: Block
+@dataclass
+class ReturnStmt: value: Any
+@dataclass
+class FlowStmt: kind: str
+@dataclass
+class UseStmt: path: str
+
+class Parser:
+    def __init__(self, tokens, filename="<input>"):
+        self.t = tokens
+        self.i = 0
+        self.file = filename
+    def cur(self): return self.t[self.i]
+    def match(self, *kinds):
+        if self.cur().kind in kinds:
+            x = self.cur(); self.i += 1; return x
+        return None
+    def expect(self, kind, msg=None):
+        x = self.match(kind)
+        if not x:
+            c = self.cur()
+            raise VeyraError(f"{self.file}:{c.line}:{c.col}: {msg or ('expected '+kind)}, got {c.kind}")
+        return x
+    def program(self):
+        body = []
+        while self.cur().kind != "EOF":
+            body.append(self.statement())
+        return Block(body)
+    def semi(self): self.match(";")
+    def statement(self):
+        if self.match("let"): return self.let_stmt(False)
+        if self.match("const"): return self.let_stmt(True)
+        if self.match("fn"): return self.fn_stmt()
+        if self.match("if"): return self.if_stmt()
+        if self.match("while"): return self.while_stmt()
+        if self.match("for"): return self.for_stmt()
+        if self.match("return"):
+            v = None if self.cur().kind in (";","}") else self.expr()
+            self.semi(); return ReturnStmt(v)
+        if self.match("break"): self.semi(); return FlowStmt("break")
+        if self.match("continue"): self.semi(); return FlowStmt("continue")
+        if self.match("use"):
+            p = self.expect("STRING", "expected module path string").value
+            self.semi(); return UseStmt(p)
+        if self.cur().kind == "{":
+            return self.block()
+        e = self.expr()
+        if self.cur().kind in ("=","+=","-=","*=","/="):
+            op = self.cur().kind; self.i += 1; v = self.expr(); self.semi(); return AssignStmt(e, op, v)
+        self.semi(); return ExprStmt(e)
+    def let_stmt(self, const):
+        name = self.expect("IDENT", "expected variable name").value
+        typ = None
+        if self.match(":"):
+            typ = self.expect("IDENT", "expected type name").value
+        self.expect("=", "expected '=' after variable declaration")
+        v = self.expr(); self.semi(); return LetStmt(name, typ, v, const)
+    def fn_stmt(self):
+        name = self.expect("IDENT", "expected function name").value
+        self.expect("("); params = []
+        if self.cur().kind != ")":
+            while True:
+                pn = self.expect("IDENT", "expected parameter name").value; pt = None
+                if self.match(":"):
+                    pt = self.expect("IDENT", "expected parameter type").value
+                params.append((pn, pt))
+                if not self.match(","):
+                    break
+        self.expect(")")
+        ret = None
+        if self.match("->"):
+            ret = self.expect("IDENT", "expected return type").value
+        return FunctionStmt(name, params, ret, self.block())
+    def block(self):
+        self.expect("{"); body = []
+        while self.cur().kind != "}":
+            if self.cur().kind == "EOF":
+                self.expect("}", "unterminated block")
+            body.append(self.statement())
+        self.expect("}"); return Block(body)
+    def if_stmt(self):
+        cond = self.expr(); then = self.block(); otherwise = None
+        if self.match("else"):
+            otherwise = self.if_stmt() if self.match("if") else self.block()
+        return IfStmt(cond, then, otherwise)
+    def while_stmt(self): return WhileStmt(self.expr(), self.block())
+    def for_stmt(self):
+        name = self.expect("IDENT", "expected loop variable").value
+        self.expect("in", "expected 'in'")
+        return ForStmt(name, self.expr(), self.block())
+    def expr(self): return self.logic_or()
+    def logic_or(self):
+        e = self.logic_and()
+        while self.cur().kind in ("||","or"):
+            op = self.cur().kind; self.i += 1; e = Binary(e, op, self.logic_and())
+        return e
+    def logic_and(self):
+        e = self.equality()
+        while self.cur().kind in ("&&","and"):
+            op = self.cur().kind; self.i += 1; e = Binary(e, op, self.equality())
+        return e
+    def equality(self):
+        e = self.compare()
+        while self.cur().kind in ("==","!="):
+            op = self.cur().kind; self.i += 1; e = Binary(e, op, self.compare())
+        return e
+    def compare(self):
+        e = self.term()
+        while self.cur().kind in ("<","<=",">",">="):
+            op = self.cur().kind; self.i += 1; e = Binary(e, op, self.term())
+        return e
+    def term(self):
+        e = self.factor()
+        while self.cur().kind in ("+","-"):
+            op = self.cur().kind; self.i += 1; e = Binary(e, op, self.factor())
+        return e
+    def factor(self):
+        e = self.power()
+        while self.cur().kind in ("*","/","%"):
+            op = self.cur().kind; self.i += 1; e = Binary(e, op, self.power())
+        return e
+    def power(self):
+        e = self.unary()
+        if self.match("**"):
+            e = Binary(e, "**", self.power())
+        return e
+    def unary(self):
+        if self.cur().kind in ("!","not","-","+"):
+            op = self.cur().kind; self.i += 1; return Unary(op, self.unary())
+        return self.call()
+    def call(self):
+        e = self.primary()
+        while True:
+            if self.match("("):
+                args = []
+                if self.cur().kind != ")":
+                    while True:
+                        args.append(self.expr())
+                        if not self.match(","):
+                            break
+                self.expect(")"); e = Call(e, args)
+            elif self.match("["):
+                k = self.expr(); self.expect("]"); e = Index(e, k)
+            else:
+                break
+        return e
+    def primary(self):
+        x = self.match("NUMBER")
+        if x: return Literal(x.value)
+        x = self.match("STRING")
+        if x: return Literal(x.value)
+        if self.match("true"): return Literal(True)
+        if self.match("false"): return Literal(False)
+        if self.match("null"): return Literal(None)
+        x = self.match("IDENT")
+        if x: return Var(x.value)
+        if self.match("("):
+            e = self.expr(); self.expect(")"); return e
+        if self.match("["):
+            a = []
+            if self.cur().kind != "]":
+                while True:
+                    a.append(self.expr())
+                    if not self.match(","):
+                        break
+            self.expect("]"); return ListExpr(a)
+        if self.match("{"):
+            pairs = []
+            if self.cur().kind != "}":
+                while True:
+                    k = self.expr(); self.expect(":"); v = self.expr(); pairs.append((k, v))
+                    if not self.match(","):
+                        break
+            self.expect("}"); return MapExpr(pairs)
+        c = self.cur()
+        raise VeyraError(f"{self.file}:{c.line}:{c.col}: expected expression, got {c.kind}")
+
+class Env:
+    def __init__(self, parent=None):
+        self.parent = parent
+        self.values = {}
+        self.const = set()
+        self.types = {}
+    def define(self, n, v, const=False, type_name=None):
+        if n in self.values:
+            raise VeyraError(f"name '{n}' already defined in this scope")
+        self.values[n] = v; self.types[n] = type_name
+        if const: self.const.add(n)
+    def find(self, n):
+        if n in self.values: return self
+        if self.parent: return self.parent.find(n)
+        raise VeyraError(f"undefined name '{n}'")
+    def get(self, n): return self.find(n).values[n]
+    def set(self, n, v):
+        e = self.find(n)
+        if n in e.const:
+            raise VeyraError(f"cannot assign to constant '{n}'")
+        if e.types.get(n):
+            check_type(v, e.types[n], n)
+        e.values[n] = v
+
+def type_of(v):
+    if v is None: return "Null"
+    if isinstance(v, bool): return "Bool"
+    if isinstance(v, int) and not isinstance(v, bool): return "Int"
+    if isinstance(v, float): return "Float"
+    if isinstance(v, str): return "String"
+    if isinstance(v, list): return "List"
+    if isinstance(v, dict): return "Map"
+    if isinstance(v, Function): return "Function"
+    if callable(v): return "Function"
+    return type(v).__name__
+
+def check_type(v, t, name="value"):
+    aliases = {"Integer":"Int","Str":"String","Boolean":"Bool","Array":"List","Dict":"Map"}
+    t = aliases.get(t, t)
+    if t in ("Any", None): return
+    if t == "Number" and type_of(v) in ("Int","Float"): return
+    if type_of(v) != t:
+        raise VeyraError(f"{name} expected {t}, got {type_of(v)}")
+
+class Signal(Exception):
+    def __init__(self, kind, value=None):
+        self.kind = kind; self.value = value
+
+class Function:
+    def __init__(self, node, closure, rt):
+        self.node = node; self.closure = closure; self.rt = rt
+    def __call__(self, *args):
+        if len(args) != len(self.node.params):
+            raise VeyraError(f"{self.node.name} expects {len(self.node.params)} arguments, got {len(args)}")
+        e = Env(self.closure)
+        for (name, typ), value in zip(self.node.params, args):
+            if typ: check_type(value, typ, name)
+            e.define(name, value, type_name=typ)
+        try:
+            self.rt.exec_block(self.node.body, e)
+        except Signal as s:
+            if s.kind == "return":
+                if self.node.return_type and self.node.return_type != "Void":
+                    check_type(s.value, self.node.return_type, "return value")
+                return s.value
+            raise
+        if self.node.return_type and self.node.return_type != "Void":
+            check_type(None, self.node.return_type, "return value")
+        return None
+    def __repr__(self): return f"<fn {self.node.name}>"
+
+def format_value(v):
+    if v is None: return "null"
+    if v is True: return "true"
+    if v is False: return "false"
+    if isinstance(v, list): return "[" + ", ".join(format_value(x) for x in v) + "]"
+    if isinstance(v, dict): return "{" + ", ".join(f"{format_value(k)}: {format_value(x)}" for k, x in v.items()) + "}"
+    return str(v)
+
+class Runtime:
+    def __init__(self, filename="<input>", global_env=None):
+        self.filename = filename
+        if global_env is None:
+            builtins_env = Env()
+            self.globals = Env(builtins_env)
+            self.install_builtins(builtins_env)
+        else:
+            self.globals = global_env
+    def install_builtins(self, target):
+        def p(*xs): print(*[format_value(x) for x in xs])
+        def vrange(*xs): return list(range(*[int(x) for x in xs]))
+        def vassert(cond, msg="assertion failed"):
+            if not cond: raise VeyraError(str(msg))
+            return True
+        def push(a, x): a.append(x); return a
+        def pop(a): return a.pop()
+        def read(path):
+            with open(path, "r", encoding="utf-8") as f: return f.read()
+        def write(path, data):
+            with open(path, "w", encoding="utf-8") as f: f.write(str(data))
+            return None
+        builtins = {
+            "print":p,"len":len,"str":lambda x:format_value(x),"int":int,"float":float,
+            "bool":bool,"type":type_of,"range":vrange,"assert":vassert,"push":push,"pop":pop,
+            "keys":lambda d:list(d.keys()),"values":lambda d:list(d.values()),"input":input,
+            "clock":time.time,"sqrt":math.sqrt,"abs":abs,"min":min,"max":max,"round":round,
+            "read":read,"write":write,"json":lambda x:json.dumps(x, ensure_ascii=False)
+        }
+        for n, v in builtins.items(): target.define(n, v, const=True)
+    def eval(self, e, env):
+        if isinstance(e, Literal): return e.value
+        if isinstance(e, Var): return env.get(e.name)
+        if isinstance(e, ListExpr): return [self.eval(x, env) for x in e.items]
+        if isinstance(e, MapExpr): return {self.eval(k, env): self.eval(v, env) for k, v in e.pairs}
+        if isinstance(e, Index): return self.eval(e.obj, env)[self.eval(e.key, env)]
+        if isinstance(e, Unary):
+            r = self.eval(e.right, env)
+            if e.op in ("!","not"): return not bool(r)
+            if e.op == "-": return -r
+            if e.op == "+": return +r
+        if isinstance(e, Binary):
+            if e.op in ("&&","and"):
+                l = self.eval(e.left, env); return self.eval(e.right, env) if l else l
+            if e.op in ("||","or"):
+                l = self.eval(e.left, env); return l if l else self.eval(e.right, env)
+            a, b = self.eval(e.left, env), self.eval(e.right, env)
+            ops = {
+                "+":lambda:a+b,"-":lambda:a-b,"*":lambda:a*b,"/":lambda:a/b,"%":lambda:a%b,
+                "**":lambda:a**b,"==":lambda:a==b,"!=":lambda:a!=b,"<":lambda:a<b,
+                "<=":lambda:a<=b,">":lambda:a>b,">=":lambda:a>=b
+            }
+            try: return ops[e.op]()
+            except Exception as ex: raise VeyraError(f"operator {e.op}: {ex}")
+        if isinstance(e, Call):
+            fn = self.eval(e.fn, env); args = [self.eval(a, env) for a in e.args]
+            if not callable(fn): raise VeyraError(f"{format_value(fn)} is not callable")
+            try: return fn(*args)
+            except VeyraError: raise
+            except Exception as ex: raise VeyraError(str(ex))
+        raise VeyraError(f"cannot evaluate {type(e).__name__}")
+    def exec_block(self, b, env):
+        value = None
+        for s in b.body:
+            value = self.exec(s, env)
+        return value
+    def exec(self, s, env):
+        if isinstance(s, Block): return self.exec_block(s, Env(env))
+        if isinstance(s, ExprStmt): return self.eval(s.expr, env)
+        if isinstance(s, LetStmt):
+            v = self.eval(s.value, env)
+            if s.type_name: check_type(v, s.type_name, s.name)
+            env.define(s.name, v, s.const, s.type_name); return None
+        if isinstance(s, AssignStmt):
+            if isinstance(s.target, Var):
+                old = env.get(s.target.name); nv = self.eval(s.value, env)
+                if s.op == "+=": nv = old + nv
+                elif s.op == "-=": nv = old - nv
+                elif s.op == "*=": nv = old * nv
+                elif s.op == "/=": nv = old / nv
+                env.set(s.target.name, nv); return None
+            if isinstance(s.target, Index):
+                obj = self.eval(s.target.obj, env); key = self.eval(s.target.key, env); nv = self.eval(s.value, env)
+                if s.op != "=":
+                    old = obj[key]
+                    if s.op == "+=": nv = old + nv
+                    elif s.op == "-=": nv = old - nv
+                    elif s.op == "*=": nv = old * nv
+                    elif s.op == "/=": nv = old / nv
+                obj[key] = nv; return None
+            raise VeyraError("invalid assignment target")
+        if isinstance(s, IfStmt):
+            if self.eval(s.cond, env): return self.exec(s.then, env)
+            if s.otherwise: return self.exec(s.otherwise, env)
+            return None
+        if isinstance(s, WhileStmt):
+            while self.eval(s.cond, env):
+                try: self.exec(s.body, env)
+                except Signal as q:
+                    if q.kind == "break": break
+                    if q.kind == "continue": continue
+                    raise
+            return None
+        if isinstance(s, ForStmt):
+            for item in self.eval(s.iterable, env):
+                loop = Env(env); loop.define(s.name, item)
+                try: self.exec_block(s.body, loop)
+                except Signal as q:
+                    if q.kind == "break": break
+                    if q.kind == "continue": continue
+                    raise
+            return None
+        if isinstance(s, FunctionStmt):
+            env.define(s.name, Function(s, env, self), const=True); return None
+        if isinstance(s, ReturnStmt): raise Signal("return", None if s.value is None else self.eval(s.value, env))
+        if isinstance(s, FlowStmt): raise Signal(s.kind)
+        if isinstance(s, UseStmt):
+            path = s.path
+            if not os.path.isabs(path):
+                path = os.path.join(os.path.dirname(os.path.abspath(self.filename)), path)
+            run_file(path, env); return None
+        raise VeyraError(f"cannot execute {type(s).__name__}")
+
+def parse(source, filename="<input>"):
+    return Parser(Lexer(source, filename).tokens(), filename).program()
+
+def run_source(source, filename="<input>", env=None):
+    rt = Runtime(filename, env)
+    tree = parse(source, filename)
+    rt.exec_block(tree, rt.globals)
+    return rt.globals
+
+def run_file(path, env=None):
+    if not os.path.exists(path): raise VeyraError(f"module/file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f: source = f.read()
+    return run_source(source, os.path.abspath(path), env)
+
+def repl():
+    print(f"Veyra {VERSION} REPL — :quit to exit")
+    env = Runtime().globals
+    buf = ""
+    while True:
+        try:
+            line = input("... " if buf else "vy> ")
+            if line.strip() in (":q",":quit","exit"): break
+            buf += line + "\n"
+            if buf.count("{") > buf.count("}"): continue
+            try:
+                tree = parse(buf, "<repl>"); rt = Runtime("<repl>", env)
+                for s in tree.body:
+                    value = rt.exec(s, env)
+                    if isinstance(s, ExprStmt) and value is not None: print(format_value(value))
+            finally:
+                buf = ""
+        except (VeyraError, Signal) as e:
+            print(f"error: {e}", file=sys.stderr); buf = ""
+        except (EOFError, KeyboardInterrupt):
+            print(); break
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="veyra", description="Veyra programming language")
+    ap.add_argument("file", nargs="?")
+    ap.add_argument("--version", action="store_true")
+    ap.add_argument("--check", action="store_true", help="parse without running")
+    ap.add_argument("--tokens", action="store_true", help="print lexer tokens")
+    ns = ap.parse_args(argv)
+    if ns.version:
+        print(f"Veyra {VERSION}"); return 0
+    if not ns.file:
+        repl(); return 0
+    try:
+        with open(ns.file, "r", encoding="utf-8") as f: source = f.read()
+        if ns.tokens:
+            for t in Lexer(source, ns.file).tokens(): print(t)
+            return 0
+        tree = parse(source, ns.file)
+        if ns.check:
+            print(f"{ns.file}: OK"); return 0
+        rt = Runtime(os.path.abspath(ns.file))
+        rt.exec_block(tree, rt.globals)
+        return 0
+    except (OSError, VeyraError) as e:
+        print(f"veyra: error: {e}", file=sys.stderr); return 1
+
+if __name__ == "__main__":
+    raise SystemExit(main())
