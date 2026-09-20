@@ -1,0 +1,38 @@
+name: Veyra CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format check
+        working-directory: engine-rs
+        run: cargo fmt --check
+      - name: Unit tests
+        working-directory: engine-rs
+        run: cargo test
+      - name: Portable core check
+        working-directory: engine-rs
+        run: cargo check --no-default-features
+      - name: Release build
+        working-directory: engine-rs
+        run: cargo build --release
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        working-directory: engine-rs
+        run: cargo clippy --all-targets --all-features -- -D warnings

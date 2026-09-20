@@ -61,12 +61,12 @@
                                    "source":  "../packages/vyweb"
                                },
                      "vyplot":  {
-                                    "version":  "0.1.0",
+                                    "version":  "0.2.0",
                                     "entry":  "vyplot.vy",
                                     "source":  "../packages/vyplot"
                                 },
                      "vyhttp":  {
-                                    "version":  "0.1.0",
+                                    "version":  "0.2.0",
                                     "entry":  "vyhttp.vy",
                                     "source":  "../packages/vyhttp"
                                 },
@@ -101,10 +101,55 @@
                                       "source":  "../packages/vysqlite"
                                   },
                      "vyos":  {
-                                  "version":  "0.1.0",
+                                  "version":  "0.2.0",
                                   "entry":  "vyos.vy",
                                   "source":  "../packages/vyos"
-                              }
+                              },
+                     "vylinalg":  {
+                                      "version":  "0.1.0",
+                                      "entry":  "vylinalg.vy",
+                                      "source":  "../packages/vylinalg"
+                                  },
+                     "vyframe":  {
+                                     "version":  "0.1.0",
+                                     "entry":  "vyframe.vy",
+                                     "source":  "../packages/vyframe"
+                                 },
+                     "vydatetime":  {
+                                        "version":  "0.1.0",
+                                        "entry":  "vydatetime.vy",
+                                        "source":  "../packages/vydatetime"
+                                    },
+                     "vyencoding":  {
+                                        "version":  "0.1.0",
+                                        "entry":  "vyencoding.vy",
+                                        "source":  "../packages/vyencoding"
+                                    },
+                     "vyconfig":  {
+                                      "version":  "0.1.0",
+                                      "entry":  "vyconfig.vy",
+                                      "source":  "../packages/vyconfig"
+                                  },
+                     "vyuuid":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vyuuid.vy",
+                                    "source":  "../packages/vyuuid"
+                                },
+                     "vysets":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vysets.vy",
+                                    "source":  "../packages/vysets"
+                                },
+                     "vyfunctional":  {
+                                          "version":  "0.1.0",
+                                          "entry":  "vyfunctional.vy",
+                                          "source":  "../packages/vyfunctional"
+                                      },
+                     "vyviz":  {
+                                   "version":  "0.1.0",
+                                   "entry":  "vyviz.vy",
+                                   "source":  "../packages/vyviz"
+                               }
                  },
     "registry_version":  1
 }

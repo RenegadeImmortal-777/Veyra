@@ -1,3 +1,11 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::let_and_return,
+    clippy::only_used_in_recursion
+)]
+
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
@@ -13,15 +21,17 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use base64::Engine;
 use libloading::Library;
 use rand::Rng;
 use regex::Regex;
+#[cfg(feature = "native-services")]
 use rusqlite::Connection;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 
-const VERSION: &str = "6.0.0-apex";
+const VERSION: &str = "7.0.0-meridian";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -33,6 +43,7 @@ enum Tok {
     Fn,
     Class,
     Return,
+    Yield,
     Break,
     Continue,
     If,
@@ -43,6 +54,8 @@ enum Tok {
     Try,
     Catch,
     Throw,
+    Match,
+    Case,
     Await,
     And,
     Or,
@@ -145,6 +158,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 "fn" => Tok::Fn,
                 "class" => Tok::Class,
                 "return" => Tok::Return,
+                "yield" => Tok::Yield,
                 "break" => Tok::Break,
                 "continue" => Tok::Continue,
                 "if" => Tok::If,
@@ -155,6 +169,8 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 "try" => Tok::Try,
                 "catch" => Tok::Catch,
                 "throw" => Tok::Throw,
+                "match" => Tok::Match,
+                "case" => Tok::Case,
                 "await" => Tok::Await,
                 "and" => Tok::And,
                 "or" => Tok::Or,
@@ -268,6 +284,8 @@ enum Expr {
     Member(Box<Expr>, String),
     MethodCall(Box<Expr>, String, Vec<Expr>),
     Await(Box<Expr>),
+    Lambda(Vec<(String, Option<String>)>, Option<String>, Vec<Stmt>),
+    ListComp(Box<Expr>, String, Box<Expr>, Option<Box<Expr>>),
     Unary(String, Box<Expr>),
     Bin(Box<Expr>, String, Box<Expr>),
     Call(String, Vec<Expr>),
@@ -291,7 +309,9 @@ enum Stmt {
     ),
     Class(String, Option<String>, Vec<Stmt>),
     SetMember(Expr, String, Expr),
+    Match(Expr, Vec<(Option<Expr>, Vec<Stmt>)>),
     Return(Option<Expr>),
+    Yield(Expr),
     Break,
     Continue,
 }
@@ -429,6 +449,11 @@ impl Parser {
             self.eat(&Tok::Semi);
             return Ok(Stmt::Continue);
         }
+        if self.eat(&Tok::Yield) {
+            let value = self.expr()?;
+            self.eat(&Tok::Semi);
+            return Ok(Stmt::Yield(value));
+        }
         if self.eat(&Tok::Return) {
             if matches!(self.cur(), Tok::Semi | Tok::Rb) {
                 self.eat(&Tok::Semi);
@@ -489,6 +514,23 @@ impl Parser {
             let value = self.expr()?;
             self.eat(&Tok::Semi);
             return Ok(Stmt::Throw(value));
+        }
+        if self.eat(&Tok::Match) {
+            let subject = self.expr()?;
+            self.need(&Tok::Lb, "expected '{' after match expression")?;
+            let mut cases = vec![];
+            while !self.eat(&Tok::Rb) {
+                self.need(&Tok::Case, "expected 'case' in match")?;
+                let pattern = if matches!(self.cur(), Tok::Id(s) if s == "_") {
+                    self.i += 1;
+                    None
+                } else {
+                    Some(self.expr()?)
+                };
+                let body = self.block()?;
+                cases.push((pattern, body));
+            }
+            return Ok(Stmt::Match(subject, cases));
         }
         if let Tok::Id(n) = self.cur().clone() {
             if self.i + 1 < self.t.len() && matches!(self.t[self.i + 1], Tok::Eq) {
@@ -640,6 +682,41 @@ impl Parser {
             Tok::True => Ok(Expr::Bool(true)),
             Tok::False => Ok(Expr::Bool(false)),
             Tok::Null => Ok(Expr::Null),
+            Tok::Fn => {
+                self.need(&Tok::Lp, "expected '(' after anonymous fn")?;
+                let mut params = vec![];
+                if !self.eat(&Tok::Rp) {
+                    loop {
+                        let param = match self.bump() {
+                            Tok::Id(s) => s,
+                            x => return Err(format!("expected parameter name, got {x:?}")),
+                        };
+                        let param_type = if self.eat(&Tok::Colon) {
+                            match self.bump() {
+                                Tok::Id(s) => Some(s),
+                                _ => return Err("expected parameter type".into()),
+                            }
+                        } else {
+                            None
+                        };
+                        params.push((param, param_type));
+                        if self.eat(&Tok::Rp) {
+                            break;
+                        }
+                        self.need(&Tok::Comma, "expected ',' between parameters")?;
+                    }
+                }
+                let return_type = if self.eat(&Tok::Arrow) {
+                    match self.bump() {
+                        Tok::Id(s) => Some(s),
+                        _ => return Err("expected return type".into()),
+                    }
+                } else {
+                    None
+                };
+                let body = self.block()?;
+                Ok(Expr::Lambda(params, return_type, body))
+            }
             Tok::Id(n) => {
                 if self.eat(&Tok::Lp) {
                     let mut a = vec![];
@@ -663,15 +740,37 @@ impl Parser {
                 Ok(e)
             }
             Tok::Ls => {
-                let mut a = vec![];
-                if !self.eat(&Tok::Rs) {
-                    loop {
-                        a.push(self.expr()?);
-                        if self.eat(&Tok::Rs) {
-                            break;
-                        }
-                        self.need(&Tok::Comma, "expected ','")?;
+                if self.eat(&Tok::Rs) {
+                    return Ok(Expr::List(vec![]));
+                }
+                let first = self.expr()?;
+                if self.eat(&Tok::For) {
+                    let name = match self.bump() {
+                        Tok::Id(s) => s,
+                        x => return Err(format!("expected comprehension variable, got {x:?}")),
+                    };
+                    self.need(&Tok::In, "expected 'in' in comprehension")?;
+                    let iterable = self.expr()?;
+                    let condition = if self.eat(&Tok::If) {
+                        Some(Box::new(self.expr()?))
+                    } else {
+                        None
+                    };
+                    self.need(&Tok::Rs, "expected ']' after comprehension")?;
+                    return Ok(Expr::ListComp(
+                        Box::new(first),
+                        name,
+                        Box::new(iterable),
+                        condition,
+                    ));
+                }
+                let mut a = vec![first];
+                while !self.eat(&Tok::Rs) {
+                    self.need(&Tok::Comma, "expected ','")?;
+                    if self.eat(&Tok::Rs) {
+                        break;
                     }
+                    a.push(self.expr()?);
                 }
                 Ok(Expr::List(a))
             }
@@ -705,6 +804,8 @@ enum Val {
     List(Vec<Val>),
     Map(Vec<(Val, Val)>),
     Object(u64),
+    Function(String),
+    Generator(u64),
 }
 fn val_to_json(v: &Val) -> JsonValue {
     match v {
@@ -714,6 +815,8 @@ fn val_to_json(v: &Val) -> JsonValue {
         Val::Null => JsonValue::Null,
         Val::List(xs) => JsonValue::Array(xs.iter().map(val_to_json).collect()),
         Val::Object(id) => JsonValue::String(format!("<object:{id}>")),
+        Val::Function(name) => JsonValue::String(format!("<function:{name}>")),
+        Val::Generator(id) => JsonValue::String(format!("<generator:{id}>")),
         Val::Map(pairs) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in pairs {
@@ -724,6 +827,7 @@ fn val_to_json(v: &Val) -> JsonValue {
     }
 }
 
+#[cfg(feature = "native-services")]
 fn json_stringify_value(v: &Val) -> Result<String, String> {
     serde_json::to_string(&val_to_json(v)).map_err(|e| e.to_string())
 }
@@ -775,6 +879,119 @@ fn distance_sq(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
 }
 
+fn square_matrix(m: &[Vec<f64>]) -> Result<usize, String> {
+    let n = m.len();
+    if n == 0 || m.iter().any(|r| r.len() != n) {
+        return Err("expected non-empty square matrix".into());
+    }
+    Ok(n)
+}
+
+fn matrix_determinant(mut m: Vec<Vec<f64>>) -> Result<f64, String> {
+    let n = square_matrix(&m)?;
+    let mut det = 1.0;
+    let mut sign = 1.0;
+    for i in 0..n {
+        let mut pivot = i;
+        for r in (i + 1)..n {
+            if m[r][i].abs() > m[pivot][i].abs() {
+                pivot = r;
+            }
+        }
+        if m[pivot][i].abs() < 1e-12 {
+            return Ok(0.0);
+        }
+        if pivot != i {
+            m.swap(i, pivot);
+            sign *= -1.0;
+        }
+        let pv = m[i][i];
+        det *= pv;
+        for r in (i + 1)..n {
+            let factor = m[r][i] / pv;
+            for c in (i + 1)..n {
+                m[r][c] -= factor * m[i][c];
+            }
+        }
+    }
+    Ok(det * sign)
+}
+
+fn matrix_inverse(mut a: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+    let n = square_matrix(&a)?;
+    let mut inv = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        inv[i][i] = 1.0;
+    }
+    for i in 0..n {
+        let mut pivot = i;
+        for r in (i + 1)..n {
+            if a[r][i].abs() > a[pivot][i].abs() {
+                pivot = r;
+            }
+        }
+        if a[pivot][i].abs() < 1e-12 {
+            return Err("matrix is singular".into());
+        }
+        if pivot != i {
+            a.swap(i, pivot);
+            inv.swap(i, pivot);
+        }
+        let pv = a[i][i];
+        for c in 0..n {
+            a[i][c] /= pv;
+            inv[i][c] /= pv;
+        }
+        for r in 0..n {
+            if r == i {
+                continue;
+            }
+            let factor = a[r][i];
+            for c in 0..n {
+                a[r][c] -= factor * a[i][c];
+                inv[r][c] -= factor * inv[i][c];
+            }
+        }
+    }
+    Ok(inv)
+}
+
+fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Result<Vec<f64>, String> {
+    let n = square_matrix(&a)?;
+    if b.len() != n {
+        return Err("linear solve dimension mismatch".into());
+    }
+    for i in 0..n {
+        let mut pivot = i;
+        for r in (i + 1)..n {
+            if a[r][i].abs() > a[pivot][i].abs() {
+                pivot = r;
+            }
+        }
+        if a[pivot][i].abs() < 1e-12 {
+            return Err("matrix is singular".into());
+        }
+        if pivot != i {
+            a.swap(i, pivot);
+            b.swap(i, pivot);
+        }
+        let pv = a[i][i];
+        for r in (i + 1)..n {
+            let factor = a[r][i] / pv;
+            for c in i..n {
+                a[r][c] -= factor * a[i][c];
+            }
+            b[r] -= factor * b[i];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for i in (0..n).rev() {
+        let rhs = b[i] - ((i + 1)..n).map(|j| a[i][j] * x[j]).sum::<f64>();
+        x[i] = rhs / a[i][i];
+    }
+    Ok(x)
+}
+
 fn map_lookup<'a>(pairs: &'a [(Val, Val)], key: &Val) -> Option<&'a Val> {
     pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
@@ -795,7 +1012,7 @@ impl Val {
             Val::Str(s) => !s.is_empty(),
             Val::List(v) => !v.is_empty(),
             Val::Map(v) => !v.is_empty(),
-            Val::Object(_) => true,
+            Val::Object(_) | Val::Function(_) | Val::Generator(_) => true,
         }
     }
     fn show(&self) -> String {
@@ -822,6 +1039,8 @@ impl Val {
                     .join(", ")
             ),
             Val::Object(id) => format!("<object:{id}>"),
+            Val::Function(name) => format!("<function:{name}>"),
+            Val::Generator(id) => format!("<generator:{id}>"),
         }
     }
 }
@@ -853,6 +1072,7 @@ enum Op {
     SetMember(String),
     Call(String, usize),
     CallMethod(String, usize),
+    FunctionRef(String),
     Def(
         String,
         Vec<(String, Option<String>)>,
@@ -870,6 +1090,7 @@ enum Op {
         )>,
     ),
     Return,
+    Yield,
     PushHandler(usize, String),
     PopHandler,
     Throw,
@@ -901,6 +1122,7 @@ struct ObjectData {
 
 static OBJECT_IDS: AtomicU64 = AtomicU64::new(1);
 static TASK_IDS: AtomicU64 = AtomicU64::new(1);
+static GENERATOR_IDS: AtomicU64 = AtomicU64::new(1);
 static CHANNEL_IDS: AtomicU64 = AtomicU64::new(1);
 static TASKS: OnceLock<Mutex<HashMap<u64, thread::JoinHandle<Result<Val, String>>>>> =
     OnceLock::new();
@@ -975,6 +1197,94 @@ impl Compiler {
             Expr::Await(task) => {
                 self.emit_expr(task)?;
                 self.code.push(Op::Call("await_task".into(), 1));
+            }
+            Expr::Lambda(params, return_type, body) => {
+                let name = self.temp("lambda");
+                let mut child = Compiler::new();
+                child.emit_stmts(body)?;
+                child.code.push(Op::Const(Val::Null));
+                child.code.push(Op::Return);
+                self.code.push(Op::Def(
+                    name.clone(),
+                    params.clone(),
+                    return_type.clone(),
+                    child.code,
+                ));
+                self.code.push(Op::FunctionRef(name));
+            }
+            Expr::ListComp(value, var, iterable, condition) => {
+                let value_fn = self.temp("comp_value");
+                let mut value_compiler = Compiler::new();
+                value_compiler.emit_expr(value)?;
+                value_compiler.code.push(Op::Return);
+                self.code.push(Op::Def(
+                    value_fn.clone(),
+                    vec![(var.clone(), None)],
+                    None,
+                    value_compiler.code,
+                ));
+                let condition_fn = if let Some(cond) = condition {
+                    let name = self.temp("comp_cond");
+                    let mut cond_compiler = Compiler::new();
+                    cond_compiler.emit_expr(cond)?;
+                    cond_compiler.code.push(Op::Return);
+                    self.code.push(Op::Def(
+                        name.clone(),
+                        vec![(var.clone(), None)],
+                        Some("Bool".into()),
+                        cond_compiler.code,
+                    ));
+                    Some(name)
+                } else {
+                    None
+                };
+                let result_name = self.temp("comp_result");
+                let iter_name = self.temp("comp_iter");
+                let idx_name = self.temp("comp_idx");
+                self.code.push(Op::Call("__list".into(), 0));
+                self.code.push(Op::Define(result_name.clone(), false, None));
+                self.emit_expr(iterable)?;
+                self.code.push(Op::Call("__iter_list".into(), 1));
+                self.code.push(Op::Define(iter_name.clone(), false, None));
+                self.code.push(Op::Const(Val::Num(0.0)));
+                self.code
+                    .push(Op::Define(idx_name.clone(), false, Some("Int".into())));
+                let loop_start = self.code.len();
+                self.code.push(Op::Load(idx_name.clone()));
+                self.code.push(Op::Load(iter_name.clone()));
+                self.code.push(Op::Call("len".into(), 1));
+                self.code.push(Op::Lt);
+                let end_jump = self.code.len();
+                self.code.push(Op::JumpIfFalse(0));
+                let mut condition_jump = None;
+                if let Some(cond_fn) = condition_fn {
+                    self.code.push(Op::Load(iter_name.clone()));
+                    self.code.push(Op::Load(idx_name.clone()));
+                    self.code.push(Op::Index);
+                    self.code.push(Op::Call(cond_fn, 1));
+                    let j = self.code.len();
+                    self.code.push(Op::JumpIfFalse(0));
+                    condition_jump = Some(j);
+                }
+                self.code.push(Op::Load(result_name.clone()));
+                self.code.push(Op::Load(iter_name.clone()));
+                self.code.push(Op::Load(idx_name.clone()));
+                self.code.push(Op::Index);
+                self.code.push(Op::Call(value_fn, 1));
+                self.code.push(Op::Call("append".into(), 2));
+                self.code.push(Op::Store(result_name.clone()));
+                let increment = self.code.len();
+                if let Some(j) = condition_jump {
+                    self.code[j] = Op::JumpIfFalse(increment);
+                }
+                self.code.push(Op::Load(idx_name.clone()));
+                self.code.push(Op::Const(Val::Num(1.0)));
+                self.code.push(Op::Add);
+                self.code.push(Op::Store(idx_name.clone()));
+                self.code.push(Op::Jump(loop_start));
+                let end = self.code.len();
+                self.code[end_jump] = Op::JumpIfFalse(end);
+                self.code.push(Op::Load(result_name));
             }
             Expr::Var(n) => self.code.push(Op::Load(n.clone())),
             Expr::Unary(op, x) => {
@@ -1098,6 +1408,7 @@ impl Compiler {
                 let iter_name = self.temp("iter");
                 let idx_name = self.temp("idx");
                 self.emit_expr(iterable)?;
+                self.code.push(Op::Call("__iter_list".into(), 1));
                 self.code.push(Op::Define(iter_name.clone(), false, None));
                 self.code.push(Op::Const(Val::Num(0.0)));
                 self.code.push(Op::Define(idx_name.clone(), false, None));
@@ -1131,6 +1442,42 @@ impl Compiler {
                 self.code[jf] = Op::JumpIfFalse(end);
                 for p in ctx.breaks {
                     self.code[p] = Op::Jump(end);
+                }
+            }
+            Stmt::Match(subject, cases) => {
+                let subject_name = self.temp("match_subject");
+                self.emit_expr(subject)?;
+                self.code
+                    .push(Op::Define(subject_name.clone(), false, None));
+                let mut end_jumps = vec![];
+                let mut wildcard_seen = false;
+                for (pattern, body) in cases {
+                    if wildcard_seen {
+                        return Err("match cases after wildcard '_' are unreachable".into());
+                    }
+                    if let Some(pattern) = pattern {
+                        self.code.push(Op::Load(subject_name.clone()));
+                        self.emit_expr(pattern)?;
+                        self.code.push(Op::Eq);
+                        let next_case = self.code.len();
+                        self.code.push(Op::JumpIfFalse(0));
+                        self.emit_stmts(body)?;
+                        let end_jump = self.code.len();
+                        self.code.push(Op::Jump(0));
+                        end_jumps.push(end_jump);
+                        let next = self.code.len();
+                        self.code[next_case] = Op::JumpIfFalse(next);
+                    } else {
+                        wildcard_seen = true;
+                        self.emit_stmts(body)?;
+                        let end_jump = self.code.len();
+                        self.code.push(Op::Jump(0));
+                        end_jumps.push(end_jump);
+                    }
+                }
+                let end = self.code.len();
+                for j in end_jumps {
+                    self.code[j] = Op::Jump(end);
                 }
             }
             Stmt::Try(body, error_name, handler) => {
@@ -1188,6 +1535,10 @@ impl Compiler {
                     child.code,
                 ));
             }
+            Stmt::Yield(value) => {
+                self.emit_expr(value)?;
+                self.code.push(Op::Yield);
+            }
             Stmt::Return(value) => {
                 if let Some(expr) = value {
                     self.emit_expr(expr)?;
@@ -1231,7 +1582,50 @@ struct Vm {
     classes: HashMap<String, ClassDef>,
     objects: Arc<Mutex<HashMap<u64, ObjectData>>>,
     handlers: Vec<(usize, String)>,
+    trace: bool,
+    finished: bool,
 }
+
+static GENERATORS: OnceLock<Mutex<HashMap<u64, Vm>>> = OnceLock::new();
+
+fn generators() -> &'static Mutex<HashMap<u64, Vm>> {
+    GENERATORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resume_generator(id: u64) -> Result<Option<Val>, String> {
+    let mut vm = generators()
+        .lock()
+        .map_err(|_| "generator registry poisoned")?
+        .remove(&id)
+        .ok_or(format!("unknown or completed generator {id}"))?;
+    if vm.finished {
+        return Ok(None);
+    }
+    let value = vm.execute()?;
+    if vm.finished {
+        Ok(None)
+    } else {
+        generators()
+            .lock()
+            .map_err(|_| "generator registry poisoned")?
+            .insert(id, vm);
+        Ok(Some(value))
+    }
+}
+
+fn collect_generator(id: u64) -> Result<Vec<Val>, String> {
+    let mut out = vec![];
+    loop {
+        match resume_generator(id) {
+            Ok(Some(v)) => out.push(v),
+            Ok(None) => break,
+            Err(e) if e.starts_with("unknown or completed generator") => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
 impl Vm {
     fn new(code: Vec<Op>) -> Self {
         Self {
@@ -1245,6 +1639,8 @@ impl Vm {
             classes: HashMap::new(),
             objects: Arc::new(Mutex::new(HashMap::new())),
             handlers: vec![],
+            trace: false,
+            finished: false,
         }
     }
     fn nested(
@@ -1265,6 +1661,8 @@ impl Vm {
             classes,
             objects,
             handlers: vec![],
+            trace: false,
+            finished: false,
         }
     }
     fn pop(&mut self) -> Result<Val, String> {
@@ -1301,6 +1699,8 @@ impl Vm {
             "Map" => matches!(value, Val::Map(_)),
             "Null" | "Void" => matches!(value, Val::Null),
             "Object" => matches!(value, Val::Object(_)),
+            "Function" => matches!(value, Val::Function(_)),
+            "Generator" => matches!(value, Val::Generator(_)),
             custom => match value {
                 Val::Object(id) => {
                     let Ok(heap) = self.objects.lock() else {
@@ -1333,6 +1733,7 @@ impl Vm {
                 args.len()
             ));
         }
+        let is_generator = def.code.iter().any(|op| matches!(op, Op::Yield));
         let mut vars = def.captures.clone();
         let mut var_types = def.capture_types.clone();
         let return_type = def.return_type.clone();
@@ -1356,6 +1757,21 @@ impl Vm {
             self.objects.clone(),
         );
         nested.var_types = var_types;
+        if is_generator {
+            if let Some(expected) = return_type {
+                if expected != "Generator" && expected != "Any" {
+                    return Err(format!(
+                        "generator function return type must be Generator or Any, got {expected}"
+                    ));
+                }
+            }
+            let id = GENERATOR_IDS.fetch_add(1, Ordering::Relaxed);
+            generators()
+                .lock()
+                .map_err(|_| "generator registry poisoned")?
+                .insert(id, nested);
+            return Ok(Val::Generator(id));
+        }
         let result = nested.execute()?;
         if let Some(expected) = return_type {
             if !self.value_matches(&result, &expected) {
@@ -1391,6 +1807,18 @@ impl Vm {
         }
         Ok(Val::Object(id))
     }
+    fn callable_def(&self, value: &Val) -> Result<(String, FunctionDef), String> {
+        let name = match value {
+            Val::Str(s) | Val::Function(s) => s.clone(),
+            _ => return Err("callable must be a function value or function name String".into()),
+        };
+        let def = self
+            .funcs
+            .get(&name)
+            .cloned()
+            .ok_or(format!("unknown function '{name}'"))?;
+        Ok((name, def))
+    }
     fn invoke(&self, name: &str, args: Vec<Val>) -> Result<Val, String> {
         let def = self
             .funcs
@@ -1409,15 +1837,38 @@ impl Vm {
                 .get(self.ip)
                 .cloned()
                 .ok_or("instruction pointer out of range")?;
+            if self.trace {
+                let mut vars = self
+                    .vars
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", v.show()))
+                    .collect::<Vec<_>>();
+                vars.sort();
+                eprintln!(
+                    "[veyra-debug pc={:04}] {:?} | stack=[{}] | vars={{ {} }}",
+                    self.ip,
+                    op,
+                    self.stack
+                        .iter()
+                        .map(Val::show)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    vars.join(", ")
+                );
+            }
             self.ip += 1;
             match op {
                 Op::Const(v) => self.stack.push(v),
-                Op::Load(n) => self.stack.push(
-                    self.vars
-                        .get(&n)
-                        .cloned()
-                        .ok_or(format!("undefined name '{n}'"))?,
-                ),
+                Op::Load(n) => {
+                    let value = if let Some(v) = self.vars.get(&n) {
+                        v.clone()
+                    } else if self.funcs.contains_key(&n) {
+                        Val::Function(n.clone())
+                    } else {
+                        return Err(format!("undefined name '{n}'"));
+                    };
+                    self.stack.push(value);
+                }
                 Op::Define(n, is_const, ty) => {
                     let v = self.pop()?;
                     if self.vars.contains_key(&n) {
@@ -1649,6 +2100,8 @@ impl Vm {
                                 Val::Null => "Null".to_string(),
                                 Val::List(_) => "List".to_string(),
                                 Val::Map(_) => "Map".to_string(),
+                                Val::Function(_) => "Function".to_string(),
+                                Val::Generator(_) => "Generator".to_string(),
                                 Val::Object(id) => {
                                     let heap =
                                         self.objects.lock().map_err(|_| "object heap poisoned")?;
@@ -1798,6 +2251,63 @@ impl Vm {
                             Val::Bool(xs.iter().any(Val::truthy))
                         }
                         "__list" => Val::List(a),
+                        "next" => {
+                            if a.len() != 1 {
+                                return Err("next expects generator".into());
+                            }
+                            let id = match a[0] {
+                                Val::Generator(id) => id,
+                                _ => return Err("next expects Generator".into()),
+                            };
+                            resume_generator(id)?.unwrap_or(Val::Null)
+                        }
+                        "generator_done" => {
+                            if a.len() != 1 {
+                                return Err("generator_done expects generator".into());
+                            }
+                            let id = match a[0] {
+                                Val::Generator(id) => id,
+                                _ => return Err("generator_done expects Generator".into()),
+                            };
+                            Val::Bool(
+                                !generators()
+                                    .lock()
+                                    .map_err(|_| "generator registry poisoned")?
+                                    .contains_key(&id),
+                            )
+                        }
+                        "collect" => {
+                            if a.len() != 1 {
+                                return Err("collect expects iterable".into());
+                            }
+                            match &a[0] {
+                                Val::Generator(id) => Val::List(collect_generator(*id)?),
+                                Val::List(v) => Val::List(v.clone()),
+                                Val::Str(s) => {
+                                    Val::List(s.chars().map(|c| Val::Str(c.to_string())).collect())
+                                }
+                                Val::Map(pairs) => {
+                                    Val::List(pairs.iter().map(|(k, _)| k.clone()).collect())
+                                }
+                                _ => return Err("collect expects Generator/List/String/Map".into()),
+                            }
+                        }
+                        "__iter_list" => {
+                            if a.len() != 1 {
+                                return Err("__iter_list expects 1 argument".into());
+                            }
+                            match &a[0] {
+                                Val::List(v) => Val::List(v.clone()),
+                                Val::Str(s) => {
+                                    Val::List(s.chars().map(|c| Val::Str(c.to_string())).collect())
+                                }
+                                Val::Map(pairs) => {
+                                    Val::List(pairs.iter().map(|(k, _)| k.clone()).collect())
+                                }
+                                Val::Generator(id) => Val::List(collect_generator(*id)?),
+                                _ => return Err("value is not iterable".into()),
+                            }
+                        }
                         "__map" => {
                             if a.len() % 2 != 0 {
                                 return Err("internal map arity error".into());
@@ -1869,6 +2379,60 @@ impl Vm {
                                 }
                             }
                             Val::List(out)
+                        }
+                        "set_union" => {
+                            if a.len() != 2 {
+                                return Err("set_union expects two lists".into());
+                            }
+                            let x = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("set_union expects Lists".into()),
+                            };
+                            let y = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("set_union expects Lists".into()),
+                            };
+                            let mut out = vec![];
+                            for v in x.iter().chain(y.iter()) {
+                                if !out.contains(v) {
+                                    out.push(v.clone());
+                                }
+                            }
+                            Val::List(out)
+                        }
+                        "set_intersection" => {
+                            if a.len() != 2 {
+                                return Err("set_intersection expects two lists".into());
+                            }
+                            let x = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("set_intersection expects Lists".into()),
+                            };
+                            let y = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("set_intersection expects Lists".into()),
+                            };
+                            let mut out = vec![];
+                            for v in x {
+                                if y.contains(v) && !out.contains(v) {
+                                    out.push(v.clone());
+                                }
+                            }
+                            Val::List(out)
+                        }
+                        "set_difference" => {
+                            if a.len() != 2 {
+                                return Err("set_difference expects two lists".into());
+                            }
+                            let x = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("set_difference expects Lists".into()),
+                            };
+                            let y = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("set_difference expects Lists".into()),
+                            };
+                            Val::List(x.iter().filter(|v| !y.contains(v)).cloned().collect())
                         }
                         "contains" => {
                             if a.len() != 2 {
@@ -2038,21 +2602,13 @@ impl Vm {
                         }
                         "map_call" => {
                             if a.len() != 2 {
-                                return Err("map_call expects function_name,list".into());
+                                return Err("map_call expects callable,list".into());
                             }
-                            let name = match &a[0] {
-                                Val::Str(s) => s,
-                                _ => return Err("function_name must be String".into()),
-                            };
+                            let (_, def) = self.callable_def(&a[0])?;
                             let xs = match &a[1] {
                                 Val::List(v) => v,
                                 _ => return Err("map_call expects List".into()),
                             };
-                            let def = self
-                                .funcs
-                                .get(name)
-                                .cloned()
-                                .ok_or(format!("unknown function '{name}'"))?;
                             let mut out = vec![];
                             for x in xs {
                                 out.push(self.call_def(def.clone(), vec![x.clone()])?);
@@ -2061,21 +2617,13 @@ impl Vm {
                         }
                         "filter_call" => {
                             if a.len() != 2 {
-                                return Err("filter_call expects function_name,list".into());
+                                return Err("filter_call expects callable,list".into());
                             }
-                            let name = match &a[0] {
-                                Val::Str(s) => s,
-                                _ => return Err("function_name must be String".into()),
-                            };
+                            let (_, def) = self.callable_def(&a[0])?;
                             let xs = match &a[1] {
                                 Val::List(v) => v,
                                 _ => return Err("filter_call expects List".into()),
                             };
-                            let def = self
-                                .funcs
-                                .get(name)
-                                .cloned()
-                                .ok_or(format!("unknown function '{name}'"))?;
                             let mut out = vec![];
                             for x in xs {
                                 if self.call_def(def.clone(), vec![x.clone()])?.truthy() {
@@ -2086,21 +2634,13 @@ impl Vm {
                         }
                         "reduce_call" => {
                             if a.len() != 3 {
-                                return Err("reduce_call expects function_name,list,initial".into());
+                                return Err("reduce_call expects callable,list,initial".into());
                             }
-                            let name = match &a[0] {
-                                Val::Str(s) => s,
-                                _ => return Err("function_name must be String".into()),
-                            };
+                            let (_, def) = self.callable_def(&a[0])?;
                             let xs = match &a[1] {
                                 Val::List(v) => v,
                                 _ => return Err("reduce_call expects List".into()),
                             };
-                            let def = self
-                                .funcs
-                                .get(name)
-                                .cloned()
-                                .ok_or(format!("unknown function '{name}'"))?;
                             let mut acc = a[2].clone();
                             for x in xs {
                                 acc = self.call_def(def.clone(), vec![acc, x.clone()])?;
@@ -2126,6 +2666,63 @@ impl Vm {
                             };
                             json_to_val(
                                 &serde_json::from_str::<JsonValue>(s).map_err(|e| e.to_string())?,
+                            )
+                        }
+                        "regex_match" => {
+                            if a.len() != 2 {
+                                return Err("regex_match expects pattern,text".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("pattern must be String".into()),
+                            };
+                            let t = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            Val::Bool(Regex::new(p).map_err(|e| e.to_string())?.is_match(t))
+                        }
+                        "regex_replace" => {
+                            if a.len() != 3 {
+                                return Err("regex_replace expects pattern,text,replacement".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("pattern must be String".into()),
+                            };
+                            let t = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let r = match &a[2] {
+                                Val::Str(s) => s,
+                                _ => return Err("replacement must be String".into()),
+                            };
+                            Val::Str(
+                                Regex::new(p)
+                                    .map_err(|e| e.to_string())?
+                                    .replace_all(t, r.as_str())
+                                    .to_string(),
+                            )
+                        }
+                        "regex_split" => {
+                            if a.len() != 2 {
+                                return Err("regex_split expects pattern,text".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("pattern must be String".into()),
+                            };
+                            let t = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            Val::List(
+                                Regex::new(p)
+                                    .map_err(|e| e.to_string())?
+                                    .split(t)
+                                    .map(|x| Val::Str(x.to_string()))
+                                    .collect(),
                             )
                         }
                         "regex_findall" => {
@@ -2356,6 +2953,27 @@ impl Vm {
                                 }
                             }
                             matrix_to_val(out)
+                        }
+                        "matrix_det" => {
+                            if a.len() != 1 {
+                                return Err("matrix_det expects matrix".into());
+                            }
+                            Val::Num(matrix_determinant(as_matrix(&a[0])?)?)
+                        }
+                        "matrix_inverse" => {
+                            if a.len() != 1 {
+                                return Err("matrix_inverse expects matrix".into());
+                            }
+                            matrix_to_val(matrix_inverse(as_matrix(&a[0])?)?)
+                        }
+                        "linear_solve" => {
+                            if a.len() != 2 {
+                                return Err("linear_solve expects matrix,vector".into());
+                            }
+                            nums_to_val(solve_linear_system(
+                                as_matrix(&a[0])?,
+                                as_num_list(&a[1])?,
+                            )?)
                         }
                         "linreg_fit" => {
                             if a.len() != 2 {
@@ -2723,6 +3341,111 @@ impl Vm {
                             fs::write(path, svg).map_err(|e| e.to_string())?;
                             Val::Null
                         }
+                        "scatter_svg" => {
+                            if a.len() != 3 {
+                                return Err("scatter_svg expects path,xs,ys".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let xs = as_num_list(&a[1])?;
+                            let ys = as_num_list(&a[2])?;
+                            if xs.len() != ys.len() || xs.is_empty() {
+                                return Err("scatter_svg requires equal non-empty lists".into());
+                            }
+                            let xmin = xs.iter().fold(f64::INFINITY, |m, x| m.min(*x));
+                            let xmax = xs.iter().fold(f64::NEG_INFINITY, |m, x| m.max(*x));
+                            let ymin = ys.iter().fold(f64::INFINITY, |m, x| m.min(*x));
+                            let ymax = ys.iter().fold(f64::NEG_INFINITY, |m, x| m.max(*x));
+                            let sx = if xmax == xmin { 1.0 } else { xmax - xmin };
+                            let sy = if ymax == ymin { 1.0 } else { ymax - ymin };
+                            let dots = xs
+                                .iter()
+                                .zip(ys.iter())
+                                .map(|(x, y)| {
+                                    let px = 50.0 + 700.0 * (x - xmin) / sx;
+                                    let py = 450.0 - 400.0 * (y - ymin) / sy;
+                                    format!("<circle cx=\"{px:.2}\" cy=\"{py:.2}\" r=\"4\"/>")
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+                            let svg = format!(
+                                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"800\" height=\"500\"><rect width=\"100%\" height=\"100%\" fill=\"white\"/><line x1=\"50\" y1=\"450\" x2=\"750\" y2=\"450\" stroke=\"black\"/><line x1=\"50\" y1=\"50\" x2=\"50\" y2=\"450\" stroke=\"black\"/>{dots}</svg>"
+                            );
+                            fs::write(path, svg).map_err(|e| e.to_string())?;
+                            Val::Null
+                        }
+                        "bar_svg" => {
+                            if a.len() != 3 {
+                                return Err("bar_svg expects path,labels,values".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let labels = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("labels must be List".into()),
+                            };
+                            let vals = as_num_list(&a[2])?;
+                            if labels.len() != vals.len() || vals.is_empty() {
+                                return Err("bar_svg requires equal non-empty lists".into());
+                            }
+                            let max = vals.iter().copied().fold(0.0, f64::max).max(1.0);
+                            let width = 700.0 / vals.len() as f64;
+                            let mut body = String::new();
+                            for (i, (label, value)) in labels.iter().zip(vals.iter()).enumerate() {
+                                let h = 360.0 * (*value) / max;
+                                let x = 55.0 + i as f64 * width;
+                                let y = 440.0 - h;
+                                body.push_str(&format!("<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{:.2}\" height=\"{h:.2}\"/><text x=\"{:.2}\" y=\"470\" font-size=\"12\" text-anchor=\"middle\">{}</text>",(width-10.0).max(1.0),x+(width-10.0).max(1.0)/2.0,svg_escape(&label.show())));
+                            }
+                            let svg = format!(
+                                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"800\" height=\"500\"><rect width=\"100%\" height=\"100%\" fill=\"white\"/><line x1=\"50\" y1=\"440\" x2=\"760\" y2=\"440\" stroke=\"black\"/>{body}</svg>"
+                            );
+                            fs::write(path, svg).map_err(|e| e.to_string())?;
+                            Val::Null
+                        }
+                        "histogram" => {
+                            if a.len() != 2 {
+                                return Err("histogram expects values,bins".into());
+                            }
+                            let vals = as_num_list(&a[0])?;
+                            let bins = match a[1] {
+                                Val::Num(n) => n.max(1.0) as usize,
+                                _ => return Err("bins must be Number".into()),
+                            };
+                            if vals.is_empty() {
+                                return Err("histogram requires values".into());
+                            }
+                            let min = vals.iter().copied().fold(f64::INFINITY, f64::min);
+                            let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                            let span = (max - min).max(f64::EPSILON);
+                            let mut counts = vec![0usize; bins];
+                            for v in vals {
+                                let mut idx = (((v - min) / span) * bins as f64).floor() as usize;
+                                if idx >= bins {
+                                    idx = bins - 1;
+                                }
+                                counts[idx] += 1;
+                            }
+                            Val::List(
+                                counts
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, count)| {
+                                        let lo = min + span * i as f64 / bins as f64;
+                                        let hi = min + span * (i + 1) as f64 / bins as f64;
+                                        Val::Map(vec![
+                                            (Val::Str("low".into()), Val::Num(lo)),
+                                            (Val::Str("high".into()), Val::Num(hi)),
+                                            (Val::Str("count".into()), Val::Num(count as f64)),
+                                        ])
+                                    })
+                                    .collect(),
+                            )
+                        }
                         "logreg_fit" => {
                             if a.len() != 4 {
                                 return Err(
@@ -2832,6 +3555,99 @@ impl Vm {
                                     .map(|(value, count)| {
                                         Val::Map(vec![
                                             (Val::Str("value".into()), value),
+                                            (Val::Str("count".into()), Val::Num(count as f64)),
+                                        ])
+                                    })
+                                    .collect(),
+                            )
+                        }
+                        "table_group_sum" => {
+                            if a.len() != 3 {
+                                return Err("table_group_sum expects rows,group,value".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let gk = match &a[1] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("group must be String".into()),
+                            };
+                            let vk = match &a[2] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("value must be String".into()),
+                            };
+                            let mut groups: Vec<(Val, f64)> = vec![];
+                            for row in rows {
+                                let p = match row {
+                                    Val::Map(p) => p,
+                                    _ => return Err("rows must contain Maps".into()),
+                                };
+                                let group = map_lookup(p, &gk).cloned().unwrap_or(Val::Null);
+                                let value = map_lookup(p, &vk)
+                                    .and_then(|v| if let Val::Num(n) = v { Some(*n) } else { None })
+                                    .ok_or("table_group_sum requires numeric value column")?;
+                                if let Some((_, sum)) = groups.iter_mut().find(|(g, _)| *g == group)
+                                {
+                                    *sum += value
+                                } else {
+                                    groups.push((group, value));
+                                }
+                            }
+                            Val::List(
+                                groups
+                                    .into_iter()
+                                    .map(|(group, sum)| {
+                                        Val::Map(vec![
+                                            (Val::Str("value".into()), group),
+                                            (Val::Str("sum".into()), Val::Num(sum)),
+                                        ])
+                                    })
+                                    .collect(),
+                            )
+                        }
+                        "table_group_mean" => {
+                            if a.len() != 3 {
+                                return Err("table_group_mean expects rows,group,value".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let gk = match &a[1] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("group must be String".into()),
+                            };
+                            let vk = match &a[2] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("value must be String".into()),
+                            };
+                            let mut groups: Vec<(Val, f64, usize)> = vec![];
+                            for row in rows {
+                                let p = match row {
+                                    Val::Map(p) => p,
+                                    _ => return Err("rows must contain Maps".into()),
+                                };
+                                let group = map_lookup(p, &gk).cloned().unwrap_or(Val::Null);
+                                let value = map_lookup(p, &vk)
+                                    .and_then(|v| if let Val::Num(n) = v { Some(*n) } else { None })
+                                    .ok_or("table_group_mean requires numeric value column")?;
+                                if let Some((_, sum, count)) =
+                                    groups.iter_mut().find(|(g, _, _)| *g == group)
+                                {
+                                    *sum += value;
+                                    *count += 1
+                                } else {
+                                    groups.push((group, value, 1));
+                                }
+                            }
+                            Val::List(
+                                groups
+                                    .into_iter()
+                                    .map(|(group, sum, count)| {
+                                        Val::Map(vec![
+                                            (Val::Str("value".into()), group),
+                                            (Val::Str("mean".into()), Val::Num(sum / count as f64)),
                                             (Val::Str("count".into()), Val::Num(count as f64)),
                                         ])
                                     })
@@ -3031,6 +3847,7 @@ impl Vm {
                             w.flush().map_err(|e| e.to_string())?;
                             Val::Null
                         }
+                        #[cfg(feature = "native-services")]
                         "gui_message" => {
                             if a.len() != 2 {
                                 return Err("gui_message expects title,message".into());
@@ -3050,6 +3867,7 @@ impl Vm {
                             );
                             Val::Null
                         }
+                        #[cfg(feature = "native-services")]
                         "gui_input" => {
                             if a.len() != 2 {
                                 return Err("gui_input expects title,message".into());
@@ -3066,6 +3884,7 @@ impl Vm {
                                 .map(Val::Str)
                                 .unwrap_or(Val::Null)
                         }
+                        #[cfg(feature = "native-services")]
                         "gui_open_file" => {
                             if a.len() != 1 {
                                 return Err("gui_open_file expects title".into());
@@ -3078,6 +3897,7 @@ impl Vm {
                                 .map(Val::Str)
                                 .unwrap_or(Val::Null)
                         }
+                        #[cfg(feature = "native-services")]
                         "gui_save_file" => {
                             if a.len() != 1 {
                                 return Err("gui_save_file expects title".into());
@@ -3090,6 +3910,7 @@ impl Vm {
                                 .map(Val::Str)
                                 .unwrap_or(Val::Null)
                         }
+                        #[cfg(feature = "native-services")]
                         "gui_confirm" => {
                             if a.len() != 2 {
                                 return Err("gui_confirm expects title,message".into());
@@ -3112,6 +3933,7 @@ impl Vm {
                                 tinyfiledialogs::YesNo::Yes
                             ))
                         }
+                        #[cfg(feature = "native-services")]
                         "gui_password" => {
                             if a.len() != 2 {
                                 return Err("gui_password expects title,message".into());
@@ -3128,6 +3950,7 @@ impl Vm {
                                 .map(Val::Str)
                                 .unwrap_or(Val::Null)
                         }
+                        #[cfg(feature = "native-services")]
                         "gui_folder" => {
                             if a.len() != 1 {
                                 return Err("gui_folder expects title".into());
@@ -3140,6 +3963,7 @@ impl Vm {
                                 .map(Val::Str)
                                 .unwrap_or(Val::Null)
                         }
+                        #[cfg(feature = "native-services")]
                         "gui_color" => {
                             if a.len() != 1 {
                                 return Err("gui_color expects title".into());
@@ -3156,6 +3980,7 @@ impl Vm {
                                 None => Val::Null,
                             }
                         }
+                        #[cfg(feature = "native-services")]
                         "gui_form" => {
                             if a.len() != 2 {
                                 return Err("gui_form expects title,fields".into());
@@ -3182,6 +4007,78 @@ impl Vm {
                                 }
                             }
                             Val::Map(out)
+                        }
+                        "sin" => {
+                            if a.len() != 1 {
+                                return Err("sin expects number".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.sin()),
+                                _ => return Err("sin expects Number".into()),
+                            }
+                        }
+                        "cos" => {
+                            if a.len() != 1 {
+                                return Err("cos expects number".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.cos()),
+                                _ => return Err("cos expects Number".into()),
+                            }
+                        }
+                        "tan" => {
+                            if a.len() != 1 {
+                                return Err("tan expects number".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.tan()),
+                                _ => return Err("tan expects Number".into()),
+                            }
+                        }
+                        "exp" => {
+                            if a.len() != 1 {
+                                return Err("exp expects number".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.exp()),
+                                _ => return Err("exp expects Number".into()),
+                            }
+                        }
+                        "ln" => {
+                            if a.len() != 1 {
+                                return Err("ln expects number".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.ln()),
+                                _ => return Err("ln expects Number".into()),
+                            }
+                        }
+                        "log10" => {
+                            if a.len() != 1 {
+                                return Err("log10 expects number".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.log10()),
+                                _ => return Err("log10 expects Number".into()),
+                            }
+                        }
+                        "pow" => {
+                            if a.len() != 2 {
+                                return Err("pow expects base,exponent".into());
+                            }
+                            match (a[0].clone(), a[1].clone()) {
+                                (Val::Num(x), Val::Num(y)) => Val::Num(x.powf(y)),
+                                _ => return Err("pow expects Numbers".into()),
+                            }
+                        }
+                        "round" => {
+                            if a.len() != 1 {
+                                return Err("round expects number".into());
+                            }
+                            match a[0] {
+                                Val::Num(n) => Val::Num(n.round()),
+                                _ => return Err("round expects Number".into()),
+                            }
                         }
                         "sqrt" => {
                             if a.len() != 1 {
@@ -3218,6 +4115,76 @@ impl Vm {
                                 Val::Num(n) => Val::Num(n.ceil()),
                                 _ => return Err("ceil expects Number".into()),
                             }
+                        }
+                        "starts_with" => {
+                            if a.len() != 2 {
+                                return Err("starts_with expects text,prefix".into());
+                            }
+                            let text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let prefix = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("prefix must be String".into()),
+                            };
+                            Val::Bool(text.starts_with(prefix))
+                        }
+                        "ends_with" => {
+                            if a.len() != 2 {
+                                return Err("ends_with expects text,suffix".into());
+                            }
+                            let text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let suffix = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("suffix must be String".into()),
+                            };
+                            Val::Bool(text.ends_with(suffix))
+                        }
+                        "replace" => {
+                            if a.len() != 3 {
+                                return Err("replace expects text,from,to".into());
+                            }
+                            let text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let from = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("from must be String".into()),
+                            };
+                            let to = match &a[2] {
+                                Val::Str(s) => s,
+                                _ => return Err("to must be String".into()),
+                            };
+                            Val::Str(text.replace(from, to))
+                        }
+                        "repeat" => {
+                            if a.len() != 2 {
+                                return Err("repeat expects text,count".into());
+                            }
+                            let text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let count = match a[1] {
+                                Val::Num(n) => n.max(0.0) as usize,
+                                _ => return Err("count must be Number".into()),
+                            };
+                            Val::Str(text.repeat(count))
+                        }
+                        "chars" => {
+                            if a.len() != 1 {
+                                return Err("chars expects text".into());
+                            }
+                            let text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            Val::List(text.chars().map(|c| Val::Str(c.to_string())).collect())
                         }
                         "lower" => {
                             if a.len() != 1 {
@@ -3274,6 +4241,65 @@ impl Vm {
                             };
                             Val::Str(xs.iter().map(Val::show).collect::<Vec<_>>().join(sep))
                         }
+                        "copy_file" => {
+                            if a.len() != 2 {
+                                return Err("copy_file expects source,destination".into());
+                            }
+                            let src = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("source must be String".into()),
+                            };
+                            let dst = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("destination must be String".into()),
+                            };
+                            Val::Num(fs::copy(src, dst).map_err(|e| e.to_string())? as f64)
+                        }
+                        "move_file" => {
+                            if a.len() != 2 {
+                                return Err("move_file expects source,destination".into());
+                            }
+                            let src = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("source must be String".into()),
+                            };
+                            let dst = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("destination must be String".into()),
+                            };
+                            fs::rename(src, dst).map_err(|e| e.to_string())?;
+                            Val::Null
+                        }
+                        "file_size" => {
+                            if a.len() != 1 {
+                                return Err("file_size expects path".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            Val::Num(fs::metadata(p).map_err(|e| e.to_string())?.len() as f64)
+                        }
+                        "is_file" => {
+                            if a.len() != 1 {
+                                return Err("is_file expects path".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            Val::Bool(Path::new(p).is_file())
+                        }
+                        "is_dir" => {
+                            if a.len() != 1 {
+                                return Err("is_dir expects path".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            Val::Bool(Path::new(p).is_dir())
+                        }
                         "read_file" => {
                             if a.len() != 1 {
                                 return Err("read_file expects path".into());
@@ -3321,6 +4347,85 @@ impl Vm {
                                 _ => return Err("key must be String".into()),
                             };
                             env::var(k).map(Val::Str).unwrap_or(Val::Null)
+                        }
+                        "uuid_v4" => {
+                            if !a.is_empty() {
+                                return Err("uuid_v4 expects no arguments".into());
+                            }
+                            Val::Str(uuid::Uuid::new_v4().to_string())
+                        }
+                        "base64_encode" => {
+                            if a.len() != 1 {
+                                return Err("base64_encode expects value".into());
+                            }
+                            Val::Str(
+                                base64::engine::general_purpose::STANDARD
+                                    .encode(a[0].show().as_bytes()),
+                            )
+                        }
+                        "base64_decode" => {
+                            if a.len() != 1 {
+                                return Err("base64_decode expects text".into());
+                            }
+                            let text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(text)
+                                .map_err(|e| e.to_string())?;
+                            Val::Str(String::from_utf8(bytes).map_err(|e| e.to_string())?)
+                        }
+                        "toml_parse" => {
+                            if a.len() != 1 {
+                                return Err("toml_parse expects text".into());
+                            }
+                            let text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let parsed: toml::Value =
+                                toml::from_str(text).map_err(|e| e.to_string())?;
+                            let json = serde_json::to_value(parsed).map_err(|e| e.to_string())?;
+                            json_to_val(&json)
+                        }
+                        "toml_stringify" => {
+                            if a.len() != 1 {
+                                return Err("toml_stringify expects value".into());
+                            }
+                            Val::Str(
+                                toml::to_string(&val_to_json(&a[0])).map_err(|e| e.to_string())?,
+                            )
+                        }
+                        "now_utc" => {
+                            if !a.is_empty() {
+                                return Err("now_utc expects no arguments".into());
+                            }
+                            Val::Str(chrono::Utc::now().to_rfc3339())
+                        }
+                        "now_local" => {
+                            if !a.is_empty() {
+                                return Err("now_local expects no arguments".into());
+                            }
+                            Val::Str(chrono::Local::now().to_rfc3339())
+                        }
+                        "datetime_format" => {
+                            if a.len() != 2 {
+                                return Err("datetime_format expects timestamp,format".into());
+                            }
+                            let timestamp = match a[0] {
+                                Val::Num(n) => n,
+                                _ => return Err("timestamp must be Number".into()),
+                            };
+                            let format = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("format must be String".into()),
+                            };
+                            let secs = timestamp.trunc() as i64;
+                            let nanos = ((timestamp.fract().abs()) * 1_000_000_000.0) as u32;
+                            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+                                .ok_or("invalid timestamp")?;
+                            Val::Str(dt.format(format).to_string())
                         }
                         "clock" => {
                             let t = SystemTime::now()
@@ -3380,6 +4485,68 @@ impl Vm {
                                 ),
                             ])
                         }
+                        #[cfg(feature = "native-services")]
+                        "http_request" => {
+                            if a.len() != 5 {
+                                return Err(
+                                    "http_request expects method,url,headers,body,timeout_ms"
+                                        .into(),
+                                );
+                            }
+                            let method_text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("method must be String".into()),
+                            };
+                            let url = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("url must be String".into()),
+                            };
+                            let headers = match &a[2] {
+                                Val::Map(p) => p,
+                                _ => return Err("headers must be Map".into()),
+                            };
+                            let timeout = match a[4] {
+                                Val::Num(n) => n.max(1.0) as u64,
+                                _ => return Err("timeout_ms must be Number".into()),
+                            };
+                            let client = reqwest::blocking::Client::builder()
+                                .timeout(std::time::Duration::from_millis(timeout))
+                                .build()
+                                .map_err(|e| e.to_string())?;
+                            let method = reqwest::Method::from_bytes(method_text.as_bytes())
+                                .map_err(|e| e.to_string())?;
+                            let mut request = client.request(method, url);
+                            for (k, v) in headers {
+                                request = request.header(k.show(), v.show());
+                            }
+                            if !matches!(a[3], Val::Null) {
+                                let body = match &a[3] {
+                                    Val::Str(s) => s.clone(),
+                                    other => json_stringify_value(other)?,
+                                };
+                                request = request.body(body);
+                            }
+                            let response = request.send().map_err(|e| e.to_string())?;
+                            let status = response.status();
+                            let header_pairs = response
+                                .headers()
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        Val::Str(k.as_str().to_string()),
+                                        Val::Str(v.to_str().unwrap_or("").to_string()),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let body = response.text().map_err(|e| e.to_string())?;
+                            Val::Map(vec![
+                                (Val::Str("status".into()), Val::Num(status.as_u16() as f64)),
+                                (Val::Str("ok".into()), Val::Bool(status.is_success())),
+                                (Val::Str("headers".into()), Val::Map(header_pairs)),
+                                (Val::Str("body".into()), Val::Str(body)),
+                            ])
+                        }
+                        #[cfg(feature = "native-services")]
                         "http_get" => {
                             if a.len() != 1 {
                                 return Err("http_get expects url".into());
@@ -3394,6 +4561,7 @@ impl Vm {
                                 .map_err(|e| e.to_string())?;
                             Val::Str(text)
                         }
+                        #[cfg(feature = "native-services")]
                         "http_post" => {
                             if a.len() != 2 {
                                 return Err("http_post expects url,body".into());
@@ -3431,6 +4599,11 @@ impl Vm {
                                 .map(|n| n.get())
                                 .unwrap_or(1) as f64,
                         ),
+                        "platform_os" => Val::Str(env::consts::OS.to_string()),
+                        "platform_arch" => Val::Str(env::consts::ARCH.to_string()),
+                        "platform_family" => Val::Str(env::consts::FAMILY.to_string()),
+                        "path_separator" => Val::Str(std::path::MAIN_SEPARATOR.to_string()),
+                        #[cfg(feature = "native-services")]
                         "sqlite_exec" => {
                             if a.len() != 2 {
                                 return Err("sqlite_exec expects path,sql".into());
@@ -3447,6 +4620,7 @@ impl Vm {
                             let n = conn.execute(sql, []).map_err(|e| e.to_string())?;
                             Val::Num(n as f64)
                         }
+                        #[cfg(feature = "native-services")]
                         "sqlite_query" => {
                             if a.len() != 2 {
                                 return Err("sqlite_query expects path,sql".into());
@@ -3493,21 +4667,13 @@ impl Vm {
                         }
                         "spawn" => {
                             if a.len() != 2 {
-                                return Err("spawn expects function_name,args".into());
+                                return Err("spawn expects callable,args".into());
                             }
-                            let name = match &a[0] {
-                                Val::Str(s) => s.clone(),
-                                _ => return Err("spawn function_name must be String".into()),
-                            };
+                            let (name, def) = self.callable_def(&a[0])?;
                             let args = match &a[1] {
                                 Val::List(v) => v.clone(),
                                 _ => return Err("spawn args must be List".into()),
                             };
-                            let def = self
-                                .funcs
-                                .get(&name)
-                                .cloned()
-                                .ok_or(format!("unknown function '{name}'"))?;
                             if def.params.len() != args.len() {
                                 return Err(format!(
                                     "{name} expects {} arguments, got {}",
@@ -3853,6 +5019,13 @@ impl Vm {
                         _ => {
                             if self.classes.contains_key(&n) {
                                 self.instantiate(&n, a)?
+                            } else if let Some(Val::Function(target)) = self.vars.get(&n).cloned() {
+                                let def = self
+                                    .funcs
+                                    .get(&target)
+                                    .cloned()
+                                    .ok_or(format!("dangling function reference '{target}'"))?;
+                                self.call_def(def, a)?
                             } else {
                                 let def = self
                                     .funcs
@@ -3864,6 +5037,12 @@ impl Vm {
                         }
                     };
                     self.stack.push(v);
+                }
+                Op::FunctionRef(name) => {
+                    if !self.funcs.contains_key(&name) {
+                        return Err(format!("unknown function reference '{name}'"));
+                    }
+                    self.stack.push(Val::Function(name));
                 }
                 Op::Def(name, params, return_type, code) => {
                     self.funcs.insert(
@@ -3904,7 +5083,11 @@ impl Vm {
                         },
                     );
                 }
-                Op::Return => return self.pop(),
+                Op::Return => {
+                    self.finished = true;
+                    return self.pop();
+                }
+                Op::Yield => return self.pop(),
                 Op::PushHandler(target, name) => self.handlers.push((target, name)),
                 Op::PopHandler => {
                     let _ = self.handlers.pop();
@@ -3918,7 +5101,10 @@ impl Vm {
                         return Err(format!("uncaught throw: {}", value.show()));
                     }
                 }
-                Op::Halt => return Ok(Val::Null),
+                Op::Halt => {
+                    self.finished = true;
+                    return Ok(Val::Null);
+                }
             }
         }
     }
@@ -4015,6 +5201,20 @@ fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                 }
             }
             Expr::Unary(_, x) | Expr::Await(x) => check_expr(x, scopes, errors),
+            Expr::Lambda(params, _, body) => {
+                let mut nested = scopes.to_vec();
+                nested.push(params.iter().map(|(name, _)| name.clone()).collect());
+                check_block(body, &nested, errors);
+            }
+            Expr::ListComp(value, var, iterable, condition) => {
+                check_expr(iterable, scopes, errors);
+                let mut nested = scopes.to_vec();
+                nested.push(HashSet::from([var.clone()]));
+                check_expr(value, &nested, errors);
+                if let Some(cond) = condition {
+                    check_expr(cond, &nested, errors);
+                }
+            }
             Expr::Call(_, args) => {
                 for a in args {
                     check_expr(a, scopes, errors)
@@ -4051,7 +5251,7 @@ fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                     }
                     check_expr(e, &scopes, errors);
                 }
-                Stmt::Expr(e) | Stmt::Throw(e) => check_expr(e, &scopes, errors),
+                Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Yield(e) => check_expr(e, &scopes, errors),
                 Stmt::SetMember(obj, _, value) => {
                     check_expr(obj, &scopes, errors);
                     check_expr(value, &scopes, errors);
@@ -4077,6 +5277,15 @@ fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                     let mut nested = scopes.clone();
                     nested.push(HashSet::from([n.clone()]));
                     check_block(body, &nested, errors);
+                }
+                Stmt::Match(subject, cases) => {
+                    check_expr(subject, &scopes, errors);
+                    for (pattern, body) in cases {
+                        if let Some(pattern) = pattern {
+                            check_expr(pattern, &scopes, errors);
+                        }
+                        check_block(body, &scopes, errors);
+                    }
                 }
                 Stmt::Try(body, n, handler) => {
                     check_block(body, &scopes, errors);
@@ -4137,6 +5346,77 @@ fn disasm_source(src: &str) -> Result<(), String> {
     let code = compile_source(src)?;
     for (i, op) in code.iter().enumerate() {
         println!("{i:04}  {op:?}");
+    }
+    Ok(())
+}
+
+fn debug_file(path: &Path) -> Result<(), String> {
+    let src = load_source(path.to_string_lossy().as_ref())?;
+    let code = compile_source(&src)?;
+    let mut vm = Vm::new(code);
+    vm.trace = true;
+    vm.run()
+}
+
+fn ast_file(path: &Path) -> Result<(), String> {
+    let src = load_source(path.to_string_lossy().as_ref())?;
+    let ast = Parser::new(lex(&src)?).program()?;
+    println!("{ast:#?}");
+    Ok(())
+}
+
+fn symbols_file(path: &Path) -> Result<(), String> {
+    let src = load_source(path.to_string_lossy().as_ref())?;
+    let ast = Parser::new(lex(&src)?).program()?;
+    println!("Symbols for {}", path.display());
+    for stmt in ast {
+        match stmt {
+            Stmt::Let(name, ty, _, is_const) => {
+                println!(
+                    "  {} {}{}",
+                    if is_const { "const" } else { "let" },
+                    name,
+                    ty.map(|t| format!(": {t}")).unwrap_or_default()
+                );
+            }
+            Stmt::Fn(name, params, ret, _) => {
+                let ps = params
+                    .iter()
+                    .map(|(n, t)| match t {
+                        Some(t) => format!("{n}: {t}"),
+                        None => n.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "  fn {name}({ps}){}",
+                    ret.map(|r| format!(" -> {r}")).unwrap_or_default()
+                );
+            }
+            Stmt::Class(name, parent, body) => {
+                println!(
+                    "  class {name}{}",
+                    parent.map(|p| format!(": {p}")).unwrap_or_default()
+                );
+                for item in body {
+                    if let Stmt::Fn(method, params, ret, _) = item {
+                        let ps = params
+                            .iter()
+                            .map(|(n, t)| match t {
+                                Some(t) => format!("{n}: {t}"),
+                                None => n.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!(
+                            "    method {method}({ps}){}",
+                            ret.map(|r| format!(" -> {r}")).unwrap_or_default()
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -4258,6 +5538,470 @@ fn doc_file(path: &Path) -> Result<(), String> {
     let target = path.with_extension("api.md");
     fs::write(&target, out).map_err(|e| e.to_string())?;
     println!("Generated {}", target.display());
+    Ok(())
+}
+
+fn lsp_word_at(text: &str, line: usize, character: usize) -> String {
+    let Some(line_text) = text.lines().nth(line) else {
+        return String::new();
+    };
+    let chars: Vec<char> = line_text.chars().collect();
+    let pos = character.min(chars.len());
+    let mut start = pos;
+    while start > 0 && (chars[start - 1].is_ascii_alphanumeric() || chars[start - 1] == '_') {
+        start -= 1;
+    }
+    let mut end = pos;
+    while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+        end += 1;
+    }
+    chars[start..end].iter().collect()
+}
+
+fn lsp_completion_items() -> JsonValue {
+    let words = [
+        "let",
+        "const",
+        "fn",
+        "class",
+        "return",
+        "if",
+        "else",
+        "while",
+        "for",
+        "in",
+        "try",
+        "catch",
+        "throw",
+        "match",
+        "case",
+        "break",
+        "continue",
+        "await",
+        "true",
+        "false",
+        "null",
+        "and",
+        "or",
+        "not",
+        "print",
+        "len",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "assert",
+        "sum",
+        "min",
+        "max",
+        "all",
+        "any",
+        "range",
+        "keys",
+        "values",
+        "get",
+        "type_of",
+        "is_instance",
+        "has_field",
+        "append",
+        "concat",
+        "slice",
+        "reverse",
+        "sort",
+        "unique",
+        "enumerate",
+        "zip",
+        "map_call",
+        "filter_call",
+        "reduce_call",
+        "spawn",
+        "await_task",
+        "task_done",
+        "channel",
+        "send",
+        "recv",
+        "try_recv",
+        "http_get",
+        "http_post",
+        "json_parse",
+        "json_stringify",
+        "regex_findall",
+        "sqlite_exec",
+        "sqlite_query",
+        "sha256",
+        "vec_mean",
+        "vec_std",
+        "vec_median",
+        "vec_percentile",
+        "correlation",
+        "matmul",
+        "linreg_fit",
+        "logreg_fit",
+        "logreg_predict",
+        "kmeans",
+        "dense",
+        "softmax",
+        "csv_read",
+        "csv_write",
+        "table_select",
+        "table_inner_join",
+        "plot_svg",
+        "ffi_available",
+        "ffi_i32",
+        "ffi_i64",
+        "ffi_f64",
+    ];
+    JsonValue::Array(
+        words.iter().map(|w| serde_json::json!({
+            "label": w,
+            "kind": if ["let","const","fn","class","return","if","else","while","for","in","try","catch","throw","match","case","break","continue","await"].contains(w) { 14 } else { 3 },
+            "detail": "Veyra"
+        })).collect()
+    )
+}
+
+fn lsp_diagnostics(text: &str) -> Vec<JsonValue> {
+    let has_imports = text
+        .lines()
+        .any(|line| line.trim_start().starts_with("use "));
+    let filtered = text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("use ") {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = match lex(&filtered) {
+        Err(e) => Err(e),
+        Ok(tokens) => match Parser::new(tokens).program() {
+            Err(e) => Err(e),
+            Ok(ast) => {
+                if has_imports {
+                    Ok(())
+                } else {
+                    semantic_check_ast(&ast)
+                }
+            }
+        },
+    };
+    match result {
+        Ok(()) => vec![],
+        Err(message) => vec![serde_json::json!({
+            "range": {
+                "start": {"line":0,"character":0},
+                "end": {"line":0,"character":1}
+            },
+            "severity": 1,
+            "source": "veyra",
+            "message": message
+        })],
+    }
+}
+
+fn lsp_publish_diagnostics(
+    connection: &lsp_server::Connection,
+    uri: &str,
+    text: &str,
+) -> Result<(), String> {
+    let notification = lsp_server::Notification {
+        method: "textDocument/publishDiagnostics".into(),
+        params: serde_json::json!({
+            "uri": uri,
+            "diagnostics": lsp_diagnostics(text)
+        }),
+    };
+    connection
+        .sender
+        .send(lsp_server::Message::Notification(notification))
+        .map_err(|e| e.to_string())
+}
+
+fn lsp_definition(text: &str, uri: &str, word: &str) -> JsonValue {
+    if word.is_empty() {
+        return JsonValue::Null;
+    }
+    let patterns = [
+        format!("fn {word}"),
+        format!("class {word}"),
+        format!("let {word}"),
+        format!("const {word}"),
+    ];
+    for (line_no, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if patterns.iter().any(|p| trimmed.starts_with(p)) {
+            if let Some(col) = line.find(word) {
+                return serde_json::json!({
+                    "uri": uri,
+                    "range": {
+                        "start":{"line":line_no,"character":col},
+                        "end":{"line":line_no,"character":col+word.chars().count()}
+                    }
+                });
+            }
+        }
+    }
+    JsonValue::Null
+}
+
+fn lsp_references(text: &str, uri: &str, word: &str) -> JsonValue {
+    if word.is_empty() {
+        return JsonValue::Array(vec![]);
+    }
+    let mut refs = vec![];
+    for (line_no, line) in text.lines().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let target: Vec<char> = word.chars().collect();
+        if target.is_empty() || chars.len() < target.len() {
+            continue;
+        }
+        for i in 0..=chars.len() - target.len() {
+            if chars[i..i + target.len()] != target[..] {
+                continue;
+            }
+            let left_ok = i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
+            let right = i + target.len();
+            let right_ok = right == chars.len()
+                || !(chars[right].is_ascii_alphanumeric() || chars[right] == '_');
+            if left_ok && right_ok {
+                refs.push(serde_json::json!({
+                    "uri":uri,
+                    "range":{
+                        "start":{"line":line_no,"character":i},
+                        "end":{"line":line_no,"character":right}
+                    }
+                }));
+            }
+        }
+    }
+    JsonValue::Array(refs)
+}
+
+fn lsp_server() -> Result<(), String> {
+    let (connection, io_threads) = lsp_server::Connection::stdio();
+    let (initialize_id, _) = connection.initialize_start().map_err(|e| e.to_string())?;
+    let initialize_result = serde_json::json!({
+        "capabilities": {
+            "textDocumentSync": 2,
+            "completionProvider": {"resolveProvider": false, "triggerCharacters": ["."]},
+            "hoverProvider": true,
+            "definitionProvider": true,
+            "referencesProvider": true,
+            "documentSymbolProvider": true,
+            "documentFormattingProvider": true
+        },
+        "serverInfo": {"name": "Veyra Language Server", "version": VERSION}
+    });
+    connection
+        .initialize_finish(initialize_id, initialize_result)
+        .map_err(|e| e.to_string())?;
+
+    let mut documents: HashMap<String, String> = HashMap::new();
+    for message in &connection.receiver {
+        match message {
+            lsp_server::Message::Request(request) => {
+                if connection
+                    .handle_shutdown(&request)
+                    .map_err(|e| e.to_string())?
+                {
+                    break;
+                }
+                let result = match request.method.as_str() {
+                    "textDocument/completion" => lsp_completion_items(),
+                    "textDocument/hover" => {
+                        let uri = request
+                            .params
+                            .pointer("/textDocument/uri")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        let line = request
+                            .params
+                            .pointer("/position/line")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0) as usize;
+                        let character = request
+                            .params
+                            .pointer("/position/character")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0) as usize;
+                        let word = documents
+                            .get(uri)
+                            .map(|text| lsp_word_at(text, line, character))
+                            .unwrap_or_default();
+                        if word.is_empty() {
+                            JsonValue::Null
+                        } else {
+                            serde_json::json!({
+                                "contents": {
+                                    "kind": "markdown",
+                                    "value": format!("Veyra symbol: {word}\n\nNative symbol or language construct.")
+                                }
+                            })
+                        }
+                    }
+                    "textDocument/definition" => {
+                        let uri = request
+                            .params
+                            .pointer("/textDocument/uri")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        let line = request
+                            .params
+                            .pointer("/position/line")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0) as usize;
+                        let character = request
+                            .params
+                            .pointer("/position/character")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0) as usize;
+                        let text = documents.get(uri).cloned().unwrap_or_default();
+                        let word = lsp_word_at(&text, line, character);
+                        lsp_definition(&text, uri, &word)
+                    }
+                    "textDocument/references" => {
+                        let uri = request
+                            .params
+                            .pointer("/textDocument/uri")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        let line = request
+                            .params
+                            .pointer("/position/line")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0) as usize;
+                        let character = request
+                            .params
+                            .pointer("/position/character")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0) as usize;
+                        let text = documents.get(uri).cloned().unwrap_or_default();
+                        let word = lsp_word_at(&text, line, character);
+                        lsp_references(&text, uri, &word)
+                    }
+                    "textDocument/documentSymbol" => {
+                        let uri = request
+                            .params
+                            .pointer("/textDocument/uri")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        let text = documents.get(uri).cloned().unwrap_or_default();
+                        let filtered = text
+                            .lines()
+                            .map(|line| {
+                                if line.trim_start().starts_with("use ") {
+                                    ""
+                                } else {
+                                    line
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let mut symbols = vec![];
+                        if let Ok(tokens) = lex(&filtered) {
+                            if let Ok(ast) = Parser::new(tokens).program() {
+                                for stmt in ast {
+                                    let (name, kind) = match stmt {
+                                        Stmt::Fn(name, _, _, _) => (name, 12),
+                                        Stmt::Class(name, _, _) => (name, 5),
+                                        Stmt::Let(name, _, _, _) => (name, 13),
+                                        _ => continue,
+                                    };
+                                    symbols.push(serde_json::json!({
+                                        "name": name,
+                                        "kind": kind,
+                                        "range": {
+                                            "start":{"line":0,"character":0},
+                                            "end":{"line":0,"character":1}
+                                        },
+                                        "selectionRange": {
+                                            "start":{"line":0,"character":0},
+                                            "end":{"line":0,"character":1}
+                                        }
+                                    }));
+                                }
+                            }
+                        }
+                        JsonValue::Array(symbols)
+                    }
+                    "textDocument/formatting" => {
+                        let uri = request
+                            .params
+                            .pointer("/textDocument/uri")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        let text = documents.get(uri).cloned().unwrap_or_default();
+                        let formatted = fmt_source(&text);
+                        let lines = text.lines().collect::<Vec<_>>();
+                        let end_line = lines.len().saturating_sub(1);
+                        let end_char = lines.last().map(|x| x.chars().count()).unwrap_or(0);
+                        serde_json::json!([{
+                            "range": {
+                                "start":{"line":0,"character":0},
+                                "end":{"line":end_line,"character":end_char}
+                            },
+                            "newText": formatted
+                        }])
+                    }
+                    _ => JsonValue::Null,
+                };
+                let response = lsp_server::Response::new_ok(request.id.clone(), result);
+                connection
+                    .sender
+                    .send(lsp_server::Message::Response(response))
+                    .map_err(|e| e.to_string())?;
+            }
+            lsp_server::Message::Notification(notification) => match notification.method.as_str() {
+                "textDocument/didOpen" => {
+                    let uri = notification
+                        .params
+                        .pointer("/textDocument/uri")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let text = notification
+                        .params
+                        .pointer("/textDocument/text")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    documents.insert(uri.clone(), text.clone());
+                    lsp_publish_diagnostics(&connection, &uri, &text)?;
+                }
+                "textDocument/didChange" => {
+                    let uri = notification
+                        .params
+                        .pointer("/textDocument/uri")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if let Some(text) = notification
+                        .params
+                        .pointer("/contentChanges/0/text")
+                        .and_then(JsonValue::as_str)
+                    {
+                        documents.insert(uri.clone(), text.to_string());
+                        lsp_publish_diagnostics(&connection, &uri, text)?;
+                    }
+                }
+                "textDocument/didClose" => {
+                    let uri = notification
+                        .params
+                        .pointer("/textDocument/uri")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("");
+                    documents.remove(uri);
+                    lsp_publish_diagnostics(&connection, uri, "")?;
+                }
+                _ => {}
+            },
+            lsp_server::Message::Response(_) => {}
+        }
+    }
+    io_threads.join().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -4955,7 +6699,7 @@ fn repl() -> Result<(), String> {
 
 fn usage() {
     println!(
-        "Veyra {VERSION}\n\nUsage:\n  veyra run [file.vy]\n  veyra check [file.vy]\n  veyra lint [file.vy]\n  veyra test\n  veyra bench [file.vy] [iterations]\n  veyra profile [file.vy]\n  veyra doc [file.vy]\n  veyra build\n  veyra audit\n  veyra serve [dir] [port]\n  veyra web <routes.json> [port]\n  veyra app <app.vy> <routes.json> [port]\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg add <name>\n  veyra pkg remove <name>\n  veyra pkg installed\n  veyra doctor\n  veyra repl\n  veyra --version"
+        "Veyra {VERSION}\n\nUsage:\n  veyra run [file.vy]\n  veyra check [file.vy]\n  veyra lint [file.vy]\n  veyra debug [file.vy]\n  veyra ast [file.vy]\n  veyra symbols [file.vy]\n  veyra lsp\n  veyra test\n  veyra bench [file.vy] [iterations]\n  veyra profile [file.vy]\n  veyra doc [file.vy]\n  veyra build\n  veyra audit\n  veyra serve [dir] [port]\n  veyra web <routes.json> [port]\n  veyra app <app.vy> <routes.json> [port]\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg add <name>\n  veyra pkg remove <name>\n  veyra pkg installed\n  veyra doctor\n  veyra repl\n  veyra --version"
     );
 }
 fn main() -> ExitCode {
@@ -5030,6 +6774,28 @@ fn main() -> ExitCode {
             };
             path.and_then(|p| lint_file(&p))
         }
+        Some("debug") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| debug_file(&p))
+        }
+        Some("ast") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| ast_file(&p))
+        }
+        Some("symbols") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| symbols_file(&p))
+        }
+        Some("lsp") => lsp_server(),
         Some("test") => test_project(),
         Some("bench") => {
             let path = match a.get(2) {
@@ -5298,5 +7064,58 @@ mod tests {
     fn await_syntax_and_introspection() {
         let src = "class A {} class B: A {} fn square(n: Int)->Int{return n*n;} let task=spawn(\"square\",[6]); let result=await task; let b=B(); let t=type_of(b); let yes=is_instance(b,\"A\"); let field=has_field(b,\"x\");";
         assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn lambda_function_values() {
+        let src = "let offset=4; let add: Function=fn(x: Int)->Int{return x+offset;}; let y=add(6); assert(y==10); assert(type_of(add)==\"Function\");";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn named_function_values() {
+        let src = "fn twice(x: Int)->Int{return x*2;} let f: Function=twice; let ys=map_call(f,[1,2,3]); assert(ys[0]==2); assert(ys[2]==6);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn list_comprehensions() {
+        let src = "let factor=3; let xs=[x*factor for x in [1,2,3,4] if x%2==0]; assert(len(xs)==2); assert(xs[0]==6); assert(xs[1]==12);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn match_case_statement() {
+        let src = "let x=2; let label=\"\"; match x { case 1 { label=\"one\"; } case 2 { label=\"two\"; } case _ { label=\"other\"; } } assert(label==\"two\");";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn advanced_linear_algebra() {
+        let src = "let d=matrix_det([[4,7],[2,6]]); assert(abs(d-10)<0.000001); let inv=matrix_inverse([[4,7],[2,6]]); assert(abs(inv[0][0]-0.6)<0.000001); let x=linear_solve([[3,2],[1,2]],[5,5]); assert(abs(x[0])<0.000001); assert(abs(x[1]-2.5)<0.000001);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn generators_yield_and_collect() {
+        let src = "fn count_to(n: Int) -> Generator { let i=0; while i<n { yield i; i=i+1; } } let g=count_to(4); let a=next(g); let b=next(g); let rest=collect(g); assert(a==0); assert(b==1); assert(len(rest)==2);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn lsp_navigation_helpers() {
+        let src = "fn add(x: Int)->Int{return x+1;} let y=add(4); let z=add(y);";
+        let def = lsp_definition(src, "file:///test.vy", "add");
+        assert!(!def.is_null());
+        let refs = lsp_references(src, "file:///test.vy", "add");
+        assert!(refs.as_array().map(|x| x.len()).unwrap_or(0) >= 3);
+    }
+    #[test]
+    fn grouped_data_and_plotting() {
+        let scatter = env::temp_dir().join("veyra_scatter.svg");
+        let bars = env::temp_dir().join("veyra_bars.svg");
+        let src = format!(
+            "let rows=[{{\"g\":\"a\",\"x\":1}},{{\"g\":\"a\",\"x\":3}},{{\"g\":\"b\",\"x\":4}}]; let sums=table_group_sum(rows,\"g\",\"x\"); let means=table_group_mean(rows,\"g\",\"x\"); let h=histogram([1,1,2,3,4,4],3); scatter_svg(\"{}\",[1,2,3],[3,2,5]); bar_svg(\"{}\",[\"a\",\"b\"],[4,5]);",
+            scatter.to_string_lossy().replace('\\', "\\\\"),
+            bars.to_string_lossy().replace('\\', "\\\\")
+        );
+        assert!(run_source(&src).is_ok());
+        assert!(scatter.exists());
+        assert!(bars.exists());
+        let _ = fs::remove_file(scatter);
+        let _ = fs::remove_file(bars);
     }
 }

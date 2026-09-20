@@ -5,3 +5,7 @@ fn current_directory() -> String { return cwd(); }
 fn environment(name: String) -> Any { return env_get(name); }
 fn command(text: String) -> Map { return shell(text); }
 fn processors() -> Number { return cpu_count(); }
+fn os() -> String { return platform_os(); }
+fn architecture() -> String { return platform_arch(); }
+fn family() -> String { return platform_family(); }
+fn separator() -> String { return path_separator(); }
