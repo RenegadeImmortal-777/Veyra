@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, ExitCode},
     sync::{
         Arc, Mutex, OnceLock,
@@ -31,7 +31,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 
-const VERSION: &str = "10.0.0-zenith";
+const VERSION: &str = "11.0.0-nexus";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -1341,6 +1341,7 @@ static FUNCTION_IDS: AtomicU64 = AtomicU64::new(1);
 static FUNCTION_OBJECTS: OnceLock<Mutex<HashMap<String, FunctionDef>>> = OnceLock::new();
 static TENSOR_IDS: AtomicU64 = AtomicU64::new(1);
 static TENSORS: OnceLock<Mutex<HashMap<u64, TensorData>>> = OnceLock::new();
+static ADAM_STATES: OnceLock<Mutex<HashMap<u64, AdamState>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 enum TensorOp {
@@ -1348,6 +1349,10 @@ enum TensorOp {
     Add(u64, u64),
     Sub(u64, u64),
     Mul(u64, u64),
+    Div(u64, u64),
+    Neg(u64),
+    Pow(u64, f64),
+    SoftmaxRows(u64, usize, usize),
     Relu(u64),
     Sigmoid(u64),
     Tanh(u64),
@@ -1369,8 +1374,19 @@ struct TensorData {
     op: TensorOp,
 }
 
+#[derive(Clone, Debug)]
+struct AdamState {
+    m: Vec<f64>,
+    v: Vec<f64>,
+    step: u64,
+}
+
 fn tensors() -> &'static Mutex<HashMap<u64, TensorData>> {
     TENSORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn adam_states() -> &'static Mutex<HashMap<u64, AdamState>> {
+    ADAM_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn tensor_handle(id: u64, shape: &[usize]) -> Val {
@@ -1479,8 +1495,13 @@ fn tensor_topology(id: u64, seen: &mut HashSet<u64>, order: &mut Vec<u64>) -> Re
     let t = tensor_snapshot(id)?;
     let parents: Vec<u64> = match t.op {
         TensorOp::Leaf => vec![],
-        TensorOp::Add(a, b) | TensorOp::Sub(a, b) | TensorOp::Mul(a, b) => vec![a, b],
-        TensorOp::Relu(a)
+        TensorOp::Add(a, b) | TensorOp::Sub(a, b) | TensorOp::Mul(a, b) | TensorOp::Div(a, b) => {
+            vec![a, b]
+        }
+        TensorOp::Neg(a)
+        | TensorOp::Pow(a, _)
+        | TensorOp::SoftmaxRows(a, _, _)
+        | TensorOp::Relu(a)
         | TensorOp::Sigmoid(a)
         | TensorOp::Tanh(a)
         | TensorOp::Exp(a)
@@ -1566,6 +1587,69 @@ fn tensor_backward(root: u64) -> Result<(), String> {
                     if t.requires_grad {
                         for i in 0..t.grad.len() {
                             t.grad[i] += grad[i] * left.data[i];
+                        }
+                    }
+                }
+            }
+            TensorOp::Div(a, b) => {
+                let left = tensor_snapshot(a)?;
+                let right = tensor_snapshot(b)?;
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            t.grad[i] += grad[i] / right.data[i];
+                        }
+                    }
+                }
+                if let Some(t) = store.get_mut(&b) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            let denom = right.data[i] * right.data[i];
+                            t.grad[i] -= grad[i] * left.data[i] / denom;
+                        }
+                    }
+                }
+            }
+            TensorOp::Neg(a) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(grad.iter()) {
+                            *dst -= *src;
+                        }
+                    }
+                }
+            }
+            TensorOp::Pow(a, exponent) => {
+                let parent = tensor_snapshot(a)?;
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            t.grad[i] += grad[i] * exponent * parent.data[i].powf(exponent - 1.0);
+                        }
+                    }
+                }
+            }
+            TensorOp::SoftmaxRows(a, rows, cols) => {
+                let mut incoming = vec![0.0; rows * cols];
+                for r in 0..rows {
+                    let mut dot = 0.0;
+                    for c in 0..cols {
+                        let idx = r * cols + c;
+                        dot += grad[idx] * current.data[idx];
+                    }
+                    for c in 0..cols {
+                        let idx = r * cols + c;
+                        incoming[idx] = current.data[idx] * (grad[idx] - dot);
+                    }
+                }
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(incoming) {
+                            *dst += src;
                         }
                     }
                 }
@@ -3908,7 +3992,7 @@ impl Vm {
                             let id = tensor_id(&a[0])?;
                             nums_to_val(tensor_snapshot(id)?.grad)
                         }
-                        "tensor_add" | "tensor_sub" | "tensor_mul" => {
+                        "tensor_add" | "tensor_sub" | "tensor_mul" | "tensor_div" => {
                             if a.len() != 2 {
                                 return Err(format!("{n} expects two tensors"));
                             }
@@ -3918,6 +4002,9 @@ impl Vm {
                             let right = tensor_snapshot(right_id)?;
                             if left.shape != right.shape || left.data.len() != right.data.len() {
                                 return Err("tensor shapes must match".into());
+                            }
+                            if n == "tensor_div" && right.data.contains(&0.0) {
+                                return Err("tensor_div division by zero".into());
                             }
                             let data = match n.as_str() {
                                 "tensor_add" => left
@@ -3932,20 +4019,105 @@ impl Vm {
                                     .zip(&right.data)
                                     .map(|(x, y)| x - y)
                                     .collect(),
-                                _ => left
+                                "tensor_mul" => left
                                     .data
                                     .iter()
                                     .zip(&right.data)
                                     .map(|(x, y)| x * y)
+                                    .collect(),
+                                _ => left
+                                    .data
+                                    .iter()
+                                    .zip(&right.data)
+                                    .map(|(x, y)| x / y)
                                     .collect(),
                             };
                             let requires_grad = left.requires_grad || right.requires_grad;
                             let op = match n.as_str() {
                                 "tensor_add" => TensorOp::Add(left_id, right_id),
                                 "tensor_sub" => TensorOp::Sub(left_id, right_id),
-                                _ => TensorOp::Mul(left_id, right_id),
+                                "tensor_mul" => TensorOp::Mul(left_id, right_id),
+                                _ => TensorOp::Div(left_id, right_id),
                             };
                             tensor_store(data, left.shape, requires_grad, op)?
+                        }
+                        "tensor_neg" => {
+                            if a.len() != 1 {
+                                return Err("tensor_neg expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let t = tensor_snapshot(id)?;
+                            let data = t.data.iter().map(|x| -*x).collect();
+                            tensor_store(data, t.shape, t.requires_grad, TensorOp::Neg(id))?
+                        }
+                        "tensor_pow" => {
+                            if a.len() != 2 {
+                                return Err("tensor_pow expects tensor,exponent".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let exponent = match a[1] {
+                                Val::Num(n) => n,
+                                _ => return Err("tensor_pow exponent must be Number".into()),
+                            };
+                            let t = tensor_snapshot(id)?;
+                            let data = t.data.iter().map(|x| x.powf(exponent)).collect();
+                            tensor_store(
+                                data,
+                                t.shape,
+                                t.requires_grad,
+                                TensorOp::Pow(id, exponent),
+                            )?
+                        }
+                        "tensor_softmax" => {
+                            if a.len() != 1 {
+                                return Err("tensor_softmax expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let t = tensor_snapshot(id)?;
+                            let (rows, cols) = match t.shape.as_slice() {
+                                [n] => (1usize, *n),
+                                [r, c] => (*r, *c),
+                                _ => return Err("tensor_softmax expects 1D or 2D tensor".into()),
+                            };
+                            let mut out = vec![0.0; t.data.len()];
+                            for row in 0..rows {
+                                let start = row * cols;
+                                let end = start + cols;
+                                let max = t.data[start..end]
+                                    .iter()
+                                    .copied()
+                                    .fold(f64::NEG_INFINITY, f64::max);
+                                let mut denom = 0.0;
+                                for c in 0..cols {
+                                    let e = (t.data[start + c] - max).exp();
+                                    out[start + c] = e;
+                                    denom += e;
+                                }
+                                for c in 0..cols {
+                                    out[start + c] /= denom;
+                                }
+                            }
+                            tensor_store(
+                                out,
+                                t.shape,
+                                t.requires_grad,
+                                TensorOp::SoftmaxRows(id, rows, cols),
+                            )?
+                        }
+                        "tensor_detach" => {
+                            if a.len() != 1 {
+                                return Err("tensor_detach expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let t = tensor_snapshot(id)?;
+                            tensor_store(t.data, t.shape, false, TensorOp::Leaf)?
+                        }
+                        "tensor_numel" => {
+                            if a.len() != 1 {
+                                return Err("tensor_numel expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            Val::Num(tensor_snapshot(id)?.data.len() as f64)
                         }
                         "tensor_relu" => {
                             if a.len() != 1 {
@@ -4184,6 +4356,80 @@ impl Vm {
                             for i in 0..t.data.len() {
                                 t.data[i] -= lr * t.grad[i];
                             }
+                            Val::Null
+                        }
+                        "tensor_adam_step" => {
+                            if a.len() != 5 {
+                                return Err(
+                                    "tensor_adam_step expects tensor,lr,beta1,beta2,epsilon".into(),
+                                );
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let number = |v: &Val, name: &str| match v {
+                                Val::Num(n) => Ok(*n),
+                                _ => Err(format!("{name} must be Number")),
+                            };
+                            let lr = number(&a[1], "learning_rate")?;
+                            let beta1 = number(&a[2], "beta1")?;
+                            let beta2 = number(&a[3], "beta2")?;
+                            let epsilon = number(&a[4], "epsilon")?;
+                            if !(0.0..1.0).contains(&beta1)
+                                || !(0.0..1.0).contains(&beta2)
+                                || lr <= 0.0
+                                || epsilon <= 0.0
+                            {
+                                return Err("invalid Adam hyperparameters".into());
+                            }
+                            let tensor = tensor_snapshot(id)?;
+                            if !tensor.requires_grad {
+                                return Err("tensor_adam_step requires trainable tensor".into());
+                            }
+                            let updates = {
+                                let mut states =
+                                    adam_states().lock().map_err(|_| "adam state poisoned")?;
+                                let state = states.entry(id).or_insert_with(|| AdamState {
+                                    m: vec![0.0; tensor.data.len()],
+                                    v: vec![0.0; tensor.data.len()],
+                                    step: 0,
+                                });
+                                if state.m.len() != tensor.data.len() {
+                                    *state = AdamState {
+                                        m: vec![0.0; tensor.data.len()],
+                                        v: vec![0.0; tensor.data.len()],
+                                        step: 0,
+                                    };
+                                }
+                                state.step += 1;
+                                let bias1 = 1.0 - beta1.powf(state.step as f64);
+                                let bias2 = 1.0 - beta2.powf(state.step as f64);
+                                let mut updates = vec![0.0; tensor.data.len()];
+                                for i in 0..tensor.data.len() {
+                                    let g = tensor.grad[i];
+                                    state.m[i] = beta1 * state.m[i] + (1.0 - beta1) * g;
+                                    state.v[i] = beta2 * state.v[i] + (1.0 - beta2) * g * g;
+                                    let m_hat = state.m[i] / bias1;
+                                    let v_hat = state.v[i] / bias2;
+                                    updates[i] = lr * m_hat / (v_hat.sqrt() + epsilon);
+                                }
+                                updates
+                            };
+                            let mut store =
+                                tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                            let t = store.get_mut(&id).ok_or("unknown tensor")?;
+                            for (value, update) in t.data.iter_mut().zip(updates) {
+                                *value -= update;
+                            }
+                            Val::Null
+                        }
+                        "tensor_reset_optimizer" => {
+                            if a.len() != 1 {
+                                return Err("tensor_reset_optimizer expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            adam_states()
+                                .lock()
+                                .map_err(|_| "adam state poisoned")?
+                                .remove(&id);
                             Val::Null
                         }
                         "tensor_zero_grad" => {
@@ -7329,6 +7575,8 @@ fn lsp_completion_items() -> JsonValue {
         "spawn",
         "await_task",
         "task_done",
+        "task_status",
+        "await_timeout",
         "channel",
         "send",
         "recv",
@@ -7353,6 +7601,29 @@ fn lsp_completion_items() -> JsonValue {
         "kmeans",
         "dense",
         "softmax",
+        "tensor",
+        "tensor_add",
+        "tensor_sub",
+        "tensor_mul",
+        "tensor_div",
+        "tensor_neg",
+        "tensor_pow",
+        "tensor_matmul",
+        "tensor_softmax",
+        "tensor_relu",
+        "tensor_sigmoid",
+        "tensor_tanh",
+        "tensor_exp",
+        "tensor_log",
+        "tensor_reshape",
+        "tensor_transpose",
+        "tensor_detach",
+        "tensor_numel",
+        "tensor_backward",
+        "tensor_step",
+        "tensor_adam_step",
+        "tensor_reset_optimizer",
+        "tensor_zero_grad",
         "csv_read",
         "csv_write",
         "table_select",
@@ -7837,11 +8108,59 @@ fn veyra_home() -> PathBuf {
 }
 
 fn pkg_index() -> Result<(PathBuf, JsonValue), String> {
+    if let Ok(url) = env::var("VEYRA_REGISTRY_URL") {
+        #[cfg(feature = "native-services")]
+        {
+            let response = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "remote registry returned HTTP {}",
+                    response.status()
+                ));
+            }
+            let text = response.text().map_err(|e| e.to_string())?;
+            let json = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            return Ok((PathBuf::from(url), json));
+        }
+        #[cfg(not(feature = "native-services"))]
+        {
+            return Err(format!(
+                "remote registry '{url}' requires the native-services feature"
+            ));
+        }
+    }
     let path = veyra_home().join("registry").join("index.json");
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("registry unavailable at {}: {e}", path.display()))?;
     let json = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     Ok((path, json))
+}
+
+fn safe_package_relative_path(value: &str) -> Result<PathBuf, String> {
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(format!("unsafe package path '{value}'"));
+    }
+    Ok(path.to_path_buf())
+}
+
+#[cfg(feature = "native-services")]
+fn fetch_package_file(url: &str) -> Result<Vec<u8>, String> {
+    let response = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "package download returned HTTP {}",
+            response.status()
+        ));
+    }
+    response
+        .bytes()
+        .map(|b| b.to_vec())
+        .map_err(|e| e.to_string())
 }
 
 fn hash_directory(dir: &Path) -> Result<String, String> {
@@ -7899,7 +8218,10 @@ fn write_package_lock(root: &Path, manifest: &JsonValue) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-fn pkg_add(name: &str) -> Result<(), String> {
+fn pkg_add_inner(name: &str, seen: &mut HashSet<String>) -> Result<(), String> {
+    if !seen.insert(name.to_string()) {
+        return Ok(());
+    }
     let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
     let (index_path, index) = pkg_index()?;
     let pkg = index
@@ -7914,16 +8236,64 @@ fn pkg_add(name: &str) -> Result<(), String> {
         .get("entry")
         .and_then(JsonValue::as_str)
         .unwrap_or("main.vy");
-    let source = pkg
-        .get("source")
-        .and_then(JsonValue::as_str)
-        .ok_or("registry package missing source")?;
-    let source_path = index_path.parent().unwrap_or(Path::new(".")).join(source);
+    if let Some(dependencies) = pkg.get("dependencies").and_then(JsonValue::as_array) {
+        for dependency in dependencies {
+            let dependency = dependency
+                .as_str()
+                .ok_or("package dependency names must be Strings")?;
+            pkg_add_inner(dependency, seen)?;
+        }
+    }
     let dest = root.join("vendor").join(name);
     if dest.exists() {
         fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
     }
-    copy_dir_all(&source_path, &dest)?;
+
+    if let Some(files) = pkg.get("files").and_then(JsonValue::as_object) {
+        fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+        #[cfg(feature = "native-services")]
+        {
+            for (relative, url) in files {
+                let relative = safe_package_relative_path(relative)?;
+                let url = url
+                    .as_str()
+                    .ok_or("registry package file URL must be String")?;
+                let target = dest.join(relative);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                fs::write(&target, fetch_package_file(url)?).map_err(|e| e.to_string())?;
+            }
+        }
+        #[cfg(not(feature = "native-services"))]
+        {
+            let _ = files;
+            return Err("remote package files require the native-services feature".into());
+        }
+    } else if let Some(url) = pkg.get("url").and_then(JsonValue::as_str) {
+        fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+        let relative = safe_package_relative_path(entry)?;
+        let target = dest.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        #[cfg(feature = "native-services")]
+        {
+            fs::write(&target, fetch_package_file(url)?).map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(feature = "native-services"))]
+        {
+            let _ = url;
+            return Err("remote package download requires the native-services feature".into());
+        }
+    } else {
+        let source = pkg
+            .get("source")
+            .and_then(JsonValue::as_str)
+            .ok_or("registry package requires source, url, or files")?;
+        let source_path = index_path.parent().unwrap_or(Path::new(".")).join(source);
+        copy_dir_all(&source_path, &dest)?;
+    }
 
     let manifest_path = root.join("veyra.json");
     let mut manifest: JsonValue =
@@ -7945,6 +8315,10 @@ fn pkg_add(name: &str) -> Result<(), String> {
     write_package_lock(&root, &manifest)?;
     println!("Added {name} {version} -> vendor/{name}/{entry}");
     Ok(())
+}
+
+fn pkg_add(name: &str) -> Result<(), String> {
+    pkg_add_inner(name, &mut HashSet::new())
 }
 
 fn pkg_remove(name: &str) -> Result<(), String> {
@@ -8400,6 +8774,17 @@ fn serve_veyra_app(app_file: &Path, routes_file: &Path, port: u16) -> Result<(),
                     .collect(),
             );
             let query = query_params(&full_url);
+            let headers = Val::Map(
+                req.headers()
+                    .iter()
+                    .map(|h| {
+                        (
+                            Val::Str(h.field.as_str().to_string()),
+                            Val::Str(h.value.as_str().to_string()),
+                        )
+                    })
+                    .collect(),
+            );
             let request = Val::Map(vec![
                 (Val::Str("method".into()), Val::Str(method)),
                 (Val::Str("path".into()), Val::Str(path)),
@@ -8407,10 +8792,11 @@ fn serve_veyra_app(app_file: &Path, routes_file: &Path, port: u16) -> Result<(),
                 (Val::Str("body".into()), Val::Str(body)),
                 (Val::Str("params".into()), params),
                 (Val::Str("query".into()), query),
+                (Val::Str("headers".into()), headers),
             ]);
             match vm.invoke(&handler, vec![request]) {
                 Ok(value) => {
-                    let (status, content_type, body) = match value {
+                    let (status, content_type, body, response_headers) = match value {
                         Val::Map(pairs) => {
                             let status = map_lookup(&pairs, &Val::Str("status".into()))
                                 .and_then(|v| {
@@ -8438,20 +8824,38 @@ fn serve_veyra_app(app_file: &Path, routes_file: &Path, port: u16) -> Result<(),
                                 other => serde_json::to_string(&val_to_json(&other))
                                     .map_err(|e| e.to_string())?,
                             };
-                            (status, content_type, text)
+                            let headers = match map_lookup(&pairs, &Val::Str("headers".into())) {
+                                Some(Val::Map(items)) => items
+                                    .iter()
+                                    .filter_map(|(k, v)| match (k, v) {
+                                        (Val::Str(name), Val::Str(value)) => {
+                                            Some((name.clone(), value.clone()))
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>(),
+                                _ => vec![],
+                            };
+                            (status, content_type, text, headers)
                         }
-                        Val::Str(s) => (200, "text/plain; charset=utf-8".into(), s),
+                        Val::Str(s) => (200, "text/plain; charset=utf-8".into(), s, vec![]),
                         other => (
                             200,
                             "application/json; charset=utf-8".into(),
                             serde_json::to_string(&val_to_json(&other))
                                 .map_err(|e| e.to_string())?,
+                            vec![],
                         ),
                     };
                     let mut r = Response::from_string(body).with_status_code(StatusCode(status));
                     if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
                     {
                         r.add_header(h);
+                    }
+                    for (name, value) in response_headers {
+                        if let Ok(h) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+                            r.add_header(h);
+                        }
                     }
                     r
                 }
@@ -9029,6 +9433,20 @@ mod tests {
         let src = "let x=tensor([1,2],true); let y=tensor_sigmoid(x); let loss=tensor_sum(y); tensor_backward(loss); let g=tensor_grad(x); assert(g[0]>0.19 and g[0]<0.20); assert(g[1]>0.10 and g[1]<0.11); let m=tensor([[1,2,3],[4,5,6]],false); let tr=tensor_transpose(m); let sh=tensor_shape(tr); assert(sh[0]==3 and sh[1]==2); let r=tensor_reshape(tr,[6]); let v=tensor_values(r); assert(v[0]==1 and v[1]==4 and v[5]==6);";
         if let Err(e) = run_source(src) {
             panic!("extended tensor test failed: {e}");
+        }
+    }
+    #[test]
+    fn tensor_advanced_ops_and_softmax() {
+        let src = "let x=tensor([2,4],true); let y=tensor_pow(x,2); let loss=tensor_sum(y); tensor_backward(loss); let g=tensor_grad(x); assert(g[0]==4 and g[1]==8); let a=tensor([6,8],true); let b=tensor([2,4],false); let q=tensor_div(a,b); let qloss=tensor_sum(q); tensor_backward(qloss); let qg=tensor_grad(a); assert(qg[0]==0.5 and qg[1]==0.25); let n=tensor_neg(a); let nv=tensor_values(n); assert(nv[0]==-6 and nv[1]==-8); let s=tensor_softmax(tensor([[1,2,3],[2,2,2]],false)); let sv=tensor_values(s); assert(sv[2]>sv[1] and sv[1]>sv[0]); assert(sv[3]>0.33 and sv[3]<0.34); assert(tensor_numel(s)==6);";
+        if let Err(e) = run_source(src) {
+            panic!("advanced tensor ops failed: {e}");
+        }
+    }
+    #[test]
+    fn adam_optimizer_trains_parameter() {
+        let src = "let target=tensor([3],false); let w=tensor([0],true); let epoch=0; while epoch<120 { let diff=tensor_sub(w,target); let loss=tensor_mean(tensor_pow(diff,2)); tensor_backward(loss); tensor_adam_step(w,0.1,0.9,0.999,0.00000001); tensor_zero_grad(w); epoch=epoch+1; } let value=tensor_values(w); assert(value[0]>2.9 and value[0]<3.1); tensor_reset_optimizer(w);";
+        if let Err(e) = run_source(src) {
+            panic!("adam optimizer test failed: {e}");
         }
     }
     #[test]

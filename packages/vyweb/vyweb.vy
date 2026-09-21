@@ -8,6 +8,10 @@ fn link(href: String, text: String) -> String { return "<a href=\"" + href + "\"
 fn response(body: Any, status: Number, content_type: String) -> Map {
     return {"status":status, "content_type":content_type, "body":body};
 }
+fn response_with_headers(body: Any, status: Number, content_type: String, headers: Map) -> Map {
+    return {"status":status, "content_type":content_type, "body":body, "headers":headers};
+}
+fn request_header(request: Map, name: String) -> Any { return get(request["headers"], name); }
 fn json_response(data: Any) -> Map {
     return response(json_stringify(data), 200, "application/json; charset=utf-8");
 }

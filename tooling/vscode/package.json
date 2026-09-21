@@ -2,7 +2,7 @@
   "name": "veyra-language",
   "displayName": "Veyra Language",
   "description": "Language support for Veyra",
-  "version": "10.0.0",
+  "version": "11.0.0",
   "publisher": "veyra",
   "engines": {"vscode": "^1.80.0"},
   "categories": ["Programming Languages", "Linters", "Debuggers"],

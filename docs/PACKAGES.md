@@ -1,11 +1,14 @@
 # Veyra Package Index
 
-Registry packages: **52**
+Registry packages: **60**
 
 | Package | Version | Entry |
 |---|---:|---|
 | vyalgo | 0.1.0 | vyalgo.vy |
+| vyapi | 0.2.0 | vyapi.vy |
+| vyarray | 0.1.0 | vyarray.vy |
 | vyasync | 0.2.0 | vyasync.vy |
+| vyauth | 0.1.0 | vyauth.vy |
 | vyautograd | 0.1.0 | vyautograd.vy |
 | vybase64 | 0.1.0 | vybase64.vy |
 | vycollections | 0.1.0 | vycollections.vy |
@@ -16,6 +19,7 @@ Registry packages: **52**
 | vydata | 0.4.0 | vydata.vy |
 | vydatetime | 0.1.0 | vydatetime.vy |
 | vyencoding | 0.1.0 | vyencoding.vy |
+| vyetl | 0.1.0 | vyetl.vy |
 | vyffi | 0.1.0 | vyffi.vy |
 | vyframe | 0.2.0 | vyframe.vy |
 | vyfs | 0.1.0 | vyfs.vy |
@@ -30,8 +34,9 @@ Registry packages: **52**
 | vymath | 0.2.0 | vymath.vy |
 | vyml | 0.3.0 | vyml.vy |
 | vymlmetrics | 0.2.0 | vymlmetrics.vy |
-| vynn | 0.1.0 | vynn.vy |
-| vyoptim | 0.1.0 | vyoptim.vy |
+| vymodel | 0.2.0 | vymodel.vy |
+| vynn | 0.2.0 | vynn.vy |
+| vyoptim | 0.2.0 | vyoptim.vy |
 | vyorm | 0.2.0 | vyorm.vy |
 | vyos | 0.2.0 | vyos.vy |
 | vypath | 0.1.0 | vypath.vy |
@@ -39,20 +44,23 @@ Registry packages: **52**
 | vyplot | 0.2.0 | vyplot.vy |
 | vyprocess | 0.1.0 | vyprocess.vy |
 | vyproperty | 0.1.0 | vyproperty.vy |
+| vyquery | 0.1.0 | vyquery.vy |
 | vyrandom | 0.1.0 | vyrandom.vy |
 | vyregex | 0.1.0 | vyregex.vy |
 | vyrequest | 0.1.0 | vyrequest.vy |
 | vyscience | 0.2.0 | vyscience.vy |
 | vysecurity | 0.1.0 | vysecurity.vy |
+| vyserde | 0.1.0 | vyserde.vy |
 | vysets | 0.1.0 | vysets.vy |
 | vysqlite | 0.2.0 | vysqlite.vy |
 | vystats | 0.1.0 | vystats.vy |
 | vystrings | 0.1.0 | vystrings.vy |
-| vytensor | 0.2.0 | vytensor.vy |
+| vytensor | 0.3.0 | vytensor.vy |
 | vytest | 0.3.0 | vytest.vy |
 | vytext | 0.1.0 | vytext.vy |
 | vytime | 0.1.0 | vytime.vy |
 | vytoml | 0.1.0 | vytoml.vy |
 | vyuuid | 0.1.0 | vyuuid.vy |
+| vyvalidate | 0.1.0 | vyvalidate.vy |
 | vyviz | 0.1.0 | vyviz.vy |
-| vyweb | 0.3.0 | vyweb.vy |
+| vyweb | 0.4.0 | vyweb.vy |

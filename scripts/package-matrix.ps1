@@ -1,6 +1,9 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "engine-rs\target\debug\veyra.exe"
+$releaseExe = Join-Path $root "engine-rs\target\release\veyra.exe"
+$debugExe = Join-Path $root "engine-rs\target\debug\veyra.exe"
+$exe = if (Test-Path $releaseExe) { $releaseExe } else { $debugExe }
+if (-not (Test-Path $exe)) { throw "Veyra compiler binary not found" }
 $env:VEYRA_HOME = $root
 $registry = Get-Content (Join-Path $root "registry\index.json") -Raw | ConvertFrom-Json
 $names = @($registry.packages.PSObject.Properties.Name)

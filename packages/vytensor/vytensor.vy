@@ -5,7 +5,13 @@ fn grad(t: Map) -> List { return tensor_grad(t); }
 fn add(a: Map, b: Map) -> Map { return tensor_add(a, b); }
 fn sub(a: Map, b: Map) -> Map { return tensor_sub(a, b); }
 fn mul(a: Map, b: Map) -> Map { return tensor_mul(a, b); }
+fn div(a: Map, b: Map) -> Map { return tensor_div(a, b); }
+fn neg(t: Map) -> Map { return tensor_neg(t); }
+fn pow(t: Map, exponent: Number) -> Map { return tensor_pow(t, exponent); }
 fn matmul(a: Map, b: Map) -> Map { return tensor_matmul(a, b); }
+fn softmax(t: Map) -> Map { return tensor_softmax(t); }
+fn detach(t: Map) -> Map { return tensor_detach(t); }
+fn numel(t: Map) -> Number { return tensor_numel(t); }
 fn relu(t: Map) -> Map { return tensor_relu(t); }
 fn sigmoid(t: Map) -> Map { return tensor_sigmoid(t); }
 fn tanh(t: Map) -> Map { return tensor_tanh(t); }

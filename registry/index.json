@@ -56,7 +56,7 @@
                                    "source":  "../packages/vygui"
                                },
                      "vyweb":  {
-                                   "version":  "0.3.0",
+                                   "version":  "0.4.0",
                                    "entry":  "vyweb.vy",
                                    "source":  "../packages/vyweb"
                                },
@@ -236,7 +236,7 @@
                                        "source":  "../packages/vyrequest"
                                    },
                      "vytensor":  {
-                                      "version":  "0.2.0",
+                                      "version":  "0.3.0",
                                       "entry":  "vytensor.vy",
                                       "source":  "../packages/vytensor"
                                   },
@@ -246,12 +246,12 @@
                                         "source":  "../packages/vyautograd"
                                     },
                      "vyoptim":  {
-                                     "version":  "0.1.0",
+                                     "version":  "0.2.0",
                                      "entry":  "vyoptim.vy",
                                      "source":  "../packages/vyoptim"
                                  },
                      "vynn":  {
-                                  "version":  "0.1.0",
+                                  "version":  "0.2.0",
                                   "entry":  "vynn.vy",
                                   "source":  "../packages/vynn"
                               },
@@ -259,7 +259,47 @@
                                         "version":  "0.1.0",
                                         "entry":  "vysecurity.vy",
                                         "source":  "../packages/vysecurity"
-                                    }
+                                    },
+                     "vyauth":  {
+                                    "source":  "../packages/vyauth",
+                                    "entry":  "vyauth.vy",
+                                    "version":  "0.1.0"
+                                },
+                     "vyetl":  {
+                                   "source":  "../packages/vyetl",
+                                   "entry":  "vyetl.vy",
+                                   "version":  "0.1.0"
+                               },
+                     "vyquery":  {
+                                     "source":  "../packages/vyquery",
+                                     "entry":  "vyquery.vy",
+                                     "version":  "0.1.0"
+                                 },
+                     "vyarray":  {
+                                     "source":  "../packages/vyarray",
+                                     "entry":  "vyarray.vy",
+                                     "version":  "0.1.0"
+                                 },
+                     "vyapi":  {
+                                   "source":  "../packages/vyapi",
+                                   "entry":  "vyapi.vy",
+                                   "version":  "0.2.0"
+                               },
+                     "vyvalidate":  {
+                                        "source":  "../packages/vyvalidate",
+                                        "entry":  "vyvalidate.vy",
+                                        "version":  "0.1.0"
+                                    },
+                     "vymodel":  {
+                                     "source":  "../packages/vymodel",
+                                     "entry":  "vymodel.vy",
+                                     "version":  "0.2.0"
+                                 },
+                     "vyserde":  {
+                                     "source":  "../packages/vyserde",
+                                     "entry":  "vyserde.vy",
+                                     "version":  "0.1.0"
+                                 }
                  },
     "registry_version":  1
 }
