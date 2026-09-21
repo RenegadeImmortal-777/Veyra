@@ -31,7 +31,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 
-const VERSION: &str = "7.0.0-meridian";
+const VERSION: &str = "8.0.0-elevation";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -41,6 +41,7 @@ enum Tok {
     Let,
     Const,
     Fn,
+    Async,
     Class,
     Return,
     Yield,
@@ -53,10 +54,13 @@ enum Tok {
     In,
     Try,
     Catch,
+    Finally,
     Throw,
     Match,
     Case,
     Await,
+    With,
+    As,
     And,
     Or,
     Not,
@@ -70,6 +74,7 @@ enum Tok {
     Ls,
     Rs,
     Comma,
+    At,
     Colon,
     Dot,
     Semi,
@@ -156,6 +161,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 "let" => Tok::Let,
                 "const" => Tok::Const,
                 "fn" => Tok::Fn,
+                "async" => Tok::Async,
                 "class" => Tok::Class,
                 "return" => Tok::Return,
                 "yield" => Tok::Yield,
@@ -168,10 +174,13 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 "in" => Tok::In,
                 "try" => Tok::Try,
                 "catch" => Tok::Catch,
+                "finally" => Tok::Finally,
                 "throw" => Tok::Throw,
                 "match" => Tok::Match,
                 "case" => Tok::Case,
                 "await" => Tok::Await,
+                "with" => Tok::With,
+                "as" => Tok::As,
                 "and" => Tok::And,
                 "or" => Tok::Or,
                 "not" => Tok::Not,
@@ -221,6 +230,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             }
             ',' => {
                 out.push(Tok::Comma);
+                i += 1
+            }
+            '@' => {
+                out.push(Tok::At);
                 i += 1
             }
             ':' => {
@@ -299,9 +312,22 @@ enum Stmt {
     While(Expr, Vec<Stmt>),
     ForRange(String, Expr, Expr, Vec<Stmt>),
     ForEach(String, Expr, Vec<Stmt>),
-    Try(Vec<Stmt>, String, Vec<Stmt>),
+    Try(Vec<Stmt>, String, Vec<Stmt>, Vec<Stmt>),
     Throw(Expr),
     Fn(
+        String,
+        Vec<(String, Option<String>)>,
+        Option<String>,
+        Vec<Stmt>,
+    ),
+    AsyncFn(
+        String,
+        Vec<(String, Option<String>)>,
+        Option<String>,
+        Vec<Stmt>,
+    ),
+    DecoratedFn(
+        String,
         String,
         Vec<(String, Option<String>)>,
         Option<String>,
@@ -310,6 +336,7 @@ enum Stmt {
     Class(String, Option<String>, Vec<Stmt>),
     SetMember(Expr, String, Expr),
     Match(Expr, Vec<(Option<Expr>, Vec<Stmt>)>),
+    With(Expr, String, Vec<Stmt>),
     Return(Option<Expr>),
     Yield(Expr),
     Break,
@@ -401,6 +428,96 @@ impl Parser {
             };
             let body = self.block()?;
             return Ok(Stmt::Class(name, parent, body));
+        }
+        if self.eat(&Tok::At) {
+            let decorator = match self.bump() {
+                Tok::Id(s) => s,
+                x => return Err(format!("expected decorator name, got {x:?}")),
+            };
+            self.need(&Tok::Fn, "expected 'fn' after decorator")?;
+            let name = match self.bump() {
+                Tok::Id(s) => s,
+                x => return Err(format!("expected function name, got {x:?}")),
+            };
+            self.need(&Tok::Lp, "expected '(' after function name")?;
+            let mut params = vec![];
+            if !self.eat(&Tok::Rp) {
+                loop {
+                    let param = match self.bump() {
+                        Tok::Id(s) => s,
+                        x => return Err(format!("expected parameter name, got {x:?}")),
+                    };
+                    let param_type = if self.eat(&Tok::Colon) {
+                        match self.bump() {
+                            Tok::Id(s) => Some(s),
+                            _ => return Err("expected parameter type".into()),
+                        }
+                    } else {
+                        None
+                    };
+                    params.push((param, param_type));
+                    if self.eat(&Tok::Rp) {
+                        break;
+                    }
+                    self.need(&Tok::Comma, "expected ',' between parameters")?;
+                }
+            }
+            let return_type = if self.eat(&Tok::Arrow) {
+                match self.bump() {
+                    Tok::Id(s) => Some(s),
+                    _ => return Err("expected return type".into()),
+                }
+            } else {
+                None
+            };
+            let body = self.block()?;
+            return Ok(Stmt::DecoratedFn(
+                decorator,
+                name,
+                params,
+                return_type,
+                body,
+            ));
+        }
+        if self.eat(&Tok::Async) {
+            self.need(&Tok::Fn, "expected 'fn' after async")?;
+            let name = match self.bump() {
+                Tok::Id(s) => s,
+                x => return Err(format!("expected function name, got {x:?}")),
+            };
+            self.need(&Tok::Lp, "expected '(' after function name")?;
+            let mut params = vec![];
+            if !self.eat(&Tok::Rp) {
+                loop {
+                    let param = match self.bump() {
+                        Tok::Id(s) => s,
+                        x => return Err(format!("expected parameter name, got {x:?}")),
+                    };
+                    let param_type = if self.eat(&Tok::Colon) {
+                        match self.bump() {
+                            Tok::Id(s) => Some(s),
+                            _ => return Err("expected parameter type".into()),
+                        }
+                    } else {
+                        None
+                    };
+                    params.push((param, param_type));
+                    if self.eat(&Tok::Rp) {
+                        break;
+                    }
+                    self.need(&Tok::Comma, "expected ',' between parameters")?;
+                }
+            }
+            let return_type = if self.eat(&Tok::Arrow) {
+                match self.bump() {
+                    Tok::Id(s) => Some(s),
+                    _ => return Err("expected return type".into()),
+                }
+            } else {
+                None
+            };
+            let body = self.block()?;
+            return Ok(Stmt::AsyncFn(name, params, return_type, body));
         }
         if self.eat(&Tok::Fn) {
             let name = match self.bump() {
@@ -508,12 +625,27 @@ impl Parser {
                 x => return Err(format!("expected catch variable, got {x:?}")),
             };
             let handler = self.block()?;
-            return Ok(Stmt::Try(body, error_name, handler));
+            let finally = if self.eat(&Tok::Finally) {
+                self.block()?
+            } else {
+                vec![]
+            };
+            return Ok(Stmt::Try(body, error_name, handler, finally));
         }
         if self.eat(&Tok::Throw) {
             let value = self.expr()?;
             self.eat(&Tok::Semi);
             return Ok(Stmt::Throw(value));
+        }
+        if self.eat(&Tok::With) {
+            let resource = self.expr()?;
+            self.need(&Tok::As, "expected 'as' in with statement")?;
+            let name = match self.bump() {
+                Tok::Id(s) => s,
+                x => return Err(format!("expected context variable, got {x:?}")),
+            };
+            let body = self.block()?;
+            return Ok(Stmt::With(resource, name, body));
         }
         if self.eat(&Tok::Match) {
             let subject = self.expr()?;
@@ -1077,6 +1209,7 @@ enum Op {
         String,
         Vec<(String, Option<String>)>,
         Option<String>,
+        bool,
         Vec<Op>,
     ),
     DefClass(
@@ -1086,6 +1219,7 @@ enum Op {
             String,
             Vec<(String, Option<String>)>,
             Option<String>,
+            bool,
             Vec<Op>,
         )>,
     ),
@@ -1103,6 +1237,7 @@ enum Op {
 struct FunctionDef {
     params: Vec<(String, Option<String>)>,
     return_type: Option<String>,
+    is_async: bool,
     code: Vec<Op>,
     captures: HashMap<String, Val>,
     capture_types: HashMap<String, String>,
@@ -1208,6 +1343,7 @@ impl Compiler {
                     name.clone(),
                     params.clone(),
                     return_type.clone(),
+                    false,
                     child.code,
                 ));
                 self.code.push(Op::FunctionRef(name));
@@ -1221,6 +1357,7 @@ impl Compiler {
                     value_fn.clone(),
                     vec![(var.clone(), None)],
                     None,
+                    false,
                     value_compiler.code,
                 ));
                 let condition_fn = if let Some(cond) = condition {
@@ -1232,6 +1369,7 @@ impl Compiler {
                         name.clone(),
                         vec![(var.clone(), None)],
                         Some("Bool".into()),
+                        false,
                         cond_compiler.code,
                     ));
                     Some(name)
@@ -1480,18 +1618,32 @@ impl Compiler {
                     self.code[j] = Op::Jump(end);
                 }
             }
-            Stmt::Try(body, error_name, handler) => {
+            Stmt::With(resource, name, body) => {
+                let resource_name = self.temp("with_resource");
+                self.emit_expr(resource)?;
+                self.code
+                    .push(Op::Define(resource_name.clone(), false, None));
+                self.code.push(Op::Load(resource_name.clone()));
+                self.code.push(Op::CallMethod("enter".into(), 0));
+                self.code.push(Op::Define(name.clone(), false, None));
+                self.emit_stmts(body)?;
+                self.code.push(Op::Load(resource_name));
+                self.code.push(Op::CallMethod("exit".into(), 0));
+                self.code.push(Op::Pop);
+            }
+            Stmt::Try(body, error_name, handler, finally) => {
                 let push = self.code.len();
                 self.code.push(Op::PushHandler(0, error_name.clone()));
                 self.emit_stmts(body)?;
                 self.code.push(Op::PopHandler);
-                let jump = self.code.len();
+                let jump_to_finally = self.code.len();
                 self.code.push(Op::Jump(0));
                 let handler_start = self.code.len();
                 self.code[push] = Op::PushHandler(handler_start, error_name.clone());
                 self.emit_stmts(handler)?;
-                let end = self.code.len();
-                self.code[jump] = Op::Jump(end);
+                let finally_start = self.code.len();
+                self.code[jump_to_finally] = Op::Jump(finally_start);
+                self.emit_stmts(finally)?;
             }
             Stmt::Throw(value) => {
                 self.emit_expr(value)?;
@@ -1505,19 +1657,34 @@ impl Compiler {
             Stmt::Class(name, parent, body) => {
                 let mut methods = vec![];
                 for item in body {
-                    if let Stmt::Fn(method, params, return_type, statements) = item {
-                        let mut child = Compiler::new();
-                        child.emit_stmts(statements)?;
-                        child.code.push(Op::Const(Val::Null));
-                        child.code.push(Op::Return);
-                        methods.push((
-                            method.clone(),
-                            params.clone(),
-                            return_type.clone(),
-                            child.code,
-                        ));
-                    } else {
-                        return Err("class bodies currently contain methods only".into());
+                    match item {
+                        Stmt::Fn(method, params, return_type, statements) => {
+                            let mut child = Compiler::new();
+                            child.emit_stmts(statements)?;
+                            child.code.push(Op::Const(Val::Null));
+                            child.code.push(Op::Return);
+                            methods.push((
+                                method.clone(),
+                                params.clone(),
+                                return_type.clone(),
+                                false,
+                                child.code,
+                            ));
+                        }
+                        Stmt::AsyncFn(method, params, return_type, statements) => {
+                            let mut child = Compiler::new();
+                            child.emit_stmts(statements)?;
+                            child.code.push(Op::Const(Val::Null));
+                            child.code.push(Op::Return);
+                            methods.push((
+                                method.clone(),
+                                params.clone(),
+                                return_type.clone(),
+                                true,
+                                child.code,
+                            ));
+                        }
+                        _ => return Err("class bodies currently contain methods only".into()),
                     }
                 }
                 self.code
@@ -1532,6 +1699,37 @@ impl Compiler {
                     name.clone(),
                     params.clone(),
                     return_type.clone(),
+                    false,
+                    child.code,
+                ));
+            }
+            Stmt::DecoratedFn(decorator, name, params, return_type, body) => {
+                let mut child = Compiler::new();
+                child.emit_stmts(body)?;
+                child.code.push(Op::Const(Val::Null));
+                child.code.push(Op::Return);
+                self.code.push(Op::Def(
+                    name.clone(),
+                    params.clone(),
+                    return_type.clone(),
+                    false,
+                    child.code,
+                ));
+                self.code.push(Op::FunctionRef(name.clone()));
+                self.code.push(Op::Call(decorator.clone(), 1));
+                self.code
+                    .push(Op::Define(name.clone(), false, Some("Function".into())));
+            }
+            Stmt::AsyncFn(name, params, return_type, body) => {
+                let mut child = Compiler::new();
+                child.emit_stmts(body)?;
+                child.code.push(Op::Const(Val::Null));
+                child.code.push(Op::Return);
+                self.code.push(Op::Def(
+                    name.clone(),
+                    params.clone(),
+                    return_type.clone(),
+                    true,
                     child.code,
                 ));
             }
@@ -1734,6 +1932,10 @@ impl Vm {
             ));
         }
         let is_generator = def.code.iter().any(|op| matches!(op, Op::Yield));
+        let is_async = def.is_async;
+        if is_async && is_generator {
+            return Err("async generator functions are not yet supported".into());
+        }
         let mut vars = def.captures.clone();
         let mut var_types = def.capture_types.clone();
         let return_type = def.return_type.clone();
@@ -1757,6 +1959,27 @@ impl Vm {
             self.objects.clone(),
         );
         nested.var_types = var_types;
+        if is_async {
+            let id = TASK_IDS.fetch_add(1, Ordering::Relaxed);
+            let expected_return = return_type.clone();
+            let handle = thread::spawn(move || {
+                let result = nested.execute()?;
+                if let Some(expected) = expected_return {
+                    if !nested.value_matches(&result, &expected) {
+                        return Err(format!(
+                            "async return value expected {expected}, got {}",
+                            result.show()
+                        ));
+                    }
+                }
+                Ok(result)
+            });
+            tasks()
+                .lock()
+                .map_err(|_| "task registry poisoned")?
+                .insert(id, handle);
+            return Ok(Val::Num(id as f64));
+        }
         if is_generator {
             if let Some(expected) = return_type {
                 if expected != "Generator" && expected != "Any" {
@@ -3089,6 +3312,114 @@ impl Vm {
                             };
                             Val::Num(1.0 / (1.0 + (-x).exp()))
                         }
+                        "accuracy_score" => {
+                            if a.len() != 2 {
+                                return Err("accuracy_score expects actual,predicted".into());
+                            }
+                            let actual = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("actual must be List".into()),
+                            };
+                            let predicted = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("predicted must be List".into()),
+                            };
+                            if actual.len() != predicted.len() || actual.is_empty() {
+                                return Err("accuracy_score length mismatch".into());
+                            }
+                            let correct = actual
+                                .iter()
+                                .zip(predicted.iter())
+                                .filter(|(x, y)| x == y)
+                                .count();
+                            Val::Num(correct as f64 / actual.len() as f64)
+                        }
+                        "classification_metrics" => {
+                            if a.len() != 2 {
+                                return Err(
+                                    "classification_metrics expects actual,predicted".into()
+                                );
+                            }
+                            let actual = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("actual must be List".into()),
+                            };
+                            let predicted = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("predicted must be List".into()),
+                            };
+                            if actual.len() != predicted.len() || actual.is_empty() {
+                                return Err("classification_metrics length mismatch".into());
+                            }
+                            let positive = |v: &Val| {
+                                matches!(v,Val::Num(n) if *n==1.0) || matches!(v, Val::Bool(true))
+                            };
+                            let mut tp = 0.0;
+                            let mut tn = 0.0;
+                            let mut fp = 0.0;
+                            let mut fnn = 0.0;
+                            for (x, y) in actual.iter().zip(predicted.iter()) {
+                                match (positive(x), positive(y)) {
+                                    (true, true) => tp += 1.0,
+                                    (false, false) => tn += 1.0,
+                                    (false, true) => fp += 1.0,
+                                    (true, false) => fnn += 1.0,
+                                }
+                            }
+                            let precision = if tp + fp == 0.0 { 0.0 } else { tp / (tp + fp) };
+                            let recall = if tp + fnn == 0.0 {
+                                0.0
+                            } else {
+                                tp / (tp + fnn)
+                            };
+                            let f1 = if precision + recall == 0.0 {
+                                0.0
+                            } else {
+                                2.0 * precision * recall / (precision + recall)
+                            };
+                            let accuracy = (tp + tn) / (tp + tn + fp + fnn);
+                            Val::Map(vec![
+                                (Val::Str("accuracy".into()), Val::Num(accuracy)),
+                                (Val::Str("precision".into()), Val::Num(precision)),
+                                (Val::Str("recall".into()), Val::Num(recall)),
+                                (Val::Str("f1".into()), Val::Num(f1)),
+                                (Val::Str("tp".into()), Val::Num(tp)),
+                                (Val::Str("tn".into()), Val::Num(tn)),
+                                (Val::Str("fp".into()), Val::Num(fp)),
+                                (Val::Str("fn".into()), Val::Num(fnn)),
+                            ])
+                        }
+                        "train_test_split" => {
+                            if a.len() != 3 {
+                                return Err("train_test_split expects x,y,test_ratio".into());
+                            }
+                            let x = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("x must be List".into()),
+                            };
+                            let y = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("y must be List".into()),
+                            };
+                            let ratio = match a[2] {
+                                Val::Num(n) => n,
+                                _ => return Err("test_ratio must be Number".into()),
+                            };
+                            if x.len() != y.len() || x.is_empty() {
+                                return Err("train_test_split length mismatch".into());
+                            }
+                            if !(0.0..1.0).contains(&ratio) {
+                                return Err("test_ratio must be between 0 and 1".into());
+                            }
+                            let test_count = ((x.len() as f64) * ratio).round().max(1.0) as usize;
+                            let split = x.len().saturating_sub(test_count.min(x.len()));
+                            Val::Map(vec![
+                                (Val::Str("train_x".into()), Val::List(x[..split].to_vec())),
+                                (Val::Str("train_y".into()), Val::List(y[..split].to_vec())),
+                                (Val::Str("test_x".into()), Val::List(x[split..].to_vec())),
+                                (Val::Str("test_y".into()), Val::List(y[split..].to_vec())),
+                            ])
+                        }
                         "mse" => {
                             if a.len() != 2 {
                                 return Err("mse expects actual,predicted".into());
@@ -3777,6 +4108,146 @@ impl Vm {
                             }
                             Val::List(out)
                         }
+                        "table_head" => {
+                            if a.len() != 2 {
+                                return Err("table_head expects rows,count".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let n = match a[1] {
+                                Val::Num(n) => n.max(0.0) as usize,
+                                _ => return Err("count must be Number".into()),
+                            };
+                            Val::List(rows.iter().take(n).cloned().collect())
+                        }
+                        "table_tail" => {
+                            if a.len() != 2 {
+                                return Err("table_tail expects rows,count".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let n = match a[1] {
+                                Val::Num(n) => n.max(0.0) as usize,
+                                _ => return Err("count must be Number".into()),
+                            };
+                            let start = rows.len().saturating_sub(n);
+                            Val::List(rows[start..].to_vec())
+                        }
+                        "table_drop_nulls" => {
+                            if a.len() != 2 {
+                                return Err("table_drop_nulls expects rows,column".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let key = match &a[1] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("column must be String".into()),
+                            };
+                            Val::List(
+                                rows.iter()
+                                    .filter(|row| match row {
+                                        Val::Map(p) => map_lookup(p, &key)
+                                            .map(|v| !matches!(v, Val::Null))
+                                            .unwrap_or(false),
+                                        _ => false,
+                                    })
+                                    .cloned()
+                                    .collect(),
+                            )
+                        }
+                        "table_fill_null" => {
+                            if a.len() != 3 {
+                                return Err("table_fill_null expects rows,column,value".into());
+                            }
+                            let rows = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("rows must be List".into()),
+                            };
+                            let key = match &a[1] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("column must be String".into()),
+                            };
+                            let fill = a[2].clone();
+                            let mut out = vec![];
+                            for row in rows {
+                                let mut pairs = match row {
+                                    Val::Map(p) => p.clone(),
+                                    _ => return Err("rows must contain Maps".into()),
+                                };
+                                if let Some((_, v)) = pairs.iter_mut().find(|(k, _)| *k == key) {
+                                    if matches!(v, Val::Null) {
+                                        *v = fill.clone();
+                                    }
+                                } else {
+                                    pairs.push((key.clone(), fill.clone()));
+                                }
+                                out.push(Val::Map(pairs));
+                            }
+                            Val::List(out)
+                        }
+                        "table_left_join" => {
+                            if a.len() != 4 {
+                                return Err(
+                                    "table_left_join expects left,right,left_key,right_key".into(),
+                                );
+                            }
+                            let left = match &a[0] {
+                                Val::List(v) => v,
+                                _ => return Err("left must be List".into()),
+                            };
+                            let right = match &a[1] {
+                                Val::List(v) => v,
+                                _ => return Err("right must be List".into()),
+                            };
+                            let lk = match &a[2] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("left_key must be String".into()),
+                            };
+                            let rk = match &a[3] {
+                                Val::Str(s) => Val::Str(s.clone()),
+                                _ => return Err("right_key must be String".into()),
+                            };
+                            let mut out = vec![];
+                            for lrow in left {
+                                let lp = match lrow {
+                                    Val::Map(p) => p,
+                                    _ => return Err("left rows must be Maps".into()),
+                                };
+                                let lv = map_lookup(lp, &lk);
+                                let mut matched = false;
+                                for rrow in right {
+                                    let rp = match rrow {
+                                        Val::Map(p) => p,
+                                        _ => return Err("right rows must be Maps".into()),
+                                    };
+                                    if lv.is_some() && lv == map_lookup(rp, &rk) {
+                                        matched = true;
+                                        let mut merged = lp.clone();
+                                        for (k, v) in rp {
+                                            let key =
+                                                if merged.iter().any(|(existing, _)| existing == k)
+                                                {
+                                                    Val::Str(format!("right.{}", k.show()))
+                                                } else {
+                                                    k.clone()
+                                                };
+                                            merged.push((key, v.clone()));
+                                        }
+                                        out.push(Val::Map(merged));
+                                    }
+                                }
+                                if !matched {
+                                    out.push(Val::Map(lp.clone()));
+                                }
+                            }
+                            Val::List(out)
+                        }
                         "csv_read" => {
                             if a.len() != 1 {
                                 return Err("csv_read expects path".into());
@@ -4240,6 +4711,77 @@ impl Vm {
                                 _ => return Err("separator must be String".into()),
                             };
                             Val::Str(xs.iter().map(Val::show).collect::<Vec<_>>().join(sep))
+                        }
+                        "replace_text" => {
+                            if a.len() != 3 {
+                                return Err("replace_text expects text,from,to".into());
+                            }
+                            let text = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("text must be String".into()),
+                            };
+                            let from = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("from must be String".into()),
+                            };
+                            let to = match &a[2] {
+                                Val::Str(s) => s,
+                                _ => return Err("to must be String".into()),
+                            };
+                            Val::Str(text.replace(from, to))
+                        }
+                        "path_join" => {
+                            if a.is_empty() {
+                                return Err("path_join expects at least one part".into());
+                            }
+                            let mut p = PathBuf::new();
+                            for part in &a {
+                                match part {
+                                    Val::Str(s) => p.push(s),
+                                    _ => return Err("path parts must be Strings".into()),
+                                }
+                            }
+                            Val::Str(p.display().to_string())
+                        }
+                        "path_name" => {
+                            if a.len() != 1 {
+                                return Err("path_name expects path".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => Path::new(s),
+                                _ => return Err("path must be String".into()),
+                            };
+                            Val::Str(
+                                p.file_name()
+                                    .map(|x| x.to_string_lossy().to_string())
+                                    .unwrap_or_default(),
+                            )
+                        }
+                        "path_parent" => {
+                            if a.len() != 1 {
+                                return Err("path_parent expects path".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => Path::new(s),
+                                _ => return Err("path must be String".into()),
+                            };
+                            p.parent()
+                                .map(|x| Val::Str(x.display().to_string()))
+                                .unwrap_or(Val::Null)
+                        }
+                        "path_extension" => {
+                            if a.len() != 1 {
+                                return Err("path_extension expects path".into());
+                            }
+                            let p = match &a[0] {
+                                Val::Str(s) => Path::new(s),
+                                _ => return Err("path must be String".into()),
+                            };
+                            Val::Str(
+                                p.extension()
+                                    .map(|x| x.to_string_lossy().to_string())
+                                    .unwrap_or_default(),
+                            )
                         }
                         "copy_file" => {
                             if a.len() != 2 {
@@ -4753,6 +5295,29 @@ impl Vm {
                                 .ok_or(format!("unknown task {id}"))?;
                             handle.join().map_err(|_| "task panicked".to_string())??
                         }
+                        "gather" => {
+                            if a.len() != 1 {
+                                return Err("gather expects list of task ids".into());
+                            }
+                            let ids = match &a[0] {
+                                Val::List(v) => v.clone(),
+                                _ => return Err("gather expects List".into()),
+                            };
+                            let mut out = vec![];
+                            for task in ids {
+                                let id = match task {
+                                    Val::Num(n) => n as u64,
+                                    _ => return Err("gather task ids must be Numbers".into()),
+                                };
+                                let handle = tasks()
+                                    .lock()
+                                    .map_err(|_| "task registry poisoned")?
+                                    .remove(&id)
+                                    .ok_or(format!("unknown task {id}"))?;
+                                out.push(handle.join().map_err(|_| "task panicked".to_string())??);
+                            }
+                            Val::List(out)
+                        }
                         "channel" => {
                             if !a.is_empty() {
                                 return Err("channel expects no arguments".into());
@@ -5044,12 +5609,13 @@ impl Vm {
                     }
                     self.stack.push(Val::Function(name));
                 }
-                Op::Def(name, params, return_type, code) => {
+                Op::Def(name, params, return_type, is_async, code) => {
                     self.funcs.insert(
                         name,
                         FunctionDef {
                             params,
                             return_type,
+                            is_async,
                             code,
                             captures: self.vars.clone(),
                             capture_types: self.var_types.clone(),
@@ -5063,12 +5629,13 @@ impl Vm {
                         }
                     }
                     let mut compiled = HashMap::new();
-                    for (method, params, return_type, code) in methods {
+                    for (method, params, return_type, is_async, code) in methods {
                         compiled.insert(
                             method,
                             FunctionDef {
                                 params,
                                 return_type,
+                                is_async,
                                 code,
                                 captures: self.vars.clone(),
                                 capture_types: self.var_types.clone(),
@@ -5227,7 +5794,10 @@ fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
         let mut local = HashSet::new();
         for s in stmts {
             match s {
-                Stmt::Fn(n, _, _, _) | Stmt::Class(n, _, _) => {
+                Stmt::Fn(n, _, _, _)
+                | Stmt::AsyncFn(n, _, _, _)
+                | Stmt::DecoratedFn(_, n, _, _, _)
+                | Stmt::Class(n, _, _) => {
                     local.insert(n.clone());
                 }
                 _ => {}
@@ -5287,23 +5857,46 @@ fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                         check_block(body, &scopes, errors);
                     }
                 }
-                Stmt::Try(body, n, handler) => {
+                Stmt::Try(body, n, handler, finally) => {
                     check_block(body, &scopes, errors);
                     let mut nested = scopes.clone();
                     nested.push(HashSet::from([n.clone()]));
                     check_block(handler, &nested, errors);
+                    check_block(finally, &scopes, errors);
                 }
-                Stmt::Fn(_, params, _, body) => {
+                Stmt::With(resource, name, body) => {
+                    check_expr(resource, &scopes, errors);
+                    let current = scopes.last_mut().unwrap();
+                    if current.contains(name) {
+                        errors.push(format!("duplicate declaration '{name}'"));
+                    } else {
+                        current.insert(name.clone());
+                    }
+                    check_block(body, &scopes, errors);
+                }
+                Stmt::Fn(_, params, _, body) | Stmt::AsyncFn(_, params, _, body) => {
+                    let mut nested = scopes.clone();
+                    nested.push(params.iter().map(|(name, _)| name.clone()).collect());
+                    check_block(body, &nested, errors);
+                }
+                Stmt::DecoratedFn(decorator, _, params, _, body) => {
+                    if !known(&scopes, decorator) {
+                        errors.push(format!("undefined decorator '{decorator}'"));
+                    }
                     let mut nested = scopes.clone();
                     nested.push(params.iter().map(|(name, _)| name.clone()).collect());
                     check_block(body, &nested, errors);
                 }
                 Stmt::Class(_, _, body) => {
                     for method in body {
-                        if let Stmt::Fn(_, params, _, method_body) = method {
-                            let mut nested = scopes.clone();
-                            nested.push(params.iter().map(|(name, _)| name.clone()).collect());
-                            check_block(method_body, &nested, errors);
+                        match method {
+                            Stmt::Fn(_, params, _, method_body)
+                            | Stmt::AsyncFn(_, params, _, method_body) => {
+                                let mut nested = scopes.clone();
+                                nested.push(params.iter().map(|(name, _)| name.clone()).collect());
+                                check_block(method_body, &nested, errors);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -5379,7 +5972,7 @@ fn symbols_file(path: &Path) -> Result<(), String> {
                     ty.map(|t| format!(": {t}")).unwrap_or_default()
                 );
             }
-            Stmt::Fn(name, params, ret, _) => {
+            Stmt::Fn(name, params, ret, _) | Stmt::AsyncFn(name, params, ret, _) => {
                 let ps = params
                     .iter()
                     .map(|(n, t)| match t {
@@ -5393,25 +5986,43 @@ fn symbols_file(path: &Path) -> Result<(), String> {
                     ret.map(|r| format!(" -> {r}")).unwrap_or_default()
                 );
             }
+            Stmt::DecoratedFn(decorator, name, params, ret, _) => {
+                let ps = params
+                    .iter()
+                    .map(|(n, t)| match t {
+                        Some(t) => format!("{n}: {t}"),
+                        None => n.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "  @{decorator} fn {name}({ps}){}",
+                    ret.map(|r| format!(" -> {r}")).unwrap_or_default()
+                );
+            }
             Stmt::Class(name, parent, body) => {
                 println!(
                     "  class {name}{}",
                     parent.map(|p| format!(": {p}")).unwrap_or_default()
                 );
                 for item in body {
-                    if let Stmt::Fn(method, params, ret, _) = item {
-                        let ps = params
-                            .iter()
-                            .map(|(n, t)| match t {
-                                Some(t) => format!("{n}: {t}"),
-                                None => n.clone(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        println!(
-                            "    method {method}({ps}){}",
-                            ret.map(|r| format!(" -> {r}")).unwrap_or_default()
-                        );
+                    match item {
+                        Stmt::Fn(method, params, ret, _)
+                        | Stmt::AsyncFn(method, params, ret, _) => {
+                            let ps = params
+                                .iter()
+                                .map(|(n, t)| match t {
+                                    Some(t) => format!("{n}: {t}"),
+                                    None => n.clone(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            println!(
+                                "    method {method}({ps}){}",
+                                ret.map(|r| format!(" -> {r}")).unwrap_or_default()
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -5492,14 +6103,15 @@ fn doc_file(path: &Path) -> Result<(), String> {
     let src = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let ast = Parser::new(lex(&src)?).program()?;
     let mut out = format!(
-        "# API — {}\n\n",
+        "# API â€” {}\n\n",
         path.file_name()
             .and_then(|x| x.to_str())
             .unwrap_or("module")
     );
     for stmt in ast {
         match stmt {
-            Stmt::Fn(name, params, return_type, _) => {
+            Stmt::Fn(name, params, return_type, _)
+            | Stmt::AsyncFn(name, params, return_type, _) => {
                 let rendered = params
                     .iter()
                     .map(|(n, t)| match t {
@@ -5511,23 +6123,41 @@ fn doc_file(path: &Path) -> Result<(), String> {
                 let ret = return_type.unwrap_or_else(|| "Any".into());
                 out.push_str(&format!("## fn {name}({rendered}) -> {ret}\n\n"));
             }
+            Stmt::DecoratedFn(decorator, name, params, return_type, _) => {
+                let rendered = params
+                    .iter()
+                    .map(|(n, t)| match t {
+                        Some(t) => format!("{n}: {t}"),
+                        None => n.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ret = return_type.unwrap_or_else(|| "Any".into());
+                out.push_str(&format!(
+                    "## @{decorator} fn {name}({rendered}) -> {ret}\n\n"
+                ));
+            }
             Stmt::Class(name, parent, body) => {
                 match parent {
                     Some(p) => out.push_str(&format!("## class {name}: {p}\n\n")),
                     None => out.push_str(&format!("## class {name}\n\n")),
                 }
                 for item in body {
-                    if let Stmt::Fn(method, params, return_type, _) = item {
-                        let rendered = params
-                            .iter()
-                            .map(|(n, t)| match t {
-                                Some(t) => format!("{n}: {t}"),
-                                None => n.clone(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let ret = return_type.unwrap_or_else(|| "Any".into());
-                        out.push_str(&format!("- `{method}({rendered}) -> {ret}`\n"));
+                    match item {
+                        Stmt::Fn(method, params, return_type, _)
+                        | Stmt::AsyncFn(method, params, return_type, _) => {
+                            let rendered = params
+                                .iter()
+                                .map(|(n, t)| match t {
+                                    Some(t) => format!("{n}: {t}"),
+                                    None => n.clone(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let ret = return_type.unwrap_or_else(|| "Any".into());
+                            out.push_str(&format!("- `{method}({rendered}) -> {ret}`\n"));
+                        }
+                        _ => {}
                     }
                 }
                 out.push('\n');
@@ -5563,6 +6193,7 @@ fn lsp_completion_items() -> JsonValue {
         "let",
         "const",
         "fn",
+        "async",
         "class",
         "return",
         "if",
@@ -5572,12 +6203,17 @@ fn lsp_completion_items() -> JsonValue {
         "in",
         "try",
         "catch",
+        "finally",
         "throw",
+        "with",
+        "as",
         "match",
         "case",
         "break",
         "continue",
         "await",
+        "yield",
+        "gather",
         "true",
         "false",
         "null",
@@ -5905,7 +6541,10 @@ fn lsp_server() -> Result<(), String> {
                             if let Ok(ast) = Parser::new(tokens).program() {
                                 for stmt in ast {
                                     let (name, kind) = match stmt {
-                                        Stmt::Fn(name, _, _, _) => (name, 12),
+                                        Stmt::Fn(name, _, _, _) | Stmt::AsyncFn(name, _, _, _) => {
+                                            (name, 12)
+                                        }
+                                        Stmt::DecoratedFn(_, name, _, _, _) => (name, 12),
                                         Stmt::Class(name, _, _) => (name, 5),
                                         Stmt::Let(name, _, _, _) => (name, 13),
                                         _ => continue,
@@ -6538,6 +7177,45 @@ fn serve_routes(routes_file: &Path, port: u16) -> Result<(), String> {
     Ok(())
 }
 
+fn match_route_pattern(pattern: &str, path: &str) -> Option<Vec<(String, String)>> {
+    let p: Vec<&str> = pattern
+        .trim_matches('/')
+        .split('/')
+        .filter(|x| !x.is_empty())
+        .collect();
+    let a: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|x| !x.is_empty())
+        .collect();
+    if p.len() != a.len() {
+        return None;
+    }
+    let mut params = vec![];
+    for (expected, actual) in p.iter().zip(a.iter()) {
+        if expected.starts_with('{') && expected.ends_with('}') && expected.len() > 2 {
+            params.push((
+                expected[1..expected.len() - 1].to_string(),
+                (*actual).to_string(),
+            ));
+        } else if expected != actual {
+            return None;
+        }
+    }
+    Some(params)
+}
+
+fn query_params(url: &str) -> Val {
+    let mut pairs = vec![];
+    if let Some(query) = url.split_once('?').map(|(_, q)| q) {
+        for item in query.split('&').filter(|x| !x.is_empty()) {
+            let (key, value) = item.split_once('=').unwrap_or((item, ""));
+            pairs.push((Val::Str(key.to_string()), Val::Str(value.to_string())));
+        }
+    }
+    Val::Map(pairs)
+}
+
 fn serve_veyra_app(app_file: &Path, routes_file: &Path, port: u16) -> Result<(), String> {
     let src = load_source(app_file.to_string_lossy().as_ref())?;
     let vm = prepare_vm(&src)?;
@@ -6556,22 +7234,51 @@ fn serve_veyra_app(app_file: &Path, routes_file: &Path, port: u16) -> Result<(),
         let path = full_url.split('?').next().unwrap_or("/").to_string();
         let method = req.method().as_str().to_string();
         let key = format!("{method} {path}");
-        let handler = routes
+        let mut route_params: Vec<(String, String)> = vec![];
+        let mut handler = routes
             .get(&key)
             .or_else(|| routes.get(&path))
-            .and_then(JsonValue::as_str);
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        if handler.is_none() {
+            for (route_key, value) in routes {
+                let (route_method, pattern) = route_key
+                    .split_once(' ')
+                    .map(|(m, p)| (Some(m), p))
+                    .unwrap_or((None, route_key.as_str()));
+                if route_method.is_some() && route_method != Some(method.as_str()) {
+                    continue;
+                }
+                if let Some(params) = match_route_pattern(pattern, &path) {
+                    if let Some(name) = value.as_str() {
+                        handler = Some(name.to_string());
+                        route_params = params;
+                        break;
+                    }
+                }
+            }
+        }
         let response = if let Some(handler) = handler {
             let mut body = String::new();
             req.as_reader()
                 .read_to_string(&mut body)
                 .map_err(|e| e.to_string())?;
+            let params = Val::Map(
+                route_params
+                    .iter()
+                    .map(|(k, v)| (Val::Str(k.clone()), Val::Str(v.clone())))
+                    .collect(),
+            );
+            let query = query_params(&full_url);
             let request = Val::Map(vec![
                 (Val::Str("method".into()), Val::Str(method)),
                 (Val::Str("path".into()), Val::Str(path)),
                 (Val::Str("url".into()), Val::Str(full_url)),
                 (Val::Str("body".into()), Val::Str(body)),
+                (Val::Str("params".into()), params),
+                (Val::Str("query".into()), query),
             ]);
-            match vm.invoke(handler, vec![request]) {
+            match vm.invoke(&handler, vec![request]) {
                 Ok(value) => {
                     let (status, content_type, body) = match value {
                         Val::Map(pairs) => {
@@ -6674,7 +7381,7 @@ fn doctor() {
 }
 
 fn repl() -> Result<(), String> {
-    println!("Veyra {VERSION} native REPL â€” :quit to exit");
+    println!("Veyra {VERSION} native REPL Ã¢â‚¬â€ :quit to exit");
     let mut line = String::new();
     loop {
         print!("vy> ");
@@ -7117,5 +7824,40 @@ mod tests {
         assert!(bars.exists());
         let _ = fs::remove_file(scatter);
         let _ = fs::remove_file(bars);
+    }
+    #[test]
+    fn async_functions_methods_and_gather() {
+        let src = "async fn square(n: Int)->Int{sleep_ms(1);return n*n;} class Worker { async fn plus(self,n:Int)->Int{return n+1;} } let a=square(3); let b=square(4); let values=gather([a,b]); assert(values[0]==9); assert(values[1]==16); let w=Worker(); let x=await w.plus(7); assert(x==8);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn context_manager_with_as() {
+        let src = "class Resource { fn init(self)->Null{self.closed=false;return null;} fn enter(self)->Resource{return self;} fn exit(self)->Null{self.closed=true;return null;} } with Resource() as r { assert(r.closed==false); } assert(r.closed==true);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn decorator_syntax_identity() {
+        let src = "fn identity(f: Function)->Function{return f;} @identity fn plus_one(x:Int)->Int{return x+1;} assert(plus_one(4)==5);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn ml_metrics_and_split() {
+        let src = "let m=classification_metrics([1,0,1,1],[1,0,0,1]); assert(m[\"accuracy\"]==0.75); assert(m[\"precision\"]==1); let s=train_test_split([1,2,3,4],[10,20,30,40],0.25); assert(len(s[\"train_x\"])==3); assert(len(s[\"test_x\"])==1);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn path_and_text_services() {
+        let src = "assert(starts_with(\"veyra\",\"vey\")); assert(ends_with(\"veyra\",\"yra\")); assert(replace_text(\"a-b\",\"-\",\"+\")==\"a+b\"); let p=path_join(\"a\",\"b.txt\"); assert(path_name(p)==\"b.txt\"); assert(path_extension(p)==\"txt\");";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn finally_cleanup_semantics() {
+        let src = "let cleaned=false; try { throw \"boom\"; } catch err { assert(err==\"boom\"); } finally { cleaned=true; } assert(cleaned); let normal=false; try { normal=true; } catch err {} finally { normal=true; } assert(normal);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn dataframe_extended_helpers() {
+        let src = "let rows=[{\"id\":1,\"x\":1},{\"id\":2,\"x\":null},{\"id\":3,\"x\":3}]; let h=table_head(rows,2); let t=table_tail(rows,1); assert(len(h)==2); assert(t[0][\"id\"]==3); let d=table_drop_nulls(rows,\"x\"); assert(len(d)==2); let f=table_fill_null(rows,\"x\",9); assert(f[1][\"x\"]==9); let joined=table_left_join(rows,[{\"rid\":1,\"name\":\"a\"}],\"id\",\"rid\"); assert(len(joined)==3);";
+        assert!(run_source(src).is_ok());
     }
 }

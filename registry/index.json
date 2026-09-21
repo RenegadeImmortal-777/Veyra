@@ -41,12 +41,12 @@
                                        "source":  "../packages/vyscience"
                                    },
                      "vyml":  {
-                                  "version":  "0.2.0",
+                                  "version":  "0.3.0",
                                   "entry":  "vyml.vy",
                                   "source":  "../packages/vyml"
                               },
                      "vydata":  {
-                                    "version":  "0.3.0",
+                                    "version":  "0.4.0",
                                     "entry":  "vydata.vy",
                                     "source":  "../packages/vydata"
                                 },
@@ -56,7 +56,7 @@
                                    "source":  "../packages/vygui"
                                },
                      "vyweb":  {
-                                   "version":  "0.1.0",
+                                   "version":  "0.3.0",
                                    "entry":  "vyweb.vy",
                                    "source":  "../packages/vyweb"
                                },
@@ -111,7 +111,7 @@
                                       "source":  "../packages/vylinalg"
                                   },
                      "vyframe":  {
-                                     "version":  "0.1.0",
+                                     "version":  "0.2.0",
                                      "entry":  "vyframe.vy",
                                      "source":  "../packages/vyframe"
                                  },
@@ -149,7 +149,92 @@
                                    "version":  "0.1.0",
                                    "entry":  "vyviz.vy",
                                    "source":  "../packages/vyviz"
-                               }
+                               },
+                     "vyasync":  {
+                                     "version":  "0.1.0",
+                                     "entry":  "vyasync.vy",
+                                     "source":  "../packages/vyasync"
+                                 },
+                     "vyiter":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vyiter.vy",
+                                    "source":  "../packages/vyiter"
+                                },
+                     "vypath":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vypath.vy",
+                                    "source":  "../packages/vypath"
+                                },
+                     "vyfs":  {
+                                  "version":  "0.1.0",
+                                  "entry":  "vyfs.vy",
+                                  "source":  "../packages/vyfs"
+                              },
+                     "vyprocess":  {
+                                       "version":  "0.1.0",
+                                       "entry":  "vyprocess.vy",
+                                       "source":  "../packages/vyprocess"
+                                   },
+                     "vyplatform":  {
+                                        "version":  "0.1.0",
+                                        "entry":  "vyplatform.vy",
+                                        "source":  "../packages/vyplatform"
+                                    },
+                     "vytoml":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vytoml.vy",
+                                    "source":  "../packages/vytoml"
+                                },
+                     "vybase64":  {
+                                      "version":  "0.1.0",
+                                      "entry":  "vybase64.vy",
+                                      "source":  "../packages/vybase64"
+                                  },
+                     "vycsv":  {
+                                   "version":  "0.1.0",
+                                   "entry":  "vycsv.vy",
+                                   "source":  "../packages/vycsv"
+                               },
+                     "vyrandom":  {
+                                      "version":  "0.1.0",
+                                      "entry":  "vyrandom.vy",
+                                      "source":  "../packages/vyrandom"
+                                  },
+                     "vytime":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vytime.vy",
+                                    "source":  "../packages/vytime"
+                                },
+                     "vyhash":  {
+                                    "version":  "0.1.0",
+                                    "entry":  "vyhash.vy",
+                                    "source":  "../packages/vyhash"
+                                },
+                     "vymlmetrics":  {
+                                         "version":  "0.2.0",
+                                         "entry":  "vymlmetrics.vy",
+                                         "source":  "../packages/vymlmetrics"
+                                     },
+                     "vystrings":  {
+                                       "version":  "0.1.0",
+                                       "entry":  "vystrings.vy",
+                                       "source":  "../packages/vystrings"
+                                   },
+                     "vyorm":  {
+                                   "version":  "0.1.0",
+                                   "entry":  "vyorm.vy",
+                                   "source":  "../packages/vyorm"
+                               },
+                     "vyproperty":  {
+                                        "version":  "0.1.0",
+                                        "entry":  "vyproperty.vy",
+                                        "source":  "../packages/vyproperty"
+                                    },
+                     "vyrequest":  {
+                                       "version":  "0.1.0",
+                                       "entry":  "vyrequest.vy",
+                                       "source":  "../packages/vyrequest"
+                                   }
                  },
     "registry_version":  1
 }

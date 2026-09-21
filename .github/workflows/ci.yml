@@ -36,3 +36,15 @@ jobs:
       - name: Clippy
         working-directory: engine-rs
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  package-matrix:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build debug compiler
+        working-directory: engine-rs
+        run: cargo build
+      - name: Validate registry packages
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\package-matrix.ps1

@@ -6,7 +6,7 @@
     {"name":"comment.line.double-slash.veyra","match":"//.*$"},
     {"name":"comment.block.veyra","begin":"/\\*","end":"\\*/"},
     {"name":"string.quoted.double.veyra","begin":"\"","end":"\""},
-    {"name":"keyword.control.veyra","match":"\\b(if|else|while|for|in|return|use|try|catch|throw|break|continue|await|yield|match|case|and|or|not)\\b"},
+    {"name":"keyword.control.veyra","match":"\\b(if|else|while|for|in|return|use|async|try|catch|finally|throw|with|as|break|continue|await|yield|match|case|and|or|not)\\b"},
     {"name":"storage.type.veyra","match":"\\b(Int|Float|Number|String|Bool|List|Map|Function|Generator|Object|Null|Any|Void)\\b"},
     {"name":"storage.modifier.veyra","match":"\\b(let|const|fn|class)\\b"},
     {"name":"constant.language.veyra","match":"\\b(true|false|null)\\b"},

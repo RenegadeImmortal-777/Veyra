@@ -2,8 +2,8 @@ const vscode = require('vscode');
 const cp = require('child_process');
 
 const keywords = [
-  'let','const','fn','class','if','else','while','for','in','return','use',
-  'try','catch','throw','break','continue','await','yield','match','case',
+  'let','const','fn','async','class','if','else','while','for','in','return','use',
+  'try','catch','finally','throw','with','as','break','continue','await','yield','match','case',
   'and','or','not','true','false','null'
 ];
 const builtins = [
@@ -14,8 +14,10 @@ const builtins = [
   'sqrt','abs','floor','ceil','lower','upper','trim','split','join','contains',
   'read_file','write_file','path_exists','mkdir','remove_file','list_dir','cwd','env_get',
   'http_get','http_post','http_request','shell','clock','random','randint','sha256','sqlite_exec','sqlite_query',
-  'spawn','await_task','task_done','channel','send','recv','try_recv','sleep_ms','cpu_count',
+  'spawn','await_task','gather','task_done','channel','send','recv','try_recv','sleep_ms','cpu_count',
   'platform_os','platform_arch','platform_family','path_separator',
+  'path_join','path_name','path_parent','path_extension','starts_with','ends_with','replace_text',
+  'accuracy_score','classification_metrics','train_test_split',
   'next','collect','generator_done',
   'toml_parse','toml_stringify','base64_encode','base64_decode','uuid_v4','now_utc','now_local','datetime_format',
   'ffi_available','ffi_i32','ffi_i64','ffi_f64',
