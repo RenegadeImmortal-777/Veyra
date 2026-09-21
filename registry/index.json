@@ -71,7 +71,7 @@
                                     "source":  "../packages/vyhttp"
                                 },
                      "vyconcurrent":  {
-                                          "version":  "0.1.0",
+                                          "version":  "0.2.0",
                                           "entry":  "vyconcurrent.vy",
                                           "source":  "../packages/vyconcurrent"
                                       },
@@ -151,7 +151,7 @@
                                    "source":  "../packages/vyviz"
                                },
                      "vyasync":  {
-                                     "version":  "0.1.0",
+                                     "version":  "0.2.0",
                                      "entry":  "vyasync.vy",
                                      "source":  "../packages/vyasync"
                                  },
@@ -236,7 +236,7 @@
                                        "source":  "../packages/vyrequest"
                                    },
                      "vytensor":  {
-                                      "version":  "0.1.0",
+                                      "version":  "0.2.0",
                                       "entry":  "vytensor.vy",
                                       "source":  "../packages/vytensor"
                                   },

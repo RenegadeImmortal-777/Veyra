@@ -7,5 +7,13 @@ fn sub(a: Map, b: Map) -> Map { return tensor_sub(a, b); }
 fn mul(a: Map, b: Map) -> Map { return tensor_mul(a, b); }
 fn matmul(a: Map, b: Map) -> Map { return tensor_matmul(a, b); }
 fn relu(t: Map) -> Map { return tensor_relu(t); }
+fn sigmoid(t: Map) -> Map { return tensor_sigmoid(t); }
+fn tanh(t: Map) -> Map { return tensor_tanh(t); }
+fn exp(t: Map) -> Map { return tensor_exp(t); }
+fn log(t: Map) -> Map { return tensor_log(t); }
+fn reshape(t: Map, shape: List) -> Map { return tensor_reshape(t, shape); }
+fn transpose(t: Map) -> Map { return tensor_transpose(t); }
+fn save(t: Map, path: String) -> Null { return tensor_save(t, path); }
+fn load(path: String) -> Map { return tensor_load(path); }
 fn sum(t: Map) -> Map { return tensor_sum(t); }
 fn mean(t: Map) -> Map { return tensor_mean(t); }

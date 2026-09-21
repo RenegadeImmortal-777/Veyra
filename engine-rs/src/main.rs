@@ -18,7 +18,7 @@ use std::{
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::Engine;
@@ -31,7 +31,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 
-const VERSION: &str = "9.0.0-ascendant";
+const VERSION: &str = "10.0.0-zenith";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -1349,6 +1349,12 @@ enum TensorOp {
     Sub(u64, u64),
     Mul(u64, u64),
     Relu(u64),
+    Sigmoid(u64),
+    Tanh(u64),
+    Exp(u64),
+    Log(u64),
+    Reshape(u64),
+    Transpose(u64, usize, usize),
     Sum(u64),
     Mean(u64),
     MatMul(u64, u64, usize, usize, usize),
@@ -1474,7 +1480,15 @@ fn tensor_topology(id: u64, seen: &mut HashSet<u64>, order: &mut Vec<u64>) -> Re
     let parents: Vec<u64> = match t.op {
         TensorOp::Leaf => vec![],
         TensorOp::Add(a, b) | TensorOp::Sub(a, b) | TensorOp::Mul(a, b) => vec![a, b],
-        TensorOp::Relu(a) | TensorOp::Sum(a) | TensorOp::Mean(a) => vec![a],
+        TensorOp::Relu(a)
+        | TensorOp::Sigmoid(a)
+        | TensorOp::Tanh(a)
+        | TensorOp::Exp(a)
+        | TensorOp::Log(a)
+        | TensorOp::Reshape(a)
+        | TensorOp::Transpose(a, _, _)
+        | TensorOp::Sum(a)
+        | TensorOp::Mean(a) => vec![a],
         TensorOp::MatMul(a, b, _, _, _) => vec![a, b],
     };
     for p in parents {
@@ -1489,18 +1503,20 @@ fn tensor_backward(root: u64) -> Result<(), String> {
     if root_tensor.data.len() != 1 {
         return Err("backward expects a scalar tensor; use tensor_sum or tensor_mean first".into());
     }
+    let mut order = vec![];
+    tensor_topology(root, &mut HashSet::new(), &mut order)?;
     {
         let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
-        for tensor in store.values_mut() {
-            for g in &mut tensor.grad {
-                *g = 0.0;
+        for id in &order {
+            if let Some(tensor) = store.get_mut(id) {
+                for g in &mut tensor.grad {
+                    *g = 0.0;
+                }
             }
         }
         let t = store.get_mut(&root).ok_or("unknown tensor")?;
         t.grad = vec![1.0];
     }
-    let mut order = vec![];
-    tensor_topology(root, &mut HashSet::new(), &mut order)?;
     for id in order.into_iter().rev() {
         let current = tensor_snapshot(id)?;
         let grad = current.grad.clone();
@@ -1561,6 +1577,75 @@ fn tensor_backward(root: u64) -> Result<(), String> {
                     if t.requires_grad {
                         for i in 0..t.grad.len() {
                             t.grad[i] += if parent.data[i] > 0.0 { grad[i] } else { 0.0 };
+                        }
+                    }
+                }
+            }
+            TensorOp::Sigmoid(a) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            let y = current.data[i];
+                            t.grad[i] += grad[i] * y * (1.0 - y);
+                        }
+                    }
+                }
+            }
+            TensorOp::Tanh(a) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            let y = current.data[i];
+                            t.grad[i] += grad[i] * (1.0 - y * y);
+                        }
+                    }
+                }
+            }
+            TensorOp::Exp(a) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            t.grad[i] += grad[i] * current.data[i];
+                        }
+                    }
+                }
+            }
+            TensorOp::Log(a) => {
+                let parent = tensor_snapshot(a)?;
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            t.grad[i] += grad[i] / parent.data[i];
+                        }
+                    }
+                }
+            }
+            TensorOp::Reshape(a) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(grad.iter()) {
+                            *dst += *src;
+                        }
+                    }
+                }
+            }
+            TensorOp::Transpose(a, rows, cols) => {
+                let mut incoming = vec![0.0; rows * cols];
+                for r in 0..rows {
+                    for c in 0..cols {
+                        incoming[r * cols + c] = grad[c * rows + r];
+                    }
+                }
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(incoming) {
+                            *dst += src;
                         }
                     }
                 }
@@ -3871,6 +3956,154 @@ impl Vm {
                             let data = t.data.iter().map(|x| x.max(0.0)).collect();
                             tensor_store(data, t.shape, t.requires_grad, TensorOp::Relu(id))?
                         }
+                        "tensor_sigmoid" | "tensor_tanh" | "tensor_exp" | "tensor_log" => {
+                            if a.len() != 1 {
+                                return Err(format!("{n} expects tensor"));
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let t = tensor_snapshot(id)?;
+                            let data: Vec<f64> = match n.as_str() {
+                                "tensor_sigmoid" => {
+                                    t.data.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect()
+                                }
+                                "tensor_tanh" => t.data.iter().map(|x| x.tanh()).collect(),
+                                "tensor_exp" => t.data.iter().map(|x| x.exp()).collect(),
+                                _ => {
+                                    if t.data.iter().any(|x| *x <= 0.0) {
+                                        return Err(
+                                            "tensor_log requires strictly positive values".into()
+                                        );
+                                    }
+                                    t.data.iter().map(|x| x.ln()).collect()
+                                }
+                            };
+                            let op = match n.as_str() {
+                                "tensor_sigmoid" => TensorOp::Sigmoid(id),
+                                "tensor_tanh" => TensorOp::Tanh(id),
+                                "tensor_exp" => TensorOp::Exp(id),
+                                _ => TensorOp::Log(id),
+                            };
+                            tensor_store(data, t.shape, t.requires_grad, op)?
+                        }
+                        "tensor_reshape" => {
+                            if a.len() != 2 {
+                                return Err("tensor_reshape expects tensor,shape".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let t = tensor_snapshot(id)?;
+                            let dims = as_num_list(&a[1])?;
+                            let mut shape = Vec::with_capacity(dims.len());
+                            for d in dims {
+                                if d < 0.0 || d.fract() != 0.0 {
+                                    return Err(
+                                        "tensor_reshape dimensions must be non-negative integers"
+                                            .into(),
+                                    );
+                                }
+                                shape.push(d as usize);
+                            }
+                            let size = if shape.is_empty() {
+                                1
+                            } else {
+                                shape.iter().product()
+                            };
+                            if size != t.data.len() {
+                                return Err("tensor_reshape element count mismatch".into());
+                            }
+                            tensor_store(t.data, shape, t.requires_grad, TensorOp::Reshape(id))?
+                        }
+                        "tensor_transpose" => {
+                            if a.len() != 1 {
+                                return Err("tensor_transpose expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let t = tensor_snapshot(id)?;
+                            if t.shape.len() != 2 {
+                                return Err("tensor_transpose expects a 2D tensor".into());
+                            }
+                            let (rows, cols) = (t.shape[0], t.shape[1]);
+                            let mut out = vec![0.0; t.data.len()];
+                            for r in 0..rows {
+                                for c in 0..cols {
+                                    out[c * rows + r] = t.data[r * cols + c];
+                                }
+                            }
+                            tensor_store(
+                                out,
+                                vec![cols, rows],
+                                t.requires_grad,
+                                TensorOp::Transpose(id, rows, cols),
+                            )?
+                        }
+                        "tensor_save" => {
+                            if a.len() != 2 {
+                                return Err("tensor_save expects tensor,path".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let path = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("tensor_save path must be String".into()),
+                            };
+                            let t = tensor_snapshot(id)?;
+                            let body = serde_json::json!({
+                                "format": "veyra.tensor.v1",
+                                "shape": t.shape,
+                                "data": t.data,
+                                "requires_grad": t.requires_grad
+                            });
+                            fs::write(
+                                path,
+                                serde_json::to_vec_pretty(&body).map_err(|e| e.to_string())?,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            Val::Null
+                        }
+                        "tensor_load" => {
+                            if a.len() != 1 {
+                                return Err("tensor_load expects path".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("tensor_load path must be String".into()),
+                            };
+                            let body: JsonValue =
+                                serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+                                    .map_err(|e| e.to_string())?;
+                            if body.get("format").and_then(JsonValue::as_str)
+                                != Some("veyra.tensor.v1")
+                            {
+                                return Err("unsupported tensor file format".into());
+                            }
+                            let shape = body
+                                .get("shape")
+                                .and_then(JsonValue::as_array)
+                                .ok_or("tensor file missing shape")?
+                                .iter()
+                                .map(|v| {
+                                    v.as_u64().map(|n| n as usize).ok_or("invalid tensor shape")
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let data = body
+                                .get("data")
+                                .and_then(JsonValue::as_array)
+                                .ok_or("tensor file missing data")?
+                                .iter()
+                                .map(|v| v.as_f64().ok_or("invalid tensor value"))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let requires_grad = body
+                                .get("requires_grad")
+                                .and_then(JsonValue::as_bool)
+                                .unwrap_or(false);
+                            let size = if shape.is_empty() {
+                                1
+                            } else {
+                                shape.iter().product()
+                            };
+                            if size != data.len() {
+                                return Err("tensor file shape/data mismatch".into());
+                            }
+                            tensor_store(data, shape, requires_grad, TensorOp::Leaf)?
+                        }
                         "tensor_sum" | "tensor_mean" => {
                             if a.len() != 1 {
                                 return Err(format!("{n} expects tensor"));
@@ -6061,6 +6294,62 @@ impl Vm {
                             };
                             let guard = tasks().lock().map_err(|_| "task registry poisoned")?;
                             Val::Bool(guard.get(&id).map(|h| h.is_finished()).unwrap_or(true))
+                        }
+                        "task_status" => {
+                            if a.len() != 1 {
+                                return Err("task_status expects task id".into());
+                            }
+                            let id = match a[0] {
+                                Val::Num(n) => n as u64,
+                                _ => return Err("task id must be Number".into()),
+                            };
+                            let guard = tasks().lock().map_err(|_| "task registry poisoned")?;
+                            Val::Str(
+                                match guard.get(&id) {
+                                    Some(h) if h.is_finished() => "finished",
+                                    Some(_) => "running",
+                                    None => "consumed",
+                                }
+                                .into(),
+                            )
+                        }
+                        "await_timeout" => {
+                            if a.len() != 2 {
+                                return Err("await_timeout expects task_id,milliseconds".into());
+                            }
+                            let id = match a[0] {
+                                Val::Num(n) => n as u64,
+                                _ => return Err("task id must be Number".into()),
+                            };
+                            let ms = match a[1] {
+                                Val::Num(n) if n >= 0.0 => n as u64,
+                                _ => return Err("timeout must be a non-negative Number".into()),
+                            };
+                            let deadline = Instant::now() + Duration::from_millis(ms);
+                            loop {
+                                let finished = {
+                                    let guard =
+                                        tasks().lock().map_err(|_| "task registry poisoned")?;
+                                    match guard.get(&id) {
+                                        Some(h) => h.is_finished(),
+                                        None => return Err(format!("unknown task {id}")),
+                                    }
+                                };
+                                if finished {
+                                    let handle = tasks()
+                                        .lock()
+                                        .map_err(|_| "task registry poisoned")?
+                                        .remove(&id)
+                                        .ok_or(format!("unknown task {id}"))?;
+                                    break handle
+                                        .join()
+                                        .map_err(|_| "task panicked".to_string())??;
+                                }
+                                if Instant::now() >= deadline {
+                                    break Val::Null;
+                                }
+                                thread::sleep(Duration::from_millis(1));
+                            }
                         }
                         "await_task" => {
                             if a.len() != 1 {
@@ -8733,6 +9022,28 @@ mod tests {
     #[test]
     fn loop_local_declaration_reinitializes() {
         let src = "let i=0; let total=0; while i<3 { let local=i+1; total=total+local; i=i+1; } assert(total==6);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn tensor_extended_autograd_and_shapes() {
+        let src = "let x=tensor([1,2],true); let y=tensor_sigmoid(x); let loss=tensor_sum(y); tensor_backward(loss); let g=tensor_grad(x); assert(g[0]>0.19 and g[0]<0.20); assert(g[1]>0.10 and g[1]<0.11); let m=tensor([[1,2,3],[4,5,6]],false); let tr=tensor_transpose(m); let sh=tensor_shape(tr); assert(sh[0]==3 and sh[1]==2); let r=tensor_reshape(tr,[6]); let v=tensor_values(r); assert(v[0]==1 and v[1]==4 and v[5]==6);";
+        if let Err(e) = run_source(src) {
+            panic!("extended tensor test failed: {e}");
+        }
+    }
+    #[test]
+    fn tensor_serialization_round_trip() {
+        let path = env::temp_dir().join("veyra_tensor_round_trip.json");
+        let escaped = path.to_string_lossy().replace('\\', "\\\\");
+        let src = format!(
+            "let x=tensor([[1,2],[3,4]],true); tensor_save(x,\"{escaped}\"); let y=tensor_load(\"{escaped}\"); let sh=tensor_shape(y); let v=tensor_values(y); assert(sh[0]==2 and sh[1]==2); assert(v[0]==1 and v[3]==4);"
+        );
+        assert!(run_source(&src).is_ok());
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn task_timeout_and_status() {
+        let src = "fn slow()->Int{sleep_ms(25);return 7;} let t=spawn(slow,[]); let s=task_status(t); assert(s==\"running\" or s==\"finished\"); let early=await_timeout(t,1); assert(early==null); let value=await_task(t); assert(value==7);";
         assert!(run_source(src).is_ok());
     }
     #[test]

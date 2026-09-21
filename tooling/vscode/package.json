@@ -2,16 +2,22 @@
   "name": "veyra-language",
   "displayName": "Veyra Language",
   "description": "Language support for Veyra",
-  "version": "9.0.0",
+  "version": "10.0.0",
   "publisher": "veyra",
   "engines": {"vscode": "^1.80.0"},
-  "categories": ["Programming Languages"],
+  "categories": ["Programming Languages", "Linters", "Debuggers"],
   "activationEvents": ["onLanguage:veyra"],
   "main": "./extension.js",
   "contributes": {
     "languages": [{"id":"veyra","aliases":["Veyra","veyra"],"extensions":[".vy"],"configuration":"./language-configuration.json"}],
     "grammars": [{"language":"veyra","scopeName":"source.veyra","path":"./syntaxes/veyra.tmLanguage.json"}],
     "snippets": [{"language":"veyra","path":"./snippets/veyra.json"}],
-    "commands": [{"command":"veyra.check","title":"Veyra: Check Current File"}]
+    "commands": [
+      {"command":"veyra.check","title":"Veyra: Check Current File"},
+      {"command":"veyra.run","title":"Veyra: Run Current File"},
+      {"command":"veyra.debug","title":"Veyra: Debug Current File"},
+      {"command":"veyra.test","title":"Veyra: Test Project"},
+      {"command":"veyra.profile","title":"Veyra: Profile Current File"}
+    ]
   }
 }

@@ -14,11 +14,11 @@ const builtins = [
   'sqrt','abs','floor','ceil','lower','upper','trim','split','join','contains',
   'read_file','write_file','path_exists','mkdir','remove_file','list_dir','cwd','env_get',
   'http_get','http_post','http_request','shell','clock','random','randint','sha256','hmac_sha256','pbkdf2_sha256','constant_time_equal','sqlite_exec','sqlite_query','sqlite_exec_params','sqlite_query_params','import_package',
-  'spawn','await_task','gather','task_done','channel','send','recv','try_recv','sleep_ms','cpu_count',
+  'spawn','await_task','await_timeout','gather','task_done','task_status','channel','send','recv','try_recv','sleep_ms','cpu_count',
   'platform_os','platform_arch','platform_family','path_separator',
   'path_join','path_name','path_parent','path_extension','starts_with','ends_with','replace_text',
   'accuracy_score','classification_metrics','train_test_split',
-  'tensor','tensor_values','tensor_shape','tensor_grad','tensor_add','tensor_sub','tensor_mul','tensor_matmul','tensor_relu','tensor_sum','tensor_mean','tensor_backward','tensor_step','tensor_zero_grad',
+  'tensor','tensor_values','tensor_shape','tensor_grad','tensor_add','tensor_sub','tensor_mul','tensor_matmul','tensor_relu','tensor_sigmoid','tensor_tanh','tensor_exp','tensor_log','tensor_reshape','tensor_transpose','tensor_save','tensor_load','tensor_sum','tensor_mean','tensor_backward','tensor_step','tensor_zero_grad',
   'next','collect','generator_done',
   'toml_parse','toml_stringify','base64_encode','base64_decode','uuid_v4','now_utc','now_local','datetime_format',
   'ffi_available','ffi_i32','ffi_i64','ffi_f64',
@@ -33,7 +33,20 @@ const builtins = [
 ];
 
 function executable() {
-  return process.env.LOCALAPPDATA + '\\Veyra\\veyra.bat';
+  if (process.env.VEYRA_EXECUTABLE) return process.env.VEYRA_EXECUTABLE;
+  if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+    return process.env.LOCALAPPDATA + '\\Veyra\\veyra.bat';
+  }
+  return 'veyra';
+}
+
+function runInTerminal(args, name) {
+  const terminal = vscode.window.createTerminal(name || 'Veyra');
+  terminal.show();
+  const exe = executable();
+  const quotedExe = exe.includes(' ') ? '"' + exe + '"' : exe;
+  const rendered = args.map(x => '"' + String(x).replace(/"/g, '\\"') + '"').join(' ');
+  terminal.sendText(quotedExe + ' ' + rendered);
 }
 
 function checkDocument(doc, diagnostics) {
@@ -105,6 +118,21 @@ function activate(context) {
     const ed = vscode.window.activeTextEditor;
     if (!ed || ed.document.languageId !== 'veyra') return;
     ed.document.save().then(() => checkDocument(ed.document, diagnostics));
+  }));
+  context.subscriptions.push(vscode.commands.registerCommand('veyra.run', () => {
+    const ed = vscode.window.activeTextEditor;
+    if (ed && ed.document.languageId === 'veyra') runInTerminal(['run', ed.document.fileName], 'Veyra Run');
+  }));
+  context.subscriptions.push(vscode.commands.registerCommand('veyra.debug', () => {
+    const ed = vscode.window.activeTextEditor;
+    if (ed && ed.document.languageId === 'veyra') runInTerminal(['debug', ed.document.fileName], 'Veyra Debug');
+  }));
+  context.subscriptions.push(vscode.commands.registerCommand('veyra.profile', () => {
+    const ed = vscode.window.activeTextEditor;
+    if (ed && ed.document.languageId === 'veyra') runInTerminal(['profile', ed.document.fileName], 'Veyra Profile');
+  }));
+  context.subscriptions.push(vscode.commands.registerCommand('veyra.test', () => {
+    runInTerminal(['test'], 'Veyra Tests');
   }));
 
   context.subscriptions.push(vscode.languages.registerCompletionItemProvider('veyra', {

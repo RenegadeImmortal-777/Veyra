@@ -1,22 +1,26 @@
-# Veyra 9.0 Ascendant
+# Veyra 10.0 Zenith
 
 Veyra is a native-first general-purpose language and application platform with its own Rust lexer, parser, semantic checker, bytecode compiler, VM, package ecosystem and developer tooling.
 
-## Ascendant highlights
+## Zenith highlights
 
 - typed OOP, inheritance, closures, escaping function objects
 - generators, comprehensions and match/case
 - decorators, with/as, try/catch/finally
-- async functions, await, gather, tasks and channels
+- async functions, await, gather, tasks, channels, task status and timeout-aware waits
 - module objects via import_package()
 - C ABI FFI
-- dynamic web applications
-- parameterized SQLite
+- dynamic web applications and native HTTP services
+- parameterized SQLite and ORM foundations
 - dataframe/statistics/plotting foundations
 - trainable tensors with reverse-mode autograd
+- differentiable sigmoid/tanh/exp/log plus reshape and transpose
+- tensor/model serialization without Python
 - gradient descent optimizers
-- HMAC/PBKDF2 security primitives
+- HMAC/PBKDF2 security primitives and package integrity auditing
 - LSP completion/hover/definition/references/rename/symbols/formatting
+- VS Code Check/Run/Debug/Test/Profile commands
+- cross-platform CI and tagged release artifact workflow
 - 52 Veyra-native packages
 
 Example:
@@ -42,4 +46,4 @@ Example:
 
 The default execution path does not require Python.
 
-See STATUS-9-ASCENDANT.md, PYTHON-75-TARGET.md and docs/PACKAGES.md.
+See STATUS-10-ZENITH.md, STATUS-9-ASCENDANT.md and docs/PACKAGES.md.
