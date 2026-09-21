@@ -1,11 +1,12 @@
 # Veyra Package Index
 
-Registry packages: **47**
+Registry packages: **52**
 
 | Package | Version | Entry |
 |---|---:|---|
 | vyalgo | 0.1.0 | vyalgo.vy |
 | vyasync | 0.1.0 | vyasync.vy |
+| vyautograd | 0.1.0 | vyautograd.vy |
 | vybase64 | 0.1.0 | vybase64.vy |
 | vycollections | 0.1.0 | vycollections.vy |
 | vyconcurrent | 0.1.0 | vyconcurrent.vy |
@@ -29,7 +30,9 @@ Registry packages: **47**
 | vymath | 0.2.0 | vymath.vy |
 | vyml | 0.3.0 | vyml.vy |
 | vymlmetrics | 0.2.0 | vymlmetrics.vy |
-| vyorm | 0.1.0 | vyorm.vy |
+| vynn | 0.1.0 | vynn.vy |
+| vyoptim | 0.1.0 | vyoptim.vy |
+| vyorm | 0.2.0 | vyorm.vy |
 | vyos | 0.2.0 | vyos.vy |
 | vypath | 0.1.0 | vypath.vy |
 | vyplatform | 0.1.0 | vyplatform.vy |
@@ -40,10 +43,12 @@ Registry packages: **47**
 | vyregex | 0.1.0 | vyregex.vy |
 | vyrequest | 0.1.0 | vyrequest.vy |
 | vyscience | 0.2.0 | vyscience.vy |
+| vysecurity | 0.1.0 | vysecurity.vy |
 | vysets | 0.1.0 | vysets.vy |
-| vysqlite | 0.1.0 | vysqlite.vy |
+| vysqlite | 0.2.0 | vysqlite.vy |
 | vystats | 0.1.0 | vystats.vy |
 | vystrings | 0.1.0 | vystrings.vy |
+| vytensor | 0.1.0 | vytensor.vy |
 | vytest | 0.3.0 | vytest.vy |
 | vytext | 0.1.0 | vytext.vy |
 | vytime | 0.1.0 | vytime.vy |

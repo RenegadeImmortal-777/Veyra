@@ -1,44 +1,45 @@
-# Veyra 8.0 Elevation
+# Veyra 9.0 Ascendant
 
-Veyra is a native-first programming language and application platform built around its own Rust lexer, parser, semantic checker, bytecode compiler and VM.
+Veyra is a native-first general-purpose language and application platform with its own Rust lexer, parser, semantic checker, bytecode compiler, VM, package ecosystem and developer tooling.
 
-Elevation adds async functions, gather, context managers, decorators, finally, parameterized web routing, deeper dataframe operations, ML metrics and a 47-package native registry.
+## Ascendant highlights
 
-Core examples:
+- typed OOP, inheritance, closures, escaping function objects
+- generators, comprehensions and match/case
+- decorators, with/as, try/catch/finally
+- async functions, await, gather, tasks and channels
+- module objects via import_package()
+- C ABI FFI
+- dynamic web applications
+- parameterized SQLite
+- dataframe/statistics/plotting foundations
+- trainable tensors with reverse-mode autograd
+- gradient descent optimizers
+- HMAC/PBKDF2 security primitives
+- LSP completion/hover/definition/references/rename/symbols/formatting
+- 52 Veyra-native packages
 
-    async fn square(n: Int) -> Int {
-        return n * n;
+Example:
+
+    let tensor = import_package("vytensor");
+    let autograd = import_package("vyautograd");
+    let optim = import_package("vyoptim");
+
+    let w = tensor.create([[0]], true);
+    let x = tensor.create([[1],[2],[3],[4]], false);
+    let y = tensor.create([[2],[4],[6],[8]], false);
+
+    let epoch = 0;
+    while epoch < 40 {
+        let pred = tensor.matmul(x, w);
+        let diff = tensor.sub(pred, y);
+        let loss = tensor.mean(tensor.mul(diff, diff));
+        autograd.backward(loss);
+        optim.step(w, 0.05);
+        optim.zero_grad(w);
+        epoch = epoch + 1;
     }
 
-    let a = square(3);
-    let b = square(4);
-    let results = gather([a, b]);
+The default execution path does not require Python.
 
-    class Resource {
-        fn enter(self) -> Resource { return self; }
-        fn exit(self) -> Null { return null; }
-    }
-
-    with Resource() as r {
-        print("managed");
-    }
-
-    try {
-        throw "boom";
-    } catch err {
-        print(err);
-    } finally {
-        print("cleanup");
-    }
-
-Web handlers support route params and query params:
-
-    GET /users/{id}?q=hello
-
-Data helpers include head/tail, filtering, grouping, null handling, inner/left joins, statistics and plotting.
-
-ML helpers include regression/classification foundations plus accuracy, precision, recall, F1 and train/test splitting.
-
-The default Veyra execution path does not require Python.
-
-See STATUS-8-ELEVATION.md, PYTHON-OVERALL-50.md and docs/PACKAGES.md.
+See STATUS-9-ASCENDANT.md, PYTHON-75-TARGET.md and docs/PACKAGES.md.

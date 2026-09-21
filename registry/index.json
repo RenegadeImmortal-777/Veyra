@@ -96,7 +96,7 @@
                                       "source":  "../packages/vycrypto"
                                   },
                      "vysqlite":  {
-                                      "version":  "0.1.0",
+                                      "version":  "0.2.0",
                                       "entry":  "vysqlite.vy",
                                       "source":  "../packages/vysqlite"
                                   },
@@ -221,7 +221,7 @@
                                        "source":  "../packages/vystrings"
                                    },
                      "vyorm":  {
-                                   "version":  "0.1.0",
+                                   "version":  "0.2.0",
                                    "entry":  "vyorm.vy",
                                    "source":  "../packages/vyorm"
                                },
@@ -234,7 +234,32 @@
                                        "version":  "0.1.0",
                                        "entry":  "vyrequest.vy",
                                        "source":  "../packages/vyrequest"
-                                   }
+                                   },
+                     "vytensor":  {
+                                      "version":  "0.1.0",
+                                      "entry":  "vytensor.vy",
+                                      "source":  "../packages/vytensor"
+                                  },
+                     "vyautograd":  {
+                                        "version":  "0.1.0",
+                                        "entry":  "vyautograd.vy",
+                                        "source":  "../packages/vyautograd"
+                                    },
+                     "vyoptim":  {
+                                     "version":  "0.1.0",
+                                     "entry":  "vyoptim.vy",
+                                     "source":  "../packages/vyoptim"
+                                 },
+                     "vynn":  {
+                                  "version":  "0.1.0",
+                                  "entry":  "vynn.vy",
+                                  "source":  "../packages/vynn"
+                              },
+                     "vysecurity":  {
+                                        "version":  "0.1.0",
+                                        "entry":  "vysecurity.vy",
+                                        "source":  "../packages/vysecurity"
+                                    }
                  },
     "registry_version":  1
 }

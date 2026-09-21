@@ -31,7 +31,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 
-const VERSION: &str = "8.0.0-elevation";
+const VERSION: &str = "9.0.0-ascendant";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -960,6 +960,18 @@ fn val_to_json(v: &Val) -> JsonValue {
 }
 
 #[cfg(feature = "native-services")]
+fn val_to_sql_value(v: &Val) -> rusqlite::types::Value {
+    match v {
+        Val::Null => rusqlite::types::Value::Null,
+        Val::Bool(b) => rusqlite::types::Value::Integer(if *b { 1 } else { 0 }),
+        Val::Num(n) if n.fract() == 0.0 => rusqlite::types::Value::Integer(*n as i64),
+        Val::Num(n) => rusqlite::types::Value::Real(*n),
+        Val::Str(s) => rusqlite::types::Value::Text(s.clone()),
+        other => rusqlite::types::Value::Text(other.show()),
+    }
+}
+
+#[cfg(feature = "native-services")]
 fn json_stringify_value(v: &Val) -> Result<String, String> {
     serde_json::to_string(&val_to_json(v)).map_err(|e| e.to_string())
 }
@@ -997,6 +1009,72 @@ fn as_matrix(v: &Val) -> Result<Vec<Vec<f64>>, String> {
         Val::List(rows) => rows.iter().map(as_num_list).collect(),
         _ => Err("expected matrix as List<List<Number>>".into()),
     }
+}
+
+fn hmac_sha256_bytes(key: &[u8], message: &[u8]) -> Vec<u8> {
+    let block_size = 64usize;
+    let mut key_block = vec![0u8; block_size];
+    if key.len() > block_size {
+        let digest = Sha256::digest(key);
+        key_block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = vec![0x36u8; block_size];
+    let mut opad = vec![0x5cu8; block_size];
+    for i in 0..block_size {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(inner_digest);
+    outer.finalize().to_vec()
+}
+
+fn hmac_sha256_hex(key: &str, message: &str) -> String {
+    hmac_sha256_bytes(key.as_bytes(), message.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn pbkdf2_sha256_hex(password: &str, salt: &str, iterations: u32, bytes: usize) -> String {
+    let mut out = vec![];
+    let mut block_index = 1u32;
+    while out.len() < bytes {
+        let mut seed = salt.as_bytes().to_vec();
+        seed.extend_from_slice(&block_index.to_be_bytes());
+        let mut u = hmac_sha256_bytes(password.as_bytes(), &seed);
+        let mut t = u.clone();
+        for _ in 1..iterations.max(1) {
+            u = hmac_sha256_bytes(password.as_bytes(), &u);
+            for (x, y) in t.iter_mut().zip(u.iter()) {
+                *x ^= *y;
+            }
+        }
+        out.extend_from_slice(&t);
+        block_index += 1;
+    }
+    out.truncate(bytes);
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn constant_time_strings_equal(a: &str, b: &str) -> bool {
+    let aa = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut diff = aa.len() ^ bb.len();
+    let max_len = aa.len().max(bb.len());
+    for i in 0..max_len {
+        let x = aa.get(i).copied().unwrap_or(0);
+        let y = bb.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
 }
 
 fn nums_to_val(xs: Vec<f64>) -> Val {
@@ -1259,6 +1337,289 @@ static OBJECT_IDS: AtomicU64 = AtomicU64::new(1);
 static TASK_IDS: AtomicU64 = AtomicU64::new(1);
 static GENERATOR_IDS: AtomicU64 = AtomicU64::new(1);
 static CHANNEL_IDS: AtomicU64 = AtomicU64::new(1);
+static FUNCTION_IDS: AtomicU64 = AtomicU64::new(1);
+static FUNCTION_OBJECTS: OnceLock<Mutex<HashMap<String, FunctionDef>>> = OnceLock::new();
+static TENSOR_IDS: AtomicU64 = AtomicU64::new(1);
+static TENSORS: OnceLock<Mutex<HashMap<u64, TensorData>>> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+enum TensorOp {
+    Leaf,
+    Add(u64, u64),
+    Sub(u64, u64),
+    Mul(u64, u64),
+    Relu(u64),
+    Sum(u64),
+    Mean(u64),
+    MatMul(u64, u64, usize, usize, usize),
+}
+
+#[derive(Clone, Debug)]
+struct TensorData {
+    data: Vec<f64>,
+    shape: Vec<usize>,
+    grad: Vec<f64>,
+    requires_grad: bool,
+    op: TensorOp,
+}
+
+fn tensors() -> &'static Mutex<HashMap<u64, TensorData>> {
+    TENSORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tensor_handle(id: u64, shape: &[usize]) -> Val {
+    Val::Map(vec![
+        (Val::Str("__tensor_id".into()), Val::Num(id as f64)),
+        (
+            Val::Str("shape".into()),
+            Val::List(shape.iter().map(|n| Val::Num(*n as f64)).collect()),
+        ),
+    ])
+}
+
+fn tensor_id(value: &Val) -> Result<u64, String> {
+    let pairs = match value {
+        Val::Map(p) => p,
+        _ => return Err("expected Tensor handle".into()),
+    };
+    for (k, v) in pairs {
+        if *k == Val::Str("__tensor_id".into()) {
+            if let Val::Num(n) = v {
+                return Ok(*n as u64);
+            }
+        }
+    }
+    Err("invalid Tensor handle".into())
+}
+
+fn tensor_from_value(value: &Val, requires_grad: bool) -> Result<Val, String> {
+    let (data, shape) = match value {
+        Val::List(rows) if rows.iter().all(|x| matches!(x, Val::List(_))) => {
+            let matrix = as_matrix(value)?;
+            if matrix.is_empty() {
+                (vec![], vec![0, 0])
+            } else {
+                let cols = matrix[0].len();
+                if matrix.iter().any(|r| r.len() != cols) {
+                    return Err("tensor matrix rows must have equal length".into());
+                }
+                (
+                    matrix.into_iter().flatten().collect(),
+                    vec![rows.len(), cols],
+                )
+            }
+        }
+        Val::List(_) => {
+            let xs = as_num_list(value)?;
+            let n = xs.len();
+            (xs, vec![n])
+        }
+        Val::Num(n) => (vec![*n], vec![]),
+        _ => return Err("tensor expects Number or numeric List".into()),
+    };
+    let id = TENSOR_IDS.fetch_add(1, Ordering::Relaxed);
+    tensors()
+        .lock()
+        .map_err(|_| "tensor registry poisoned")?
+        .insert(
+            id,
+            TensorData {
+                grad: vec![0.0; data.len()],
+                data,
+                shape: shape.clone(),
+                requires_grad,
+                op: TensorOp::Leaf,
+            },
+        );
+    Ok(tensor_handle(id, &shape))
+}
+
+fn tensor_snapshot(id: u64) -> Result<TensorData, String> {
+    tensors()
+        .lock()
+        .map_err(|_| "tensor registry poisoned")?
+        .get(&id)
+        .cloned()
+        .ok_or(format!("unknown tensor {id}"))
+}
+
+fn tensor_store(
+    data: Vec<f64>,
+    shape: Vec<usize>,
+    requires_grad: bool,
+    op: TensorOp,
+) -> Result<Val, String> {
+    let id = TENSOR_IDS.fetch_add(1, Ordering::Relaxed);
+    tensors()
+        .lock()
+        .map_err(|_| "tensor registry poisoned")?
+        .insert(
+            id,
+            TensorData {
+                grad: vec![0.0; data.len()],
+                data,
+                shape: shape.clone(),
+                requires_grad,
+                op,
+            },
+        );
+    Ok(tensor_handle(id, &shape))
+}
+
+fn tensor_topology(id: u64, seen: &mut HashSet<u64>, order: &mut Vec<u64>) -> Result<(), String> {
+    if !seen.insert(id) {
+        return Ok(());
+    }
+    let t = tensor_snapshot(id)?;
+    let parents: Vec<u64> = match t.op {
+        TensorOp::Leaf => vec![],
+        TensorOp::Add(a, b) | TensorOp::Sub(a, b) | TensorOp::Mul(a, b) => vec![a, b],
+        TensorOp::Relu(a) | TensorOp::Sum(a) | TensorOp::Mean(a) => vec![a],
+        TensorOp::MatMul(a, b, _, _, _) => vec![a, b],
+    };
+    for p in parents {
+        tensor_topology(p, seen, order)?;
+    }
+    order.push(id);
+    Ok(())
+}
+
+fn tensor_backward(root: u64) -> Result<(), String> {
+    let root_tensor = tensor_snapshot(root)?;
+    if root_tensor.data.len() != 1 {
+        return Err("backward expects a scalar tensor; use tensor_sum or tensor_mean first".into());
+    }
+    {
+        let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+        for tensor in store.values_mut() {
+            for g in &mut tensor.grad {
+                *g = 0.0;
+            }
+        }
+        let t = store.get_mut(&root).ok_or("unknown tensor")?;
+        t.grad = vec![1.0];
+    }
+    let mut order = vec![];
+    tensor_topology(root, &mut HashSet::new(), &mut order)?;
+    for id in order.into_iter().rev() {
+        let current = tensor_snapshot(id)?;
+        let grad = current.grad.clone();
+        match current.op {
+            TensorOp::Leaf => {}
+            TensorOp::Add(a, b) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                for parent in [a, b] {
+                    if let Some(t) = store.get_mut(&parent) {
+                        if t.requires_grad {
+                            for (dst, src) in t.grad.iter_mut().zip(grad.iter()) {
+                                *dst += *src;
+                            }
+                        }
+                    }
+                }
+            }
+            TensorOp::Sub(a, b) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(grad.iter()) {
+                            *dst += *src;
+                        }
+                    }
+                }
+                if let Some(t) = store.get_mut(&b) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(grad.iter()) {
+                            *dst -= *src;
+                        }
+                    }
+                }
+            }
+            TensorOp::Mul(a, b) => {
+                let left = tensor_snapshot(a)?;
+                let right = tensor_snapshot(b)?;
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            t.grad[i] += grad[i] * right.data[i];
+                        }
+                    }
+                }
+                if let Some(t) = store.get_mut(&b) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            t.grad[i] += grad[i] * left.data[i];
+                        }
+                    }
+                }
+            }
+            TensorOp::Relu(a) => {
+                let parent = tensor_snapshot(a)?;
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for i in 0..t.grad.len() {
+                            t.grad[i] += if parent.data[i] > 0.0 { grad[i] } else { 0.0 };
+                        }
+                    }
+                }
+            }
+            TensorOp::Sum(a) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for dst in &mut t.grad {
+                            *dst += grad[0];
+                        }
+                    }
+                }
+            }
+            TensorOp::Mean(a) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad && !t.grad.is_empty() {
+                        let scale = grad[0] / t.grad.len() as f64;
+                        for dst in &mut t.grad {
+                            *dst += scale;
+                        }
+                    }
+                }
+            }
+            TensorOp::MatMul(a, b, m, k, n) => {
+                let left = tensor_snapshot(a)?;
+                let right = tensor_snapshot(b)?;
+                let mut grad_a = vec![0.0; m * k];
+                let mut grad_b = vec![0.0; k * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        let g = grad[i * n + j];
+                        for p in 0..k {
+                            grad_a[i * k + p] += g * right.data[p * n + j];
+                            grad_b[p * n + j] += g * left.data[i * k + p];
+                        }
+                    }
+                }
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(grad_a) {
+                            *dst += src;
+                        }
+                    }
+                }
+                if let Some(t) = store.get_mut(&b) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(grad_b) {
+                            *dst += src;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 static TASKS: OnceLock<Mutex<HashMap<u64, thread::JoinHandle<Result<Val, String>>>>> =
     OnceLock::new();
 static CHANNELS: OnceLock<Mutex<HashMap<u64, (Sender<Val>, Arc<Mutex<Receiver<Val>>>)>>> =
@@ -1269,6 +1630,47 @@ fn tasks() -> &'static Mutex<HashMap<u64, thread::JoinHandle<Result<Val, String>
 }
 fn channels() -> &'static Mutex<HashMap<u64, (Sender<Val>, Arc<Mutex<Receiver<Val>>>)>> {
     CHANNELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn function_objects() -> &'static Mutex<HashMap<String, FunctionDef>> {
+    FUNCTION_OBJECTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn namespace_module_ops(code: &mut [Op], local_names: &HashSet<String>, prefix: &str) {
+    for op in code {
+        match op {
+            Op::Call(name, _) | Op::FunctionRef(name) => {
+                if local_names.contains(name) {
+                    *name = format!("{prefix}{name}");
+                }
+            }
+            Op::Def(_, _, _, _, nested) => namespace_module_ops(nested, local_names, prefix),
+            Op::DefClass(_, _, methods) => {
+                for (_, _, _, _, nested) in methods {
+                    namespace_module_ops(nested, local_names, prefix);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn export_function_object(def: FunctionDef) -> Result<String, String> {
+    let id = FUNCTION_IDS.fetch_add(1, Ordering::Relaxed);
+    let key = format!("@fn:{id}");
+    function_objects()
+        .lock()
+        .map_err(|_| "function object registry poisoned")?
+        .insert(key.clone(), def);
+    Ok(key)
+}
+
+fn resolve_function_object(name: &str) -> Result<Option<FunctionDef>, String> {
+    Ok(function_objects()
+        .lock()
+        .map_err(|_| "function object registry poisoned")?
+        .get(name)
+        .cloned())
 }
 
 struct LoopCtx {
@@ -2035,11 +2437,13 @@ impl Vm {
             Val::Str(s) | Val::Function(s) => s.clone(),
             _ => return Err("callable must be a function value or function name String".into()),
         };
-        let def = self
-            .funcs
-            .get(&name)
-            .cloned()
-            .ok_or(format!("unknown function '{name}'"))?;
+        let def = if let Some(def) = self.funcs.get(&name).cloned() {
+            def
+        } else if let Some(def) = resolve_function_object(&name)? {
+            def
+        } else {
+            return Err(format!("unknown function '{name}'"));
+        };
         Ok((name, def))
     }
     fn invoke(&self, name: &str, args: Vec<Val>) -> Result<Val, String> {
@@ -2094,7 +2498,10 @@ impl Vm {
                 }
                 Op::Define(n, is_const, ty) => {
                     let v = self.pop()?;
-                    if self.vars.contains_key(&n) {
+                    if self.vars.contains_key(&n) && self.consts.contains(&n) {
+                        return Err(format!("cannot redefine constant '{n}'"));
+                    }
+                    if self.vars.contains_key(&n) && is_const {
                         return Err(format!("name '{n}' already defined"));
                     }
                     if let Some(ref expected) = ty {
@@ -2255,20 +2662,31 @@ impl Vm {
                     }
                     args.reverse();
                     let receiver = self.pop()?;
-                    let id = match receiver {
-                        Val::Object(id) => id,
-                        _ => return Err("method call requires object".into()),
+                    let value = match receiver {
+                        Val::Object(id) => {
+                            let class_name = {
+                                let heap =
+                                    self.objects.lock().map_err(|_| "object heap poisoned")?;
+                                heap.get(&id).ok_or("dangling object")?.class_name.clone()
+                            };
+                            let method = self
+                                .find_method(&class_name, &name)
+                                .ok_or(format!("undefined method '{name}' on {class_name}"))?;
+                            let mut call_args = vec![Val::Object(id)];
+                            call_args.extend(args);
+                            self.call_def(method, call_args)?
+                        }
+                        Val::Map(pairs) => {
+                            let member = pairs
+                                .iter()
+                                .find(|(k, _)| *k == Val::Str(name.clone()))
+                                .map(|(_, v)| v.clone())
+                                .ok_or(format!("undefined module member '{name}'"))?;
+                            let (_, def) = self.callable_def(&member)?;
+                            self.call_def(def, args)?
+                        }
+                        _ => return Err("method call requires object or module map".into()),
                     };
-                    let class_name = {
-                        let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-                        heap.get(&id).ok_or("dangling object")?.class_name.clone()
-                    };
-                    let method = self
-                        .find_method(&class_name, &name)
-                        .ok_or(format!("undefined method '{name}' on {class_name}"))?;
-                    let mut call_args = vec![Val::Object(id)];
-                    call_args.extend(args);
-                    let value = self.call_def(method, call_args)?;
                     self.stack.push(value);
                 }
                 Op::JumpIfFalse(p) => {
@@ -2288,6 +2706,58 @@ impl Vm {
                         "print" => {
                             println!("{}", a.iter().map(Val::show).collect::<Vec<_>>().join(" "));
                             Val::Null
+                        }
+                        "import_package" => {
+                            if a.len() != 1 {
+                                return Err("import_package expects package name".into());
+                            }
+                            let package = match &a[0] {
+                                Val::Str(s) => s.clone(),
+                                _ => return Err("package name must be String".into()),
+                            };
+                            let cwd = env::current_dir().map_err(|e| e.to_string())?;
+                            let root = project_root(&cwd)?;
+                            let manifest: JsonValue = serde_json::from_str(
+                                &fs::read_to_string(root.join("veyra.json"))
+                                    .map_err(|e| e.to_string())?,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            let meta = manifest
+                                .get("packages")
+                                .and_then(|p| p.get(&package))
+                                .ok_or(format!("package '{package}' is not installed"))?;
+                            let entry = meta
+                                .get("entry")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("main.vy");
+                            let path = root.join("vendor").join(&package).join(entry);
+                            let source = load_source(path.to_string_lossy().as_ref())?;
+                            let mut module_vm = Vm::new(compile_source(&source)?);
+                            module_vm.run()?;
+                            let local_names: HashSet<String> =
+                                module_vm.funcs.keys().cloned().collect();
+                            let module_id = FUNCTION_IDS.fetch_add(1, Ordering::Relaxed);
+                            let prefix = format!("@module:{package}:{module_id}:");
+                            let mut exports = vec![];
+                            for (name, mut def) in module_vm.funcs {
+                                namespace_module_ops(&mut def.code, &local_names, &prefix);
+                                for value in def.captures.values_mut() {
+                                    if let Val::Function(target) = value {
+                                        if local_names.contains(target) {
+                                            *target = format!("{prefix}{target}");
+                                        }
+                                    }
+                                }
+                                let qualified = format!("{prefix}{name}");
+                                self.funcs.insert(qualified.clone(), def);
+                                exports.push((Val::Str(name), Val::Function(qualified)));
+                            }
+                            for (name, value) in module_vm.vars {
+                                if !name.starts_with("__") {
+                                    exports.push((Val::Str(name), value));
+                                }
+                            }
+                            Val::Map(exports)
                         }
                         "len" => {
                             if a.len() != 1 {
@@ -3311,6 +3781,190 @@ impl Vm {
                                 _ => return Err("sigmoid expects Number".into()),
                             };
                             Val::Num(1.0 / (1.0 + (-x).exp()))
+                        }
+                        "tensor" => {
+                            if a.is_empty() || a.len() > 2 {
+                                return Err("tensor expects values[,requires_grad]".into());
+                            }
+                            let requires_grad = if a.len() == 2 {
+                                match a[1] {
+                                    Val::Bool(b) => b,
+                                    _ => return Err("requires_grad must be Bool".into()),
+                                }
+                            } else {
+                                false
+                            };
+                            tensor_from_value(&a[0], requires_grad)?
+                        }
+                        "tensor_values" => {
+                            if a.len() != 1 {
+                                return Err("tensor_values expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            nums_to_val(tensor_snapshot(id)?.data)
+                        }
+                        "tensor_shape" => {
+                            if a.len() != 1 {
+                                return Err("tensor_shape expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            Val::List(
+                                tensor_snapshot(id)?
+                                    .shape
+                                    .into_iter()
+                                    .map(|n| Val::Num(n as f64))
+                                    .collect(),
+                            )
+                        }
+                        "tensor_grad" => {
+                            if a.len() != 1 {
+                                return Err("tensor_grad expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            nums_to_val(tensor_snapshot(id)?.grad)
+                        }
+                        "tensor_add" | "tensor_sub" | "tensor_mul" => {
+                            if a.len() != 2 {
+                                return Err(format!("{n} expects two tensors"));
+                            }
+                            let left_id = tensor_id(&a[0])?;
+                            let right_id = tensor_id(&a[1])?;
+                            let left = tensor_snapshot(left_id)?;
+                            let right = tensor_snapshot(right_id)?;
+                            if left.shape != right.shape || left.data.len() != right.data.len() {
+                                return Err("tensor shapes must match".into());
+                            }
+                            let data = match n.as_str() {
+                                "tensor_add" => left
+                                    .data
+                                    .iter()
+                                    .zip(&right.data)
+                                    .map(|(x, y)| x + y)
+                                    .collect(),
+                                "tensor_sub" => left
+                                    .data
+                                    .iter()
+                                    .zip(&right.data)
+                                    .map(|(x, y)| x - y)
+                                    .collect(),
+                                _ => left
+                                    .data
+                                    .iter()
+                                    .zip(&right.data)
+                                    .map(|(x, y)| x * y)
+                                    .collect(),
+                            };
+                            let requires_grad = left.requires_grad || right.requires_grad;
+                            let op = match n.as_str() {
+                                "tensor_add" => TensorOp::Add(left_id, right_id),
+                                "tensor_sub" => TensorOp::Sub(left_id, right_id),
+                                _ => TensorOp::Mul(left_id, right_id),
+                            };
+                            tensor_store(data, left.shape, requires_grad, op)?
+                        }
+                        "tensor_relu" => {
+                            if a.len() != 1 {
+                                return Err("tensor_relu expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let t = tensor_snapshot(id)?;
+                            let data = t.data.iter().map(|x| x.max(0.0)).collect();
+                            tensor_store(data, t.shape, t.requires_grad, TensorOp::Relu(id))?
+                        }
+                        "tensor_sum" | "tensor_mean" => {
+                            if a.len() != 1 {
+                                return Err(format!("{n} expects tensor"));
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let t = tensor_snapshot(id)?;
+                            let sum: f64 = t.data.iter().sum();
+                            let (value, op) = if n == "tensor_mean" {
+                                (
+                                    if t.data.is_empty() {
+                                        0.0
+                                    } else {
+                                        sum / t.data.len() as f64
+                                    },
+                                    TensorOp::Mean(id),
+                                )
+                            } else {
+                                (sum, TensorOp::Sum(id))
+                            };
+                            tensor_store(vec![value], vec![], t.requires_grad, op)?
+                        }
+                        "tensor_matmul" => {
+                            if a.len() != 2 {
+                                return Err("tensor_matmul expects two tensors".into());
+                            }
+                            let left_id = tensor_id(&a[0])?;
+                            let right_id = tensor_id(&a[1])?;
+                            let left = tensor_snapshot(left_id)?;
+                            let right = tensor_snapshot(right_id)?;
+                            if left.shape.len() != 2 || right.shape.len() != 2 {
+                                return Err("tensor_matmul expects 2D tensors".into());
+                            }
+                            let (m, k) = (left.shape[0], left.shape[1]);
+                            let (k2, ncols) = (right.shape[0], right.shape[1]);
+                            if k != k2 {
+                                return Err("tensor_matmul shape mismatch".into());
+                            }
+                            let mut out = vec![0.0; m * ncols];
+                            for i in 0..m {
+                                for j in 0..ncols {
+                                    let mut s = 0.0;
+                                    for p in 0..k {
+                                        s += left.data[i * k + p] * right.data[p * ncols + j];
+                                    }
+                                    out[i * ncols + j] = s;
+                                }
+                            }
+                            tensor_store(
+                                out,
+                                vec![m, ncols],
+                                left.requires_grad || right.requires_grad,
+                                TensorOp::MatMul(left_id, right_id, m, k, ncols),
+                            )?
+                        }
+                        "tensor_backward" => {
+                            if a.len() != 1 {
+                                return Err("tensor_backward expects scalar tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            tensor_backward(id)?;
+                            Val::Null
+                        }
+                        "tensor_step" => {
+                            if a.len() != 2 {
+                                return Err("tensor_step expects tensor,learning_rate".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let lr = match a[1] {
+                                Val::Num(n) => n,
+                                _ => return Err("learning_rate must be Number".into()),
+                            };
+                            let mut store =
+                                tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                            let t = store.get_mut(&id).ok_or("unknown tensor")?;
+                            if !t.requires_grad {
+                                return Err("tensor_step requires trainable tensor".into());
+                            }
+                            for i in 0..t.data.len() {
+                                t.data[i] -= lr * t.grad[i];
+                            }
+                            Val::Null
+                        }
+                        "tensor_zero_grad" => {
+                            if a.len() != 1 {
+                                return Err("tensor_zero_grad expects tensor".into());
+                            }
+                            let id = tensor_id(&a[0])?;
+                            let mut store =
+                                tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                            let t = store.get_mut(&id).ok_or("unknown tensor")?;
+                            for g in &mut t.grad {
+                                *g = 0.0;
+                            }
+                            Val::Null
                         }
                         "accuracy_score" => {
                             if a.len() != 2 {
@@ -4998,6 +5652,58 @@ impl Vm {
                             h.update(a[0].show().as_bytes());
                             Val::Str(format!("{:x}", h.finalize()))
                         }
+                        "hmac_sha256" => {
+                            if a.len() != 2 {
+                                return Err("hmac_sha256 expects key,message".into());
+                            }
+                            let key = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("key must be String".into()),
+                            };
+                            let message = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("message must be String".into()),
+                            };
+                            Val::Str(hmac_sha256_hex(key, message))
+                        }
+                        "pbkdf2_sha256" => {
+                            if a.len() != 4 {
+                                return Err(
+                                    "pbkdf2_sha256 expects password,salt,iterations,bytes".into()
+                                );
+                            }
+                            let password = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("password must be String".into()),
+                            };
+                            let salt = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("salt must be String".into()),
+                            };
+                            let iterations = match a[2] {
+                                Val::Num(n) => n.max(1.0) as u32,
+                                _ => return Err("iterations must be Number".into()),
+                            };
+                            let bytes = match a[3] {
+                                Val::Num(n) => n.max(1.0) as usize,
+                                _ => return Err("bytes must be Number".into()),
+                            };
+                            Val::Str(pbkdf2_sha256_hex(password, salt, iterations, bytes))
+                        }
+                        "constant_time_equal" => {
+                            if a.len() != 2 {
+                                return Err("constant_time_equal expects two strings".into());
+                            }
+                            let left = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("left must be String".into()),
+                            };
+                            let right = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("right must be String".into()),
+                            };
+                            Val::Bool(constant_time_strings_equal(left, right))
+                        }
                         "shell" => {
                             if a.len() != 1 {
                                 return Err("shell expects command".into());
@@ -5181,6 +5887,82 @@ impl Vm {
                                 stmt.column_names().iter().map(|s| s.to_string()).collect();
                             let rows = stmt
                                 .query_map([], |row| {
+                                    let mut pairs = Vec::new();
+                                    for (i, name) in names.iter().enumerate() {
+                                        let val = match row.get_ref(i)? {
+                                            rusqlite::types::ValueRef::Null => Val::Null,
+                                            rusqlite::types::ValueRef::Integer(x) => {
+                                                Val::Num(x as f64)
+                                            }
+                                            rusqlite::types::ValueRef::Real(x) => Val::Num(x),
+                                            rusqlite::types::ValueRef::Text(x) => {
+                                                Val::Str(String::from_utf8_lossy(x).to_string())
+                                            }
+                                            rusqlite::types::ValueRef::Blob(x) => {
+                                                Val::Str(format!("<{} bytes>", x.len()))
+                                            }
+                                        };
+                                        pairs.push((Val::Str(name.clone()), val));
+                                    }
+                                    Ok(Val::Map(pairs))
+                                })
+                                .map_err(|e| e.to_string())?;
+                            let mut out = Vec::new();
+                            for row in rows {
+                                out.push(row.map_err(|e| e.to_string())?);
+                            }
+                            Val::List(out)
+                        }
+                        #[cfg(feature = "native-services")]
+                        "sqlite_exec_params" => {
+                            if a.len() != 3 {
+                                return Err("sqlite_exec_params expects path,sql,params".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let sql = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("sql must be String".into()),
+                            };
+                            let params = match &a[2] {
+                                Val::List(v) => v,
+                                _ => return Err("params must be List".into()),
+                            };
+                            let values: Vec<rusqlite::types::Value> =
+                                params.iter().map(val_to_sql_value).collect();
+                            let conn = Connection::open(path).map_err(|e| e.to_string())?;
+                            let n = conn
+                                .execute(sql, rusqlite::params_from_iter(values.iter()))
+                                .map_err(|e| e.to_string())?;
+                            Val::Num(n as f64)
+                        }
+                        #[cfg(feature = "native-services")]
+                        "sqlite_query_params" => {
+                            if a.len() != 3 {
+                                return Err("sqlite_query_params expects path,sql,params".into());
+                            }
+                            let path = match &a[0] {
+                                Val::Str(s) => s,
+                                _ => return Err("path must be String".into()),
+                            };
+                            let sql = match &a[1] {
+                                Val::Str(s) => s,
+                                _ => return Err("sql must be String".into()),
+                            };
+                            let params = match &a[2] {
+                                Val::List(v) => v,
+                                _ => return Err("params must be List".into()),
+                            };
+                            let values: Vec<rusqlite::types::Value> =
+                                params.iter().map(val_to_sql_value).collect();
+                            let conn = Connection::open(path).map_err(|e| e.to_string())?;
+                            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+                            let names: Vec<String> =
+                                stmt.column_names().iter().map(|s| s.to_string()).collect();
+                            let rows = stmt
+                                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
                                     let mut pairs = Vec::new();
                                     for (i, name) in names.iter().enumerate() {
                                         let val = match row.get_ref(i)? {
@@ -5585,11 +6367,13 @@ impl Vm {
                             if self.classes.contains_key(&n) {
                                 self.instantiate(&n, a)?
                             } else if let Some(Val::Function(target)) = self.vars.get(&n).cloned() {
-                                let def = self
-                                    .funcs
-                                    .get(&target)
-                                    .cloned()
-                                    .ok_or(format!("dangling function reference '{target}'"))?;
+                                let def = if let Some(def) = self.funcs.get(&target).cloned() {
+                                    def
+                                } else if let Some(def) = resolve_function_object(&target)? {
+                                    def
+                                } else {
+                                    return Err(format!("dangling function reference '{target}'"));
+                                };
                                 self.call_def(def, a)?
                             } else {
                                 let def = self
@@ -5604,10 +6388,13 @@ impl Vm {
                     self.stack.push(v);
                 }
                 Op::FunctionRef(name) => {
-                    if !self.funcs.contains_key(&name) {
-                        return Err(format!("unknown function reference '{name}'"));
-                    }
-                    self.stack.push(Val::Function(name));
+                    let def = self
+                        .funcs
+                        .get(&name)
+                        .cloned()
+                        .ok_or(format!("unknown function reference '{name}'"))?;
+                    let key = export_function_object(def)?;
+                    self.stack.push(Val::Function(key));
                 }
                 Op::Def(name, params, return_type, is_async, code) => {
                     self.funcs.insert(
@@ -6416,6 +7203,34 @@ fn lsp_references(text: &str, uri: &str, word: &str) -> JsonValue {
     JsonValue::Array(refs)
 }
 
+fn lsp_rename(text: &str, uri: &str, word: &str, new_name: &str) -> JsonValue {
+    if word.is_empty()
+        || new_name.is_empty()
+        || !new_name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit()))
+    {
+        return JsonValue::Null;
+    }
+    let refs = lsp_references(text, uri, word);
+    let edits = refs
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|location| {
+            location.get("range").cloned().map(|range| {
+                serde_json::json!({
+                    "range": range,
+                    "newText": new_name
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"changes": {uri: edits}})
+}
+
 fn lsp_server() -> Result<(), String> {
     let (connection, io_threads) = lsp_server::Connection::stdio();
     let (initialize_id, _) = connection.initialize_start().map_err(|e| e.to_string())?;
@@ -6426,6 +7241,7 @@ fn lsp_server() -> Result<(), String> {
             "hoverProvider": true,
             "definitionProvider": true,
             "referencesProvider": true,
+            "renameProvider": true,
             "documentSymbolProvider": true,
             "documentFormattingProvider": true
         },
@@ -6517,6 +7333,31 @@ fn lsp_server() -> Result<(), String> {
                         let text = documents.get(uri).cloned().unwrap_or_default();
                         let word = lsp_word_at(&text, line, character);
                         lsp_references(&text, uri, &word)
+                    }
+                    "textDocument/rename" => {
+                        let uri = request
+                            .params
+                            .pointer("/textDocument/uri")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        let line = request
+                            .params
+                            .pointer("/position/line")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0) as usize;
+                        let character = request
+                            .params
+                            .pointer("/position/character")
+                            .and_then(JsonValue::as_u64)
+                            .unwrap_or(0) as usize;
+                        let new_name = request
+                            .params
+                            .get("newName")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        let text = documents.get(uri).cloned().unwrap_or_default();
+                        let word = lsp_word_at(&text, line, character);
+                        lsp_rename(&text, uri, &word, new_name)
                     }
                     "textDocument/documentSymbol" => {
                         let uri = request
@@ -7841,6 +8682,30 @@ mod tests {
         assert!(run_source(src).is_ok());
     }
     #[test]
+    fn escaping_closure_objects() {
+        let src = "fn twice_result(f:Function)->Function{return fn(x:Int)->Int{return f(x)*2;};} @twice_result fn plus_one(x:Int)->Int{return x+1;} fn make_adder(offset:Int)->Function{return fn(x:Int)->Int{return x+offset;};} let add7=make_adder(7); assert(plus_one(4)==10); assert(add7(5)==12);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn module_map_dispatch() {
+        let mut vm = Vm::new(compile_source("fn plus_one(x:Int)->Int{return x+1;}").unwrap());
+        vm.run().unwrap();
+        let def = vm.funcs.get("plus_one").unwrap().clone();
+        let key = export_function_object(def).unwrap();
+        let module = Val::Map(vec![(Val::Str("plus".into()), Val::Function(key))]);
+        let mut caller = Vm::new(vec![
+            Op::Load("module".into()),
+            Op::Const(Val::Num(4.0)),
+            Op::CallMethod("plus".into(), 1),
+            Op::Const(Val::Num(5.0)),
+            Op::Eq,
+            Op::Call("assert".into(), 1),
+            Op::Halt,
+        ]);
+        caller.vars.insert("module".into(), module);
+        assert!(caller.run().is_ok());
+    }
+    #[test]
     fn ml_metrics_and_split() {
         let src = "let m=classification_metrics([1,0,1,1],[1,0,0,1]); assert(m[\"accuracy\"]==0.75); assert(m[\"precision\"]==1); let s=train_test_split([1,2,3,4],[10,20,30,40],0.25); assert(len(s[\"train_x\"])==3); assert(len(s[\"test_x\"])==1);";
         assert!(run_source(src).is_ok());
@@ -7859,5 +8724,43 @@ mod tests {
     fn dataframe_extended_helpers() {
         let src = "let rows=[{\"id\":1,\"x\":1},{\"id\":2,\"x\":null},{\"id\":3,\"x\":3}]; let h=table_head(rows,2); let t=table_tail(rows,1); assert(len(h)==2); assert(t[0][\"id\"]==3); let d=table_drop_nulls(rows,\"x\"); assert(len(d)==2); let f=table_fill_null(rows,\"x\",9); assert(f[1][\"x\"]==9); let joined=table_left_join(rows,[{\"rid\":1,\"name\":\"a\"}],\"id\",\"rid\"); assert(len(joined)==3);";
         assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn tensor_autograd_and_training() {
+        let src = "let x=tensor([[1],[2],[3],[4]],false); let y=tensor([[2],[4],[6],[8]],false); let w=tensor([[0]],true); let epoch=0; while epoch<40 { let pred=tensor_matmul(x,w); let diff=tensor_sub(pred,y); let sq=tensor_mul(diff,diff); let loss=tensor_mean(sq); tensor_backward(loss); tensor_step(w,0.05); tensor_zero_grad(w); epoch=epoch+1; } let trained=tensor_values(w); assert(trained[0]>1.9 and trained[0]<2.1);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn loop_local_declaration_reinitializes() {
+        let src = "let i=0; let total=0; while i<3 { let local=i+1; total=total+local; i=i+1; } assert(total==6);";
+        assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn lsp_rename_helper() {
+        let src = "fn add(x:Int)->Int{return x+1;} let a=add(1); let b=add(a);";
+        let edit = lsp_rename(src, "file:///test.vy", "add", "increment");
+        let changes = edit
+            .get("changes")
+            .and_then(|x| x.get("file:///test.vy"))
+            .and_then(JsonValue::as_array)
+            .map(|x| x.len())
+            .unwrap_or(0);
+        assert!(changes >= 3);
+    }
+    #[test]
+    fn security_primitives() {
+        let src = "let mac=hmac_sha256(\"key\",\"message\"); assert(len(mac)==64); let derived=pbkdf2_sha256(\"password\",\"salt\",100,32); assert(len(derived)==64); assert(constant_time_equal(mac,mac)); assert(not constant_time_equal(mac,derived));";
+        assert!(run_source(src).is_ok());
+    }
+    #[cfg(feature = "native-services")]
+    #[test]
+    fn sqlite_parameter_binding() {
+        let db = env::temp_dir().join("veyra_params_test.sqlite");
+        let escaped = db.to_string_lossy().replace('\\', "\\\\");
+        let src = format!(
+            "sqlite_exec(\"{escaped}\",\"CREATE TABLE IF NOT EXISTS items(id INTEGER,name TEXT)\"); sqlite_exec(\"{escaped}\",\"DELETE FROM items\"); sqlite_exec_params(\"{escaped}\",\"INSERT INTO items(id,name) VALUES (?,?)\",[7,\"veyra\"]); let rows=sqlite_query_params(\"{escaped}\",\"SELECT id,name FROM items WHERE id=?\",[7]); assert(len(rows)==1); assert(rows[0][\"name\"]==\"veyra\");"
+        );
+        assert!(run_source(&src).is_ok());
+        let _ = fs::remove_file(db);
     }
 }
