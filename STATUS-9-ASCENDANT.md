@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Veyra 9.0 Ascendant
 
 Ascendant is the post-Elevation release focused on architecture depth rather than surface syntax.

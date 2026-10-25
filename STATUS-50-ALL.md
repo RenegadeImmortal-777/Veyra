@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Veyra 5.0 Frontier — 50%-Class Practical Capability Milestone
 
 This document uses "50%" as a practical capability threshold within each engineering category previously tracked. It does NOT mean Veyra has 50% of Python's package count, community, production history, research ecosystem, or total implementation complexity.

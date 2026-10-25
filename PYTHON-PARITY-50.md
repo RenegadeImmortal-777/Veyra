@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Veyra vs Python — Meridian 50% Technical Milestone
 
 ## What "50%" means

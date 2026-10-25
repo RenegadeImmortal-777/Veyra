@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Python Overall 50% Milestone
 
 Using the same broad comparison denominator:

@@ -6,3 +6,5 @@ tests/__pycache__/
 dist/
 .veyra/
 *.vyc
+
+gate-report.txt

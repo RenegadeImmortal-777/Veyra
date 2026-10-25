@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Python 75% Target
 
 The 75% target is split into two measurements.

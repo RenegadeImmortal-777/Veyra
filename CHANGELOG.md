@@ -1,0 +1,231 @@
+# Changelog
+
+Consolidated release history for Veyra, distilled from the milestone documents that
+previously each lived in their own root-level file. Those files are retained for
+provenance and are marked historical.
+
+Two execution paths exist in this repository and are tracked separately below:
+
+- **Native Horizon engine** — the Rust compiler/VM in `engine-rs/`, shipped as
+  `bin/veyra-native.exe`. This is the default path.
+- **Convergence runtime** — the Python compatibility layer (`veyra.py`,
+  `veyra_cli.py`). This is the legacy/interop path and the one that exposes
+  `py_import`.
+
+Release numbering below follows the native engine. Only Zenith and Nexus record a
+release date in the source material; earlier entries are undated.
+
+---
+
+## 11.0 Nexus
+
+Ecosystem-focused successor to Zenith. Release gate reported **2026-09-21**.
+
+- Registry expanded 52 → **60 native packages**; added vyarray, vyvalidate, vyauth,
+  vyquery, vyserde, vyetl, vymodel, vyapi.
+- Hosted registry support via `VEYRA_REGISTRY_URL`, with HTTP download for
+  single-file and multi-file packages.
+- Recursive package dependencies with cycle protection, plus path-traversal
+  protection on downloaded files. Local/offline registry remains the default.
+- Lockfile SHA-256 integrity auditing remains mandatory.
+- Tensor stack: division with reverse-mode gradients, negation, scalar power,
+  numerically stable row-wise softmax (1D/2D) with gradients, `detach`, `numel`.
+- Persistent Adam optimizer state with bias correction and reset.
+- Web runtime: app handlers receive request headers and may return arbitrary
+  response headers (cookies, CORS, cache control, authorization, request IDs).
+- LSP and VS Code completion surfaces extended for the new tensor and task APIs.
+- New ecosystem release gate covering hosted registry fetch, recursive dependency
+  install, compile/execute of downloaded packages, lockfile audit, request-header
+  delivery and custom response headers over real HTTP.
+
+Reported gate result: fmt, 57/57 tests, portable-core check, clippy with warnings
+denied, release build, 60/60 package matrix, hosted-registry gate, remote run with
+SHA-256 audit, HTTP header gate, installed CLI `11.0.0-nexus`, installed extension
+`veyra.veyra-language@11.0.0`, package tamper detection and restore.
+
+Independently re-verified **2026-10-10** with `cargo`/`rustc` 1.93.1 on Windows at
+git `d92996b`: all eight gates in `scripts/gate-report.ps1` pass — fmt, 57/57 tests,
+portable-core check, clippy with warnings denied, release build, 60/60 package
+matrix, ecosystem gate and release check. The installed-CLI and extension-version
+checks in the list above were not part of that re-run. See [STATUS.md](STATUS.md).
+
+## 10.0 Zenith
+
+Declared the Veyra 10 engineered roadmap complete. Release gate reported **2026-09-21**.
+
+- Typed functions, recursion, closures, escaping function objects.
+- Classes, inheritance, runtime type enforcement.
+- Lists, maps, sets, tuples, comprehensions, general iteration.
+- Generators, decorators, `match`/`case`, structured exceptions.
+- `with`/`as` and `finally` cleanup semantics.
+- Async functions, native tasks, `gather`, channels, timeout-aware waits,
+  runtime task status inspection.
+- C ABI FFI; package namespaces via `import_package()`.
+- Services: filesystem, paths, processes, environment, platform introspection,
+  JSON, TOML, CSV, Base64, UUID, date/time.
+- HTTP clients plus static, routed and dynamic application servers.
+- SQLite with parameter binding and ORM foundations.
+- Security: SHA-256, HMAC-SHA256, PBKDF2, constant-time equality.
+- Dataframe transforms, joins, grouping, null handling, summaries.
+- N-dimensional tensor handles with reverse-mode autograd, trainable parameters,
+  gradient descent, `zero_grad`, serialization/loading without Python.
+- Native LSP: completion, hover, definitions, references, rename, symbols,
+  formatting, diagnostics.
+- 52-package native registry; Windows/Linux/macOS CI; tagged release workflow with
+  staged platform bundles and SHA-256 manifests; portable-core build gate.
+
+The "100%" label in the original document applies to this repository's own roadmap
+and gates, not to Python/C/JavaScript ecosystem size, age or adoption.
+
+## 9.0 Ascendant
+
+Depth-focused release rather than surface syntax.
+
+- Escaping closures became real exported callable objects; decorators can return
+  newly created nested closures that outlive the creating VM.
+- Runtime package namespaces via `import_package("name")` returning isolated module
+  objects; namespaced method dispatch prevents global symbol collisions.
+- Native tensor runtime with shapes, values and trainable parameters; reverse-mode
+  autograd for add/sub/mul/ReLU/sum/mean/matmul; verified matmul gradients;
+  gradient-descent updates and `zero_grad`; full tiny-model training inside Veyra.
+- Parameterized SQLite exec/query primitives; ORM packages upgraded for bound
+  parameters.
+- HMAC-SHA256, PBKDF2-SHA256, constant-time equality.
+- Native LSP rename support.
+- Fixed loop re-execution of non-const local declarations.
+- Registry expanded to 52 packages.
+
+Reported quality gates: 52/52 regression tests, 52/52 packages install/import/check,
+fmt, portable-core check, clippy with warnings denied.
+
+## 8.0 Elevation
+
+First release aimed at a defensible ~50%-overall comparison, with ecosystem maturity
+reported separately.
+
+- `async fn` and async methods; `await` + `gather`.
+- `with`/`as` context management; decorator syntax; `try`/`catch`/`finally`.
+- Parameterized web routes and query parameters; request/response helpers in vyweb.
+- Dataframe head/tail, drop/fill nulls, left joins.
+- ML workflow metrics: accuracy, precision, recall, F1, confusion counts,
+  train/test split.
+- Expanded path/text services.
+- 47 native packages; package-matrix automation on Windows and POSIX; generated
+  package index documentation.
+
+Reported gates: 45/45 tests, 47/47 packages, fmt, portable-core check, clippy,
+live parameterized routing, package integrity hashing, Python-independent execution.
+
+## 7.0 Meridian
+
+First release to claim the ~50%-class technical threshold.
+
+- Generators (`yield`, `next`, completion checks, collect) usable in `for`-`in`.
+- First-class lambdas and named function values; `map`/`filter`/`reduce` accept
+  Function values.
+- List comprehensions with optional `if` filtering; `match`/`case` with wildcard.
+- Generic HTTP `request(method, url, headers, body, timeout)`.
+- Platform introspection (OS, architecture, family, path separator).
+- TOML parse/stringify; UTC/local datetime helpers; Base64; UUID v4;
+  regex match/replace/split; set union/intersection/difference.
+- Determinant, inverse, linear-system solving; grouped data sum/mean; histogram,
+  scatter and bar visualization.
+- CLI: `run`/`check`/`lint`/`fmt`/`test`/`build`/`repl`/`disasm`,
+  `ast`/`symbols`/`debug`, `bench`/`profile`/`doc`,
+  `registry`/`add`/`remove`/`install`/`publish`/`audit`, `serve`/`web`/`app`, `lsp`.
+- LSP: document sync, diagnostics, completion, hover, symbols, formatting,
+  go-to-definition, references.
+- 30 native packages with a fresh-project add/import/check matrix; content-hashed
+  lockfiles; tamper-detecting audit.
+- Feature-gated native services; cross-platform CI matrix (Windows, Ubuntu, macOS).
+  38 native unit/regression tests.
+
+Platform readiness in this release is build readiness, not certification on physical
+Linux/macOS/ARM hardware.
+
+## 6.0 Apex
+
+- Native classes, inheritance, constructors, fields, bound methods,
+  reference-semantic objects.
+- Runtime-enforced type annotations for variables, assignments, parameters, returns
+  and user-defined class types.
+- Lexical semantic checking for undefined names and duplicate declarations;
+  lexical captures for nested functions.
+- `try`/`catch`/`throw`; general iteration over lists and strings; `break`/`continue`.
+- Native `await` over Veyra tasks; background tasks via `spawn`/`task_done`/
+  `await_task`; message-passing channels.
+- Direct C ABI dynamic-library calls for i32/i64/f64; CPU-count and sleep primitives.
+- Static, routed and dynamic web applications; stateful objects across requests;
+  native HTTP GET/POST.
+- SQLite, JSON, regex, files, environment, subprocess, SHA-256, GUI services.
+- Vectors and matrices; mean/variance/stddev/median/percentile/covariance/
+  correlation; CSV and row-map tables; column/filter/describe/group/sort/select/
+  inner-join; SVG plotting; linear and logistic regression, k-NN, k-means,
+  normalization, dense inference, ReLU, sigmoid, softmax, MSE.
+- Toolchain: `new`/`run`/`check`/`fmt`/`test`/`build`/`disasm`/`repl`, `lint`/`bench`/
+  `profile`/`doc`, registry search/add/remove/install/publish, content-hashed
+  lockfiles, package-integrity audit.
+- 30 tests covering legacy runtime behavior plus classes, inheritance, exceptions,
+  lexical captures, type enforcement, FFI, tasks, channels, `await`, functional
+  collections, and science/data/ML services.
+
+## 5.0 Frontier
+
+The 50%-class practical capability milestone, measured per category.
+
+- Core language/runtime ~75%, project/tooling ~70%, standard services ~65%,
+  data/scientific ~55%, AI/ML ~50% (introductory foundation), web ~50%
+  (small-app/server foundation), GUI ~50% (utility dialogs, not a widget toolkit),
+  database ~55%, package ecosystem ~55% (infrastructure, not catalogue size).
+- Seeded packages: vymath, vystats, vyalgo, vycollections, vytext, vytest, vyhello,
+  vyscience, vyml, vydata, vyplot, vyweb, vygui.
+
+## 4.0 Sovereign
+
+The 50% independent-ecosystem milestone: roughly half of the previously
+Python-dependent platform categories gained a usable Veyra-owned path.
+
+- Native Windows executable, lexer/parser/AST, bytecode compiler, stack VM,
+  user functions and recursion, constants, control flow, lists, maps, indexing,
+  module loading.
+- Standard services independent of Python: JSON, regex, text/math utilities,
+  files/directories/paths, environment, subprocesses, HTTP GET, random/time,
+  SHA-256, SQLite.
+- Project tooling: creation, manifests, checking, formatting, test runner,
+  distribution builds, disassembly, REPL.
+- Package ecosystem: Veyra-owned registry, search/list, add/remove, vendoring,
+  lockfiles, restore/install, local publishing, package-name module resolution,
+  seven seeded packages.
+- Editor path switched to the native executable rather than Python.
+
+Verified by running a built distribution with Python absent from `PATH`:
+`Veyra 4.0.0-sovereign`, native package checks passing, `ECOSYSTEM_OK`, exit 0. The
+package lifecycle was verified end to end (publish → search → add → use by name →
+run → delete vendor → restore → run → build).
+
+## Convergence runtime (Python path)
+
+The Python compatibility layer carries its own version string, currently
+`3.2.0-convergence`, in both `veyra.py` and `veyra_cli.py`. `veyra_cli.py` imports
+`veyra` explicitly as `legacy` and shells out to `bin/veyra-native.exe` for native
+commands.
+
+Measurements recorded against this path while it was the primary runtime:
+
+- **90%-practical milestone** — general scripting, typed functions and recursion,
+  OOP, structured exceptions, core collections, filesystem/environment, JSON and
+  regex, HTTP clients, SQLite and database access, thread-pool tasks and concurrent
+  mapping, plus scientific, AI/ML, web, image and native-extension ecosystems
+  reached through `py_import`; isolated project environments; dependency
+  add/remove/list/install/lock/audit; formatter, linter, semantic checker, tests,
+  benchmark, profiler, trace; API documentation; REPL; VS Code support.
+- **Python parity 50%** and **Python overall 50%** — split scoring that separates
+  engineered technical capability from whole-ecosystem comparison.
+- **Python 75% target** — Ascendant-era position of roughly 78–82% on engineered
+  technical capability, with the explicit caveat that this is not 75% of the entire
+  Python world.
+
+All of these documents consistently exclude ecosystem-scale dimensions (PyPI
+package count, users, maintainers, production history, documentation volume,
+research adoption, commercial support) from their technical scores, and report them
+separately as still far below Python.

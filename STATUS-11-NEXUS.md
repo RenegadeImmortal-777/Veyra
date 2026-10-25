@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Veyra 11.0 Nexus
 
 Nexus is the ecosystem-focused successor to Veyra 10 Zenith.

@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Veyra 10.0 Zenith — Engineered Roadmap 100%
 
 Zenith closes the defined Veyra 10 engineered roadmap for this repository. The 100% label applies to the roadmap and release gates owned by this project, not to the size, age, adoption or third-party ecosystem of Python, C, JavaScript or other mature platforms.

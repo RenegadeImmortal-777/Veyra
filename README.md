@@ -47,4 +47,6 @@ Example:
 
 The default execution path does not require Python.
 
-See STATUS-11-NEXUS.md, docs/REMOTE-REGISTRY.md and docs/PACKAGES.md.
+See [STATUS.md](STATUS.md) for the current release state and known gaps,
+[CHANGELOG.md](CHANGELOG.md) for release history, and docs/REMOTE-REGISTRY.md and
+docs/PACKAGES.md for package details.

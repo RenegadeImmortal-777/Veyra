@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Veyra 8.0 Elevation
 
 Veyra 8.0 Elevation is the first release aimed at a defensible ~50%-overall comparison against Python-in-its-entirety, while keeping ecosystem/community maturity explicitly separate from compiler/runtime capability.

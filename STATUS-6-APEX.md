@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Veyra 6.0 Apex
 
 Veyra 6.0 Apex advances the native Rust compiler/bytecode VM beyond Frontier with a substantially deeper language and application platform.

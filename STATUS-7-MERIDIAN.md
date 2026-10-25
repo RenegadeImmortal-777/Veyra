@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Veyra 7.0 Meridian
 
 Veyra 7.0 Meridian is the 50%-class technical-platform milestone.

@@ -1,3 +1,6 @@
+> **Historical record.** Superseded by [STATUS.md](STATUS.md) and
+> [CHANGELOG.md](CHANGELOG.md). Retained for provenance.
+
 # Veyra 50% Independent Ecosystem Milestone
 
 "50%" here means roughly half of the practical platform categories we previously relied on Python for now have a usable Veyra-owned/native path. It does not mean Veyra has half as many packages, users, maintainers or years of production history as Python.
