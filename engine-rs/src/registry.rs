@@ -12,9 +12,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
 use crate::VERSION;
-use crate::copy_dir_all;
-use crate::project_root;
-use crate::veyra_home;
+use crate::project::{copy_dir_all, project_root, veyra_home};
 
 pub(crate) fn pkg_index() -> Result<(PathBuf, JsonValue), String> {
     if let Ok(url) = env::var("VEYRA_REGISTRY_URL") {

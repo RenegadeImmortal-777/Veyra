@@ -9,10 +9,10 @@ use serde_json::Value as JsonValue;
 
 use crate::VERSION;
 use crate::ast::Stmt;
-use crate::fmt_source;
 use crate::lexer::lex;
 use crate::parser::Parser;
 use crate::pipeline::semantic_check_ast;
+use crate::project::fmt_source;
 
 pub(crate) fn lsp_word_at(text: &str, line: usize, character: usize) -> String {
     let Some(line_text) = text.lines().nth(line) else {

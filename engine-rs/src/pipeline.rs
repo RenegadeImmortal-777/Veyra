@@ -14,7 +14,7 @@ use crate::bytecode::Op;
 use crate::compiler::Compiler;
 use crate::lexer::lex;
 use crate::parser::Parser;
-use crate::project_root;
+use crate::project::project_root;
 use crate::vm::Vm;
 
 pub(crate) fn load_source(path: &str) -> Result<String, String> {
