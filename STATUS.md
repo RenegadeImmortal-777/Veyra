@@ -59,10 +59,36 @@ packages on real hardware. It does **not** extend to the installer and extension
 version checks listed in the original Nexus record, and it does not cover Linux,
 macOS or ARM, which remain CI-build-only.
 
-Confirmed separately by inspection: 60 directories under `packages/`, the 9,495-line
-engine source file, `bin/veyra-native.exe`, the 11.0.0 extension bundle, and build
-output directories for `debug`, `release`, `aarch64-pc-windows-msvc` and
-`x86_64-unknown-linux-gnu`.
+Confirmed separately by inspection: 60 directories under `packages/`, the engine
+source (now `main.rs` plus `lexer.rs` — see [docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md)),
+`bin/veyra-native.exe`, the 11.0.0 extension bundle, and build output directories for
+`debug`, `release`, `aarch64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`.
+
+### Toolchain regression (2026-10-25)
+
+The gates can no longer be run on this machine. The MSVC link toolchain is
+incomplete: `Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231`
+contains `include` but no `bin` or `lib`, `Windows Kits/10/Lib` is empty, and
+`vswhere -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64` reports no
+installation. `link.exe` on `PATH` resolves to Git's GNU `link`, which fails with
+`missing operand`.
+
+What still works, and was run on 2026-10-25 at commit `b187e32`:
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --check` | PASS |
+| `cargo check --all-targets --all-features` | PASS |
+| `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
+
+What cannot run until the toolchain is repaired: `cargo test`, `cargo build`,
+`cargo build --release`, and therefore `package-matrix.ps1`, `ecosystem-gate.ps1`
+and `release-check.ps1`. The existing `target/release/veyra.exe` still runs, but it
+was linked on 2026-09-21 and does not include any change made since.
+
+This does not invalidate the 2026-10-10 table: those gates genuinely passed. It does
+mean the test suite is currently unavailable as a safety net, which is a hard
+constraint on any refactor until it is fixed.
 
 ### Re-running the gates
 
