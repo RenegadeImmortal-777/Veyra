@@ -65,7 +65,11 @@ clean. `scripts/gate-report.ps1 -Quick` runs the Rust half of that.
 
 Extract in dependency order, test after each module:
 
-1. `lexer.rs` — `Tok`, `lex`
+1. `lexer.rs` — `Tok`, `lex` — **done 2026-10-25**, verified by `cargo fmt --check`,
+   `cargo check --all-targets --all-features` and `clippy -D warnings` only. The test
+   suite could not run: the MSVC link toolchain on this machine is incomplete (see
+   [../STATUS.md](../STATUS.md), "Toolchain regression"). `main.rs` 9,495 → 9,248
+   lines, `lexer.rs` 254 lines.
 2. `ast.rs` — `Expr`, `Stmt`
 3. `parser.rs` — `Parser`
 4. `value.rs` — `Val`, `val_to_json`, `as_matrix`, `hmac_*`, matrix helpers
