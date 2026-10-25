@@ -28,6 +28,8 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
 use crate::bytecode::{ClassDef, FunctionDef, ObjectData, Op};
+use crate::pipeline::{compile_source, load_source};
+use crate::project_root;
 use crate::runtime::{
     CHANNEL_IDS, FUNCTION_IDS, GENERATOR_IDS, OBJECT_IDS, TASK_IDS, channels,
     export_function_object, namespace_module_ops, resolve_function_object, tasks,
@@ -43,7 +45,6 @@ use crate::value::{
 };
 #[cfg(feature = "native-services")]
 use crate::value::{json_stringify_value, val_to_sql_value};
-use crate::{compile_source, load_source, project_root};
 
 pub(crate) struct Vm {
     code: Vec<Op>,
