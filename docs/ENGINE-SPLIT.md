@@ -61,37 +61,59 @@ Each phase ends with the same gate: `cargo fmt --check` and `cargo test` both ex
 with **57 passed**, plus `cargo clippy --all-targets --all-features -- -D warnings`
 clean. `scripts/gate-report.ps1 -Quick` runs the Rust half of that.
 
-### Phase 1 — mechanical file split (no behavior change)
+While the MSVC linker is unavailable that gate degrades to `fmt`, `check
+--all-targets` and `clippy` — see Phase 1's verification note for exactly what that
+does and does not prove.
 
-Extract in dependency order, test after each module:
+### Phase 1 — mechanical file split — **complete 2026-10-25**
 
-1. `lexer.rs` — `Tok`, `lex` — **done 2026-10-25**, verified by `cargo fmt --check`,
-   `cargo check --all-targets --all-features` and `clippy -D warnings` only. The test
-   suite could not run: the MSVC link toolchain on this machine is incomplete (see
-   [../STATUS.md](../STATUS.md), "Toolchain regression"). `main.rs` 9,495 → 9,248
-   lines, `lexer.rs` 254 lines.
-2. `ast.rs` — `Expr`, `Stmt`
-3. `parser.rs` — `Parser`
-4. `value.rs` — `Val`, `val_to_json`, `as_matrix`, `hmac_*`, matrix helpers
-5. `bytecode.rs` — `Op`, `FunctionDef`, `ClassDef`, `ObjectData`, statics
-6. `compiler.rs` — `LoopCtx`, `Compiler`
-7. `tensor.rs` — `TensorOp`, `TensorData`, `AdamState`, `tensor_*`
-8. `vm/mod.rs` — `Vm` struct, `new`/`nested`/`pop`/`bin_num`/`call_def`/`invoke`
-9. `vm/execute.rs` — `execute()` **as-is**. Do not touch it in this phase.
-10. `check.rs` — `semantic_check_ast`
-11. `tooling.rs` — debug/ast/symbols/lint/bench/profile/doc
-12. `lsp.rs` — the LSP server
-13. `registry.rs` — pkg index/add/remove/list/install/search/publish/audit
-14. `server.rs` — `serve_*`, routing, `query_params`
-15. `cli.rs` — `doctor`, `repl`, `usage`, `main`
+`main.rs` went from 9,495 lines to 610: `main()` and the test suite only. Sixteen
+modules, one commit each, in dependency order.
 
-Submodules of the crate root may read crate-root-private fields, so `Vm`'s internals
-do not need to become `pub(crate)` for steps 8–9 in a binary-only crate. That changes
-the moment a `lib.rs` is introduced, which is a separate decision (see below).
+| Module | Lines | Contents |
+|---|---|---|
+| `lexer.rs` | 254 | `Tok`, `lex` |
+| `ast.rs` | 62 | `Expr`, `Stmt` |
+| `parser.rs` | 590 | `Parser` |
+| `value.rs` | 343 | `Val` plus the JSON, SQL, crypto and linear-algebra helpers |
+| `bytecode.rs` | 86 | `Op`, `FunctionDef`, `ClassDef`, `ObjectData` |
+| `runtime.rs` | 76 | id counters and the task/channel/function-object registries |
+| `tensor.rs` | 467 | `TensorOp`, `TensorData`, `AdamState`, handle/autograd/backward |
+| `compiler.rs` | 505 | `LoopCtx`, `Compiler` |
+| `vm.rs` | 4,706 | `Vm` and `execute()` — moved as-is |
+| `pipeline.rs` | 284 | `load_source`, `semantic_check_ast`, compile/prepare/run/disasm |
+| `tooling.rs` | 242 | debug, ast, symbols, lint, bench, profile, doc |
+| `lsp.rs` | 567 | the language server |
+| `registry.rs` | 390 | package index, lockfile, pkg commands |
+| `project.rs` | 173 | path helpers, scaffolding, build commands |
+| `server.rs` | 305 | static, routed and dynamic HTTP servers |
+| `cli.rs` | 86 | `new_project`, `doctor`, `repl`, `usage` |
+
+**Verification.** The gate for this phase was `fmt`, `check --all-targets` and
+`clippy -D warnings`, not `cargo test`: the MSVC link toolchain is incomplete on this
+machine, so nothing can be linked or executed (see [../STATUS.md](../STATUS.md),
+"Toolchain regression"). A pure move cannot change behavior, only fail to compile,
+and the compiler checked every module — including the `#[cfg(test)]` test suite,
+which `--all-targets` type-checks. **The tests have not been run since 2026-10-10
+and must be run before Phase 2.**
+
+Code-preservation check, baseline `d92996b` against the split tree:
+
+| Count | Before | After |
+|---|---|---|
+| `fn` definitions | 192 | 192 |
+| `struct`/`enum` | 15 | 15 |
+| `#[test]` | 57 | 57 |
+| Lines | 9,495 | 9,746 (+251 of module headers, `mod` and `use` lines) |
+
+Submodules of the crate root can read crate-root-private items, so `Vm`'s internals
+needed `pub(crate)` only where the pipeline, server and tests actually reach them.
+That changes the moment a `lib.rs` is introduced, which is a separate decision (see
+below).
 
 ### Phase 2 — make `Op::Call` legible
 
-Only after Phase 1 is green and committed:
+Only once the test suite runs again and is green:
 
 1. Extract each of the 212 arms into `fn builtin_<name>(&mut self, a: Vec<Val>) -> Result<Val, String>`.
    Mechanical, one at a time; the suite covers most of them by name.

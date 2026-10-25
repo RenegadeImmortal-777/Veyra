@@ -60,9 +60,14 @@ version checks listed in the original Nexus record, and it does not cover Linux,
 macOS or ARM, which remain CI-build-only.
 
 Confirmed separately by inspection: 60 directories under `packages/`, the engine
-source (now `main.rs` plus `lexer.rs` — see [docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md)),
-`bin/veyra-native.exe`, the 11.0.0 extension bundle, and build output directories for
-`debug`, `release`, `aarch64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`.
+source, `bin/veyra-native.exe`, the 11.0.0 extension bundle, and build output
+directories for `debug`, `release`, `aarch64-pc-windows-msvc` and
+`x86_64-unknown-linux-gnu`.
+
+The engine source is no longer one file. As of 2026-10-25 `engine-rs/src/main.rs` is
+610 lines — `main()` and the tests — with the rest in sixteen modules; see
+[docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md) for the map and for what that change
+did and did not verify.
 
 ### Toolchain regression (2026-10-25)
 
