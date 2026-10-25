@@ -14,8 +14,8 @@ use std::{
     process::{Command, ExitCode},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        atomic::Ordering,
+        mpsc::{self, TryRecvError},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -37,6 +37,7 @@ mod ast;
 mod bytecode;
 mod lexer;
 mod parser;
+mod runtime;
 mod tensor;
 mod value;
 
@@ -44,6 +45,10 @@ use crate::ast::{Expr, Stmt};
 use crate::bytecode::{ClassDef, FunctionDef, ObjectData, Op};
 use crate::lexer::lex;
 use crate::parser::Parser;
+use crate::runtime::{
+    CHANNEL_IDS, FUNCTION_IDS, GENERATOR_IDS, OBJECT_IDS, TASK_IDS, channels,
+    export_function_object, namespace_module_ops, resolve_function_object, tasks,
+};
 use crate::tensor::{
     AdamState, TensorOp, adam_states, tensor_backward, tensor_from_value, tensor_id,
     tensor_snapshot, tensor_store, tensors,
@@ -55,66 +60,6 @@ use crate::value::{
 };
 #[cfg(feature = "native-services")]
 use crate::value::{json_stringify_value, val_to_sql_value};
-
-static OBJECT_IDS: AtomicU64 = AtomicU64::new(1);
-static TASK_IDS: AtomicU64 = AtomicU64::new(1);
-static GENERATOR_IDS: AtomicU64 = AtomicU64::new(1);
-static CHANNEL_IDS: AtomicU64 = AtomicU64::new(1);
-static FUNCTION_IDS: AtomicU64 = AtomicU64::new(1);
-static FUNCTION_OBJECTS: OnceLock<Mutex<HashMap<String, FunctionDef>>> = OnceLock::new();
-
-static TASKS: OnceLock<Mutex<HashMap<u64, thread::JoinHandle<Result<Val, String>>>>> =
-    OnceLock::new();
-static CHANNELS: OnceLock<Mutex<HashMap<u64, (Sender<Val>, Arc<Mutex<Receiver<Val>>>)>>> =
-    OnceLock::new();
-
-fn tasks() -> &'static Mutex<HashMap<u64, thread::JoinHandle<Result<Val, String>>>> {
-    TASKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-fn channels() -> &'static Mutex<HashMap<u64, (Sender<Val>, Arc<Mutex<Receiver<Val>>>)>> {
-    CHANNELS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn function_objects() -> &'static Mutex<HashMap<String, FunctionDef>> {
-    FUNCTION_OBJECTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn namespace_module_ops(code: &mut [Op], local_names: &HashSet<String>, prefix: &str) {
-    for op in code {
-        match op {
-            Op::Call(name, _) | Op::FunctionRef(name) => {
-                if local_names.contains(name) {
-                    *name = format!("{prefix}{name}");
-                }
-            }
-            Op::Def(_, _, _, _, nested) => namespace_module_ops(nested, local_names, prefix),
-            Op::DefClass(_, _, methods) => {
-                for (_, _, _, _, nested) in methods {
-                    namespace_module_ops(nested, local_names, prefix);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn export_function_object(def: FunctionDef) -> Result<String, String> {
-    let id = FUNCTION_IDS.fetch_add(1, Ordering::Relaxed);
-    let key = format!("@fn:{id}");
-    function_objects()
-        .lock()
-        .map_err(|_| "function object registry poisoned")?
-        .insert(key.clone(), def);
-    Ok(key)
-}
-
-fn resolve_function_object(name: &str) -> Result<Option<FunctionDef>, String> {
-    Ok(function_objects()
-        .lock()
-        .map_err(|_| "function object registry poisoned")?
-        .get(name)
-        .cloned())
-}
 
 struct LoopCtx {
     breaks: Vec<usize>,
