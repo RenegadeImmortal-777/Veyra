@@ -55,83 +55,9 @@ use crate::value::{
 #[cfg(feature = "native-services")]
 use crate::value::{json_stringify_value, val_to_sql_value};
 
-#[derive(Clone, Debug)]
-enum Op {
-    Const(Val),
-    Load(String),
-    Define(String, bool, Option<String>),
-    Store(String),
-    Pop,
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    Neg,
-    Not,
-    And,
-    Or,
-    Index,
-    GetMember(String),
-    SetMember(String),
-    Call(String, usize),
-    CallMethod(String, usize),
-    FunctionRef(String),
-    Def(
-        String,
-        Vec<(String, Option<String>)>,
-        Option<String>,
-        bool,
-        Vec<Op>,
-    ),
-    DefClass(
-        String,
-        Option<String>,
-        Vec<(
-            String,
-            Vec<(String, Option<String>)>,
-            Option<String>,
-            bool,
-            Vec<Op>,
-        )>,
-    ),
-    Return,
-    Yield,
-    PushHandler(usize, String),
-    PopHandler,
-    Throw,
-    JumpIfFalse(usize),
-    Jump(usize),
-    Halt,
-}
+mod bytecode;
 
-#[derive(Clone, Debug)]
-struct FunctionDef {
-    params: Vec<(String, Option<String>)>,
-    return_type: Option<String>,
-    is_async: bool,
-    code: Vec<Op>,
-    captures: HashMap<String, Val>,
-    capture_types: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug)]
-struct ClassDef {
-    parent: Option<String>,
-    methods: HashMap<String, FunctionDef>,
-}
-
-#[derive(Clone, Debug)]
-struct ObjectData {
-    class_name: String,
-    fields: HashMap<String, Val>,
-}
+use crate::bytecode::{ClassDef, FunctionDef, ObjectData, Op};
 
 static OBJECT_IDS: AtomicU64 = AtomicU64::new(1);
 static TASK_IDS: AtomicU64 = AtomicU64::new(1);
