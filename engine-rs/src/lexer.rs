@@ -123,6 +123,92 @@ pub(crate) fn lex_with_lines(src: &str) -> Result<Vec<(Tok, usize)>, String> {
             out.push((Tok::Num(n), line));
             continue;
         }
+        if (c == 'f' || c == 'F') && i + 1 < cs.len() && (cs[i + 1] == '"' || cs[i + 1] == '\'') {
+            let start_line = line;
+            let quote = cs[i + 1];
+            i += 2;
+            out.push((Tok::Lp, start_line));
+            out.push((Tok::Str(String::new()), start_line));
+            let mut lit = String::new();
+            while i < cs.len() && cs[i] != quote {
+                if cs[i] == '\n' {
+                    line += 1;
+                }
+                if cs[i] == '\\' && i + 1 < cs.len() {
+                    i += 1;
+                    lit.push(match cs[i] {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        x => x,
+                    });
+                    i += 1;
+                    continue;
+                }
+                if cs[i] == '{' {
+                    if i + 1 < cs.len() && cs[i + 1] == '{' {
+                        lit.push('{');
+                        i += 2;
+                        continue;
+                    }
+                    if !lit.is_empty() {
+                        out.push((Tok::Plus, line));
+                        out.push((Tok::Str(std::mem::take(&mut lit)), line));
+                    }
+                    i += 1;
+                    let mut expr_src = String::new();
+                    let mut depth = 1usize;
+                    while i < cs.len() && depth > 0 {
+                        if cs[i] == '{' {
+                            depth += 1;
+                            expr_src.push(cs[i]);
+                        } else if cs[i] == '}' {
+                            depth -= 1;
+                            if depth > 0 {
+                                expr_src.push(cs[i]);
+                            }
+                        } else {
+                            if cs[i] == '\n' {
+                                line += 1;
+                            }
+                            expr_src.push(cs[i]);
+                        }
+                        i += 1;
+                    }
+                    if depth != 0 {
+                        return Err(format!("line {start_line}: unterminated '{{' in f-string"));
+                    }
+                    let inner_toks = lex_with_lines(&expr_src)?;
+                    out.push((Tok::Plus, line));
+                    out.push((Tok::Id("str".into()), line));
+                    out.push((Tok::Lp, line));
+                    for (t, _) in inner_toks {
+                        if !matches!(t, Tok::Eof) {
+                            out.push((t, line));
+                        }
+                    }
+                    out.push((Tok::Rp, line));
+                    continue;
+                }
+                if cs[i] == '}' && i + 1 < cs.len() && cs[i + 1] == '}' {
+                    lit.push('}');
+                    i += 2;
+                    continue;
+                }
+                lit.push(cs[i]);
+                i += 1;
+            }
+            if i >= cs.len() {
+                return Err(format!("line {start_line}: unterminated f-string"));
+            }
+            i += 1;
+            if !lit.is_empty() {
+                out.push((Tok::Plus, line));
+                out.push((Tok::Str(lit), line));
+            }
+            out.push((Tok::Rp, start_line));
+            continue;
+        }
         if c == '"' || c == '\'' {
             let start_line = line;
             let quote = c;
@@ -159,10 +245,15 @@ pub(crate) fn lex_with_lines(src: &str) -> Result<Vec<(Tok, usize)>, String> {
                 i += 1;
             }
             let w: String = cs[s..i].iter().collect();
+            if w == "elif" {
+                out.push((Tok::Else, line));
+                out.push((Tok::If, line));
+                continue;
+            }
             let tok = match w.as_str() {
                 "let" => Tok::Let,
                 "const" => Tok::Const,
-                "fn" => Tok::Fn,
+                "fn" | "def" => Tok::Fn,
                 "async" => Tok::Async,
                 "class" => Tok::Class,
                 "return" => Tok::Return,
@@ -175,9 +266,9 @@ pub(crate) fn lex_with_lines(src: &str) -> Result<Vec<(Tok, usize)>, String> {
                 "for" => Tok::For,
                 "in" => Tok::In,
                 "try" => Tok::Try,
-                "catch" => Tok::Catch,
+                "catch" | "except" => Tok::Catch,
                 "finally" => Tok::Finally,
-                "throw" => Tok::Throw,
+                "throw" | "raise" => Tok::Throw,
                 "match" => Tok::Match,
                 "case" => Tok::Case,
                 "await" => Tok::Await,
@@ -186,9 +277,9 @@ pub(crate) fn lex_with_lines(src: &str) -> Result<Vec<(Tok, usize)>, String> {
                 "and" => Tok::And,
                 "or" => Tok::Or,
                 "not" => Tok::Not,
-                "true" => Tok::True,
-                "false" => Tok::False,
-                "null" => Tok::Null,
+                "true" | "True" => Tok::True,
+                "false" | "False" => Tok::False,
+                "null" | "None" => Tok::Null,
                 _ => Tok::Id(w),
             };
             out.push((tok, line));

@@ -158,7 +158,7 @@ impl Vm {
                 Val::Str(a[0].show())
             }
             "type_of" => self.type_of_val(&a)?,
-            "is_instance" => {
+            "is_instance" | "isinstance" => {
                 if a.len() != 2 {
                     return Err("is_instance expects value,type".into());
                 }
@@ -589,20 +589,93 @@ impl Vm {
                     _ => return Err("slice supports List/String".into()),
                 }
             }
-            "reverse" => {
-                if a.len() != 1 {
-                    return Err("reverse expects list".into());
+            "py_slice" => {
+                if a.len() != 4 {
+                    return Err("py_slice expects target,start,stop,step".into());
                 }
-                let mut xs = match &a[0] {
-                    Val::List(v) => v.clone(),
-                    _ => return Err("reverse expects List".into()),
+                let step: isize = match &a[3] {
+                    Val::Null => 1,
+                    Val::Num(n) => {
+                        let s = *n as isize;
+                        if s == 0 {
+                            return Err("slice step cannot be zero".into());
+                        }
+                        s
+                    }
+                    _ => return Err("slice step must be Number".into()),
                 };
-                xs.reverse();
-                Val::List(xs)
+                let slice_indices = |len: isize| -> Result<Vec<usize>, String> {
+                    let norm = |bound: &Val, default: isize| -> Result<isize, String> {
+                        match bound {
+                            Val::Null => Ok(default),
+                            Val::Num(n) => {
+                                let mut idx = *n as isize;
+                                if idx < 0 {
+                                    idx += len;
+                                }
+                                if step > 0 {
+                                    Ok(idx.clamp(0, len))
+                                } else {
+                                    Ok(idx.clamp(-1, len - 1))
+                                }
+                            }
+                            _ => Err("slice indices must be Numbers".into()),
+                        }
+                    };
+                    let (start, stop) = if step > 0 {
+                        (norm(&a[1], 0)?, norm(&a[2], len)?)
+                    } else {
+                        (norm(&a[1], len - 1)?, norm(&a[2], -1)?)
+                    };
+                    let mut indices = vec![];
+                    let mut cur = start;
+                    if step > 0 {
+                        while cur < stop {
+                            if cur >= 0 && cur < len {
+                                indices.push(cur as usize);
+                            }
+                            cur += step;
+                        }
+                    } else {
+                        while cur > stop {
+                            if cur >= 0 && cur < len {
+                                indices.push(cur as usize);
+                            }
+                            cur += step;
+                        }
+                    }
+                    Ok(indices)
+                };
+                match &a[0] {
+                    Val::List(v) => {
+                        let idxs = slice_indices(v.len() as isize)?;
+                        Val::List(idxs.into_iter().map(|i| v[i].clone()).collect())
+                    }
+                    Val::Str(s) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        let idxs = slice_indices(chars.len() as isize)?;
+                        Val::Str(idxs.into_iter().map(|i| chars[i]).collect())
+                    }
+                    _ => return Err("slicing supports List or String".into()),
+                }
             }
-            "sort" => {
+            "reverse" | "reversed" => {
                 if a.len() != 1 {
-                    return Err("sort expects list".into());
+                    return Err("reverse expects list or string".into());
+                }
+                match &a[0] {
+                    Val::List(v) => {
+                        let mut xs = v.clone();
+                        xs.reverse();
+                        Val::List(xs)
+                    }
+                    Val::Str(s) => Val::Str(s.chars().rev().collect()),
+                    _ => return Err("reverse expects List or String".into()),
+                }
+            }
+            "sort" | "sorted" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("sort expects (list[, reverse])".into());
                 }
                 let mut xs = match &a[0] {
                     Val::List(v) => v.clone(),
@@ -615,7 +688,57 @@ impl Vm {
                     (Val::Str(a), Val::Str(b)) => a.cmp(b),
                     _ => std::cmp::Ordering::Equal,
                 });
+                if a.get(1).map(Val::truthy).unwrap_or(false) {
+                    xs.reverse();
+                }
                 Val::List(xs)
+            }
+            "chr" => {
+                if a.len() != 1 {
+                    return Err("chr expects 1 argument".into());
+                }
+                match a[0] {
+                    Val::Num(n) => {
+                        let code = n as u32;
+                        let ch = char::from_u32(code).ok_or("chr code point out of range")?;
+                        Val::Str(ch.to_string())
+                    }
+                    _ => return Err("chr expects Number".into()),
+                }
+            }
+            "ord" => {
+                if a.len() != 1 {
+                    return Err("ord expects 1 argument".into());
+                }
+                match &a[0] {
+                    Val::Str(s) => {
+                        let mut chars = s.chars();
+                        let ch = chars.next().ok_or("ord expects non-empty String")?;
+                        if chars.next().is_some() {
+                            return Err("ord expects single-character String".into());
+                        }
+                        Val::Num((ch as u32) as f64)
+                    }
+                    _ => return Err("ord expects String".into()),
+                }
+            }
+            "hex" => {
+                if a.len() != 1 {
+                    return Err("hex expects 1 argument".into());
+                }
+                match a[0] {
+                    Val::Num(n) => Val::Str(format!("0x{:x}", n as i64)),
+                    _ => return Err("hex expects Number".into()),
+                }
+            }
+            "bin" => {
+                if a.len() != 1 {
+                    return Err("bin expects 1 argument".into());
+                }
+                match a[0] {
+                    Val::Num(n) => Val::Str(format!("0b{:b}", n as i64)),
+                    _ => return Err("bin expects Number".into()),
+                }
             }
             "unique" => {
                 if a.len() != 1 {

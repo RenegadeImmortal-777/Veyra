@@ -67,12 +67,100 @@ use crate::tooling::{
 #[cfg(test)]
 use crate::vm::Vm;
 
+const BUNDLE_MAGIC: &[u8; 8] = b"VEYRABC1";
+
+pub fn extract_embedded_vybc(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    let footer_start = bytes.len() - 8;
+    if &bytes[footer_start..] != BUNDLE_MAGIC {
+        return None;
+    }
+    let len_bytes: [u8; 8] = bytes[footer_start - 8..footer_start].try_into().ok()?;
+    let payload_len = u64::from_le_bytes(len_bytes) as usize;
+    if footer_start < 8 + payload_len {
+        return None;
+    }
+    let payload_start = footer_start - 8 - payload_len;
+    String::from_utf8(bytes[payload_start..footer_start - 8].to_vec()).ok()
+}
+
+pub fn bundle_executable(script_path: &Path, out_path: Option<&Path>) -> Result<PathBuf, String> {
+    let source = load_source(script_path.to_string_lossy().as_ref())?;
+    let vybc = compile_to_vybc(&source)?;
+    let exe_path = env::current_exe().map_err(|e| e.to_string())?;
+    let mut base_bytes = fs::read(&exe_path).map_err(|e| e.to_string())?;
+    if base_bytes.len() >= 16 && &base_bytes[base_bytes.len() - 8..] == BUNDLE_MAGIC {
+        let f = base_bytes.len() - 8;
+        if let Ok(lb) = <[u8; 8]>::try_from(&base_bytes[f - 8..f]) {
+            let plen = u64::from_le_bytes(lb) as usize;
+            if f >= 8 + plen {
+                base_bytes.truncate(f - 8 - plen);
+            }
+        }
+    }
+    let payload = vybc.as_bytes();
+    base_bytes.extend_from_slice(payload);
+    base_bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    base_bytes.extend_from_slice(BUNDLE_MAGIC);
+    let target = match out_path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let stem = script_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("veyra-app");
+            if cfg!(windows) {
+                script_path.with_file_name(format!("{stem}.exe"))
+            } else {
+                script_path.with_file_name(stem)
+            }
+        }
+    };
+    fs::write(&target, &base_bytes).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(&target) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = fs::set_permissions(&target, perms);
+        }
+    }
+    Ok(target)
+}
+
 pub fn run_cli() -> ExitCode {
+    if let Ok(exe) = env::current_exe() {
+        if let Ok(bytes) = fs::read(&exe) {
+            if let Some(embedded_vybc) = extract_embedded_vybc(&bytes) {
+                return match run_vybc(&embedded_vybc) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("veyra: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+        }
+    }
     let a: Vec<String> = env::args().collect();
     let r: Result<(), String> = match a.get(1).map(String::as_str) {
         Some("--version") | Some("version") => {
             println!("Veyra {VERSION}");
             Ok(())
+        }
+        Some("bundle") => {
+            let script = a
+                .get(2)
+                .ok_or("usage: veyra bundle <script.vy> [output]".to_string());
+            script.and_then(|s| {
+                let out = a.get(3).map(Path::new);
+                let built = bundle_executable(Path::new(s), out)?;
+                println!("Bundled standalone executable: {}", built.display());
+                Ok(())
+            })
         }
         Some("doctor") => {
             doctor();
@@ -934,5 +1022,82 @@ mod tests {
             assert(tensor_grad(x) == [2, 3, 2, 3, 2, 3]);
         ";
         assert!(run_source(src).is_ok());
+    }
+    #[test]
+    fn python_parity_fstrings_slicing_methods_and_destructuring() {
+        let src = r#"
+            # 1. F-strings & expressions inside interpolation
+            let name = "veyra"
+            let score = 95
+            let greeting = f"Hello {name.upper()}, score={score + 5}!"
+            assert(greeting == "Hello VEYRA, score=100!")
+
+            # 2. Negative indexing & Python slicing [start:stop:step]
+            let nums = [10, 20, 30, 40, 50]
+            assert(nums[-1] == 50)
+            assert(nums[-2] == 40)
+            nums[-1] = 55
+            assert(nums[4] == 55)
+            assert(nums[1:4] == [20, 30, 40])
+            assert(nums[:2] == [10, 20])
+            assert(nums[3:] == [40, 55])
+            assert(nums[::-1] == [55, 40, 30, 20, 10])
+            assert("abcde"[::-1] == "edcba")
+            assert("abcde"[-1] == "e")
+
+            # 3. Python 'in' / 'not in', 'def', 'elif', 'None', 'True', 'False', 'lambda'
+            def classify(x) {
+                if x in [1, 2, 3] {
+                    return "small"
+                } elif x not in [10, 20] and x is not None {
+                    return "medium"
+                } else {
+                    pass
+                    return "other"
+                }
+            }
+            assert(classify(2) == "small")
+            assert(classify(5) == "medium")
+            let sq = lambda z: z * z
+            assert(sq(9) == 81)
+
+            # 4. List & Map Python methods + Destructuring + For-loop unpacking
+            let items = [3, 1, 2]
+            items.append(4)
+            items.sort()
+            assert(items == [1, 2, 3, 4])
+            items.reverse()
+            assert(items == [4, 3, 2, 1])
+
+            let a, b = [100, 200]
+            assert(a == 100 and b == 200)
+            let [c, d] = ["x", "y"]
+            assert(c == "x" and d == "y")
+
+            let dmap = {"alpha": 1, "beta": 2}
+            assert(dmap.get("alpha") == 1)
+            assert(dmap.get("missing", 99) == 99)
+            let sum_v = 0
+            for k, v in dmap.items() {
+                if "a" in k {
+                    sum_v += v
+                }
+            }
+            assert(sum_v == 3)
+            assert(chr(65) == "A" and ord("A") == 65)
+            assert(hex(255) == "0xff" and bin(5) == "0b101")
+        "#;
+        run_source(src).unwrap();
+    }
+    #[test]
+    fn standalone_bundle_round_trip() {
+        let payload = compile_to_vybc("let x = 40 + 2; assert(x == 42);").unwrap();
+        let mut fake_exe = b"MZ_FAKE_PE_HEADER".to_vec();
+        fake_exe.extend_from_slice(payload.as_bytes());
+        fake_exe.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        fake_exe.extend_from_slice(BUNDLE_MAGIC);
+        let extracted = extract_embedded_vybc(&fake_exe).expect("should extract embedded vybc");
+        assert_eq!(extracted, payload);
+        assert!(run_vybc(&extracted).is_ok());
     }
 }

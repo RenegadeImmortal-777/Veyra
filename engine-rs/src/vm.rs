@@ -560,32 +560,34 @@ impl Vm {
                     (self.code.get(self.ip), self.code.get(self.ip + 1))
                 {
                     if let Some(Val::Num(idx_num)) = self.get_var(idx_name) {
-                        let i = idx_num as usize;
-                        let indexed = if let Some(cell) = self.cells.get(&n) {
-                            let guard = cell
-                                .lock()
-                                .map_err(|_| "upvalue cell poisoned".to_string())?;
-                            match &*guard {
-                                Val::List(v) => Some(
+                        if idx_num >= 0.0 {
+                            let i = idx_num as usize;
+                            let indexed = if let Some(cell) = self.cells.get(&n) {
+                                let guard = cell
+                                    .lock()
+                                    .map_err(|_| "upvalue cell poisoned".to_string())?;
+                                match &*guard {
+                                    Val::List(v) => {
+                                        Some(v.get(i).cloned().ok_or_else(|| {
+                                            format!("list index {i} out of range")
+                                        })?)
+                                    }
+                                    _ => None,
+                                }
+                            } else if let Some(Val::List(v)) = self.vars.get(&n) {
+                                Some(
                                     v.get(i)
                                         .cloned()
                                         .ok_or_else(|| format!("list index {i} out of range"))?,
-                                ),
-                                _ => None,
+                                )
+                            } else {
+                                None
+                            };
+                            if let Some(val) = indexed {
+                                self.ip += 2;
+                                self.stack.push(val);
+                                return Ok(None);
                             }
-                        } else if let Some(Val::List(v)) = self.vars.get(&n) {
-                            Some(
-                                v.get(i)
-                                    .cloned()
-                                    .ok_or_else(|| format!("list index {i} out of range"))?,
-                            )
-                        } else {
-                            None
-                        };
-                        if let Some(val) = indexed {
-                            self.ip += 2;
-                            self.stack.push(val);
-                            return Ok(None);
                         }
                     }
                 }
@@ -724,17 +726,23 @@ impl Vm {
                 let obj = self.pop()?;
                 let value = match (obj, key) {
                     (Val::List(v), Val::Num(n)) => {
-                        let i = n as usize;
-                        v.get(i)
-                            .cloned()
-                            .ok_or(format!("list index {i} out of range"))?
+                        let raw = n as isize;
+                        let len = v.len() as isize;
+                        let resolved = if raw < 0 { len + raw } else { raw };
+                        if resolved < 0 || (resolved as usize) >= v.len() {
+                            return Err(format!("list index {raw} out of range"));
+                        }
+                        v[resolved as usize].clone()
                     }
                     (Val::Str(s), Val::Num(n)) => {
-                        let i = n as usize;
-                        s.chars()
-                            .nth(i)
-                            .map(|c| Val::Str(c.to_string()))
-                            .ok_or(format!("string index {i} out of range"))?
+                        let chars: Vec<char> = s.chars().collect();
+                        let raw = n as isize;
+                        let len = chars.len() as isize;
+                        let resolved = if raw < 0 { len + raw } else { raw };
+                        if resolved < 0 || (resolved as usize) >= chars.len() {
+                            return Err(format!("string index {raw} out of range"));
+                        }
+                        Val::Str(chars[resolved as usize].to_string())
                     }
                     (Val::Map(pairs), k) => pairs
                         .iter()
@@ -751,14 +759,16 @@ impl Vm {
                 let obj = self.pop()?;
                 let updated = match (obj, key) {
                     (Val::List(mut items), Val::Num(n)) => {
-                        if n < 0.0 || n.fract() != 0.0 {
-                            return Err("list index must be non-negative integer".into());
+                        if n.fract() != 0.0 {
+                            return Err("list index must be integer".into());
                         }
-                        let i = n as usize;
-                        if i >= items.len() {
-                            return Err(format!("list index {i} out of range"));
+                        let raw = n as isize;
+                        let len = items.len() as isize;
+                        let resolved = if raw < 0 { len + raw } else { raw };
+                        if resolved < 0 || (resolved as usize) >= items.len() {
+                            return Err(format!("list index {raw} out of range"));
                         }
-                        items[i] = value;
+                        items[resolved as usize] = value;
                         Val::List(items)
                     }
                     (Val::Map(mut pairs), k) => {
@@ -826,14 +836,198 @@ impl Vm {
                         self.call_def(method, call_args)?
                     }
                     Val::Map(pairs) => {
-                        let member = pairs
-                            .iter()
-                            .find(|(k, _)| *k == Val::Str(name.clone()))
-                            .map(|(_, v)| v.clone())
-                            .ok_or(format!("undefined module member '{name}'"))?;
-                        let (_, def) = self.callable_def(&member)?;
-                        self.call_def(def, args)?
+                        if let Some((_, member)) =
+                            pairs.iter().find(|(k, _)| *k == Val::Str(name.clone()))
+                        {
+                            if let Ok((_, def)) = self.callable_def(member) {
+                                self.stack.push(self.call_def(def, args)?);
+                                return Ok(None);
+                            }
+                        }
+                        match name.as_str() {
+                            "keys" => Val::List(pairs.iter().map(|(k, _)| k.clone()).collect()),
+                            "values" => Val::List(pairs.iter().map(|(_, v)| v.clone()).collect()),
+                            "items" | "entries" => Val::List(
+                                pairs
+                                    .iter()
+                                    .map(|(k, v)| Val::List(vec![k.clone(), v.clone()]))
+                                    .collect(),
+                            ),
+                            "get" => {
+                                if args.is_empty() || args.len() > 2 {
+                                    return Err("map.get expects (key[, default])".into());
+                                }
+                                pairs
+                                    .iter()
+                                    .find(|(k, _)| *k == args[0])
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_else(|| args.get(1).cloned().unwrap_or(Val::Null))
+                            }
+                            "has" | "contains" => {
+                                if args.len() != 1 {
+                                    return Err("map.has expects 1 argument".into());
+                                }
+                                Val::Bool(pairs.iter().any(|(k, _)| *k == args[0]))
+                            }
+                            "len" => Val::Num(pairs.len() as f64),
+                            _ => return Err(format!("undefined module member '{name}'")),
+                        }
                     }
+                    Val::Str(s) => match name.as_str() {
+                        "upper" => Val::Str(s.to_uppercase()),
+                        "lower" => Val::Str(s.to_lowercase()),
+                        "strip" | "trim" => Val::Str(s.trim().to_string()),
+                        "lstrip" => Val::Str(s.trim_start().to_string()),
+                        "rstrip" => Val::Str(s.trim_end().to_string()),
+                        "split" => {
+                            if args.is_empty() {
+                                Val::List(
+                                    s.split_whitespace()
+                                        .map(|p| Val::Str(p.to_string()))
+                                        .collect(),
+                                )
+                            } else if let Val::Str(sep) = &args[0] {
+                                Val::List(s.split(sep).map(|p| Val::Str(p.to_string())).collect())
+                            } else {
+                                return Err("str.split separator must be String".into());
+                            }
+                        }
+                        "replace" => {
+                            if args.len() != 2 {
+                                return Err("str.replace expects (old, new)".into());
+                            }
+                            match (&args[0], &args[1]) {
+                                (Val::Str(old), Val::Str(new)) => Val::Str(s.replace(old, new)),
+                                _ => return Err("str.replace arguments must be Strings".into()),
+                            }
+                        }
+                        "startswith" | "starts_with" => match args.first() {
+                            Some(Val::Str(p)) => Val::Bool(s.starts_with(p)),
+                            _ => return Err("str.startswith expects String".into()),
+                        },
+                        "endswith" | "ends_with" => match args.first() {
+                            Some(Val::Str(p)) => Val::Bool(s.ends_with(p)),
+                            _ => return Err("str.endswith expects String".into()),
+                        },
+                        "find" => match args.first() {
+                            Some(Val::Str(sub)) => {
+                                Val::Num(s.find(sub).map(|i| i as f64).unwrap_or(-1.0))
+                            }
+                            _ => return Err("str.find expects String".into()),
+                        },
+                        "count" => match args.first() {
+                            Some(Val::Str(sub)) => Val::Num(s.matches(sub).count() as f64),
+                            _ => return Err("str.count expects String".into()),
+                        },
+                        "join" => match args.first() {
+                            Some(Val::List(items)) => {
+                                Val::Str(items.iter().map(Val::show).collect::<Vec<_>>().join(&s))
+                            }
+                            _ => return Err("str.join expects List".into()),
+                        },
+                        "chars" => Val::List(s.chars().map(|c| Val::Str(c.to_string())).collect()),
+                        "isdigit" => {
+                            Val::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                        }
+                        "isalpha" => {
+                            Val::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
+                        }
+                        "len" => Val::Num(s.chars().count() as f64),
+                        _ => return Err(format!("unknown String method '{name}'")),
+                    },
+                    Val::List(mut items) => match name.as_str() {
+                        "append" | "push" => {
+                            if args.len() != 1 {
+                                return Err("list.append expects 1 argument".into());
+                            }
+                            items.push(args.into_iter().next().unwrap());
+                            Val::List(items)
+                        }
+                        "extend" => {
+                            if args.len() != 1 {
+                                return Err("list.extend expects List".into());
+                            }
+                            match args.into_iter().next().unwrap() {
+                                Val::List(other) => {
+                                    items.extend(other);
+                                    Val::List(items)
+                                }
+                                _ => return Err("list.extend expects List".into()),
+                            }
+                        }
+                        "pop" => items.pop().ok_or("pop from empty list")?,
+                        "sort" => {
+                            items.sort_by(|x, y| match (x, y) {
+                                (Val::Num(a), Val::Num(b)) => {
+                                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                }
+                                (Val::Str(a), Val::Str(b)) => a.cmp(b),
+                                _ => std::cmp::Ordering::Equal,
+                            });
+                            Val::List(items)
+                        }
+                        "reverse" => {
+                            items.reverse();
+                            Val::List(items)
+                        }
+                        "clear" => {
+                            items.clear();
+                            Val::List(items)
+                        }
+                        "insert" => {
+                            if args.len() != 2 {
+                                return Err("list.insert expects (index, value)".into());
+                            }
+                            let idx = match args[0] {
+                                Val::Num(n) => (n.max(0.0) as usize).min(items.len()),
+                                _ => return Err("list.insert index must be Number".into()),
+                            };
+                            items.insert(idx, args[1].clone());
+                            Val::List(items)
+                        }
+                        "remove" => {
+                            if args.len() != 1 {
+                                return Err("list.remove expects 1 argument".into());
+                            }
+                            if let Some(pos) = items.iter().position(|x| *x == args[0]) {
+                                items.remove(pos);
+                            }
+                            Val::List(items)
+                        }
+                        "index" => {
+                            if args.len() != 1 {
+                                return Err("list.index expects 1 argument".into());
+                            }
+                            items
+                                .iter()
+                                .position(|x| *x == args[0])
+                                .map(|i| Val::Num(i as f64))
+                                .ok_or("value is not in list")?
+                        }
+                        "count" => {
+                            if args.len() != 1 {
+                                return Err("list.count expects 1 argument".into());
+                            }
+                            Val::Num(items.iter().filter(|x| **x == args[0]).count() as f64)
+                        }
+                        "contains" => {
+                            if args.len() != 1 {
+                                return Err("list.contains expects 1 argument".into());
+                            }
+                            Val::Bool(items.contains(&args[0]))
+                        }
+                        "copy" => Val::List(items),
+                        "join" => {
+                            let sep = match args.first() {
+                                Some(Val::Str(s)) => s.as_str(),
+                                None => "",
+                                _ => return Err("list.join separator must be String".into()),
+                            };
+                            Val::Str(items.iter().map(Val::show).collect::<Vec<_>>().join(sep))
+                        }
+                        "len" => Val::Num(items.len() as f64),
+                        _ => return Err(format!("unknown List method '{name}'")),
+                    },
                     _ => return Err("method call requires object or module map".into()),
                 };
                 self.stack.push(value);

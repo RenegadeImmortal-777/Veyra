@@ -77,12 +77,81 @@ impl Parser {
         Ok(v)
     }
     fn stmt(&mut self) -> Result<Stmt, String> {
+        if matches!(self.cur(), Tok::Id(s) if s == "pass") {
+            self.i += 1;
+            self.eat(&Tok::Semi);
+            return Ok(Stmt::Expr(Expr::Null));
+        }
         if self.eat(&Tok::Let) || self.eat(&Tok::Const) {
             let is_const = matches!(self.t[self.i - 1], Tok::Const);
+            if self.eat(&Tok::Ls) || self.eat(&Tok::Lp) {
+                let closing = if matches!(self.t[self.i - 1], Tok::Ls) {
+                    Tok::Rs
+                } else {
+                    Tok::Rp
+                };
+                let mut names = vec![];
+                while !self.eat(&closing) {
+                    match self.bump() {
+                        Tok::Id(s) => names.push(s),
+                        x => return Err(format!("expected destructuring name, got {x:?}")),
+                    }
+                    if self.eat(&closing) {
+                        break;
+                    }
+                    self.need(&Tok::Comma, "expected ',' in destructuring")?;
+                }
+                self.need(&Tok::Eq, "expected '=' after destructuring pattern")?;
+                let rhs = self.expr()?;
+                self.eat(&Tok::Semi);
+                let tmp = format!("__unpack_{}", self.i);
+                let mut stmts = vec![Stmt::Let(tmp.clone(), None, rhs, false)];
+                for (idx, n) in names.into_iter().enumerate() {
+                    stmts.push(Stmt::Let(
+                        n,
+                        None,
+                        Expr::Index(
+                            Box::new(Expr::Var(tmp.clone())),
+                            Box::new(Expr::Num(idx as f64)),
+                        ),
+                        is_const,
+                    ));
+                }
+                return Ok(Stmt::If(Expr::Bool(true), stmts, vec![]));
+            }
             let name = match self.bump() {
                 Tok::Id(s) => s,
                 x => return Err(format!("expected name, got {x:?}")),
             };
+            if self.eat(&Tok::Comma) {
+                let mut names = vec![name];
+                loop {
+                    match self.bump() {
+                        Tok::Id(s) => names.push(s),
+                        x => return Err(format!("expected destructuring name, got {x:?}")),
+                    }
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.need(&Tok::Eq, "expected '='")?;
+                let rhs = self.expr()?;
+                self.eat(&Tok::Semi);
+                let tmp = format!("__unpack_{}", self.i);
+                let mut stmts = vec![Stmt::Let(tmp.clone(), None, rhs, false)];
+                for (idx, n) in names.into_iter().enumerate() {
+                    stmts.push(Stmt::Let(
+                        n,
+                        None,
+                        Expr::Index(
+                            Box::new(Expr::Var(tmp.clone())),
+                            Box::new(Expr::Num(idx as f64)),
+                        ),
+                        is_const,
+                    ));
+                }
+                return Ok(Stmt::If(Expr::Bool(true), stmts, vec![]));
+            }
             let ty = if self.eat(&Tok::Colon) {
                 match self.bump() {
                     Tok::Id(s) => Some(s),
@@ -287,6 +356,36 @@ impl Parser {
                 Tok::Id(s) => s,
                 x => return Err(format!("expected loop variable, got {x:?}")),
             };
+            if self.eat(&Tok::Comma) {
+                let mut names = vec![name];
+                loop {
+                    match self.bump() {
+                        Tok::Id(s) => names.push(s),
+                        x => return Err(format!("expected loop variable, got {x:?}")),
+                    }
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.need(&Tok::In, "expected 'in'")?;
+                let iterable = self.expr()?;
+                let mut body = self.block()?;
+                let tmp = format!("__for_item_{}", self.i);
+                let mut prefix = Vec::with_capacity(names.len());
+                for (idx, n) in names.into_iter().enumerate() {
+                    prefix.push(Stmt::Let(
+                        n,
+                        None,
+                        Expr::Index(
+                            Box::new(Expr::Var(tmp.clone())),
+                            Box::new(Expr::Num(idx as f64)),
+                        ),
+                        false,
+                    ));
+                }
+                prefix.append(&mut body);
+                return Ok(Stmt::ForEach(tmp, iterable, prefix));
+            }
             self.need(&Tok::In, "expected 'in'")?;
             if matches!(self.cur(), Tok::Id(s) if s == "range")
                 && self.i + 1 < self.t.len()
@@ -390,6 +489,23 @@ impl Parser {
             };
         }
         self.eat(&Tok::Semi);
+        if let Expr::MethodCall(ref recv, ref mname, _) = e {
+            if let Expr::Var(var_name) = &**recv {
+                if matches!(
+                    mname.as_str(),
+                    "append"
+                        | "push"
+                        | "extend"
+                        | "sort"
+                        | "reverse"
+                        | "clear"
+                        | "insert"
+                        | "remove"
+                ) {
+                    return Ok(Stmt::Assign(var_name.clone(), e));
+                }
+            }
+        }
         Ok(Stmt::Expr(e))
     }
     fn expr(&mut self) -> Result<Expr, String> {
@@ -412,6 +528,12 @@ impl Parser {
     fn equality(&mut self) -> Result<Expr, String> {
         let mut e = self.compare()?;
         loop {
+            if matches!(self.cur(), Tok::Id(s) if s == "is") {
+                self.i += 1;
+                let op = if self.eat(&Tok::Not) { "!=" } else { "==" }.to_string();
+                e = Expr::Bin(Box::new(e), op, Box::new(self.compare()?));
+                continue;
+            }
             let op = match self.cur() {
                 Tok::EqEq => "==",
                 Tok::Ne => "!=",
@@ -426,6 +548,23 @@ impl Parser {
     fn compare(&mut self) -> Result<Expr, String> {
         let mut e = self.term()?;
         loop {
+            if self.eat(&Tok::In) {
+                let rhs = self.term()?;
+                e = Expr::Call("contains".into(), vec![rhs, e]);
+                continue;
+            }
+            if matches!(self.cur(), Tok::Not)
+                && self.i + 1 < self.t.len()
+                && matches!(self.t[self.i + 1], Tok::In)
+            {
+                self.i += 2;
+                let rhs = self.term()?;
+                e = Expr::Unary(
+                    "!".into(),
+                    Box::new(Expr::Call("contains".into(), vec![rhs, e])),
+                );
+                continue;
+            }
             let op = match self.cur() {
                 Tok::Lt => "<",
                 Tok::Le => "<=",
@@ -493,9 +632,32 @@ impl Parser {
         let mut e = self.primary()?;
         loop {
             if self.eat(&Tok::Ls) {
-                let key = self.expr()?;
-                self.need(&Tok::Rs, "expected ']' after index")?;
-                e = Expr::Index(Box::new(e), Box::new(key));
+                let first = if matches!(self.cur(), Tok::Colon) {
+                    Expr::Null
+                } else {
+                    self.expr()?
+                };
+                if self.eat(&Tok::Colon) {
+                    let stop = if matches!(self.cur(), Tok::Colon | Tok::Rs) {
+                        Expr::Null
+                    } else {
+                        self.expr()?
+                    };
+                    let step = if self.eat(&Tok::Colon) {
+                        if matches!(self.cur(), Tok::Rs) {
+                            Expr::Null
+                        } else {
+                            self.expr()?
+                        }
+                    } else {
+                        Expr::Null
+                    };
+                    self.need(&Tok::Rs, "expected ']' after slice")?;
+                    e = Expr::Call("py_slice".into(), vec![e, first, stop, step]);
+                } else {
+                    self.need(&Tok::Rs, "expected ']' after index")?;
+                    e = Expr::Index(Box::new(e), Box::new(first));
+                }
                 continue;
             }
             if self.eat(&Tok::Dot) {
@@ -567,6 +729,28 @@ impl Parser {
                 Ok(Expr::Lambda(params, return_type, body))
             }
             Tok::Id(n) => {
+                if n == "lambda" && !matches!(self.cur(), Tok::Lp) {
+                    let mut params = vec![];
+                    if !self.eat(&Tok::Colon) {
+                        loop {
+                            let param = match self.bump() {
+                                Tok::Id(s) => s,
+                                x => return Err(format!("expected lambda parameter, got {x:?}")),
+                            };
+                            params.push((param, None));
+                            if self.eat(&Tok::Colon) {
+                                break;
+                            }
+                            self.need(&Tok::Comma, "expected ',' or ':' in lambda")?;
+                        }
+                    }
+                    let body_expr = self.expr()?;
+                    return Ok(Expr::Lambda(
+                        params,
+                        None,
+                        vec![Stmt::Return(Some(body_expr))],
+                    ));
+                }
                 if self.eat(&Tok::Lp) {
                     let mut a = vec![];
                     if !self.eat(&Tok::Rp) {
