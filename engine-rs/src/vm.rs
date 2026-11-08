@@ -210,7 +210,7 @@ impl Vm {
         let mut cells = def.upvalues.clone();
         let mut var_types = def.capture_types.clone();
         let return_type = def.return_type.clone();
-        for ((param, ty), value) in def.params.iter().zip(args.into_iter()) {
+        for ((param, ty), value) in def.params.iter().zip(args) {
             if let Some(expected) = ty {
                 if !self.value_matches(&value, expected) {
                     return Err(format!(

@@ -851,9 +851,7 @@ impl Vm {
                 {
                     let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
                     let t = store.get_mut(&id).ok_or("unknown tensor")?;
-                    for g in &mut t.grad {
-                        *g = 0.0;
-                    }
+                    t.grad.fill(0.0);
                 }
                 let _ = self.gc_tensors()?;
                 Val::Null

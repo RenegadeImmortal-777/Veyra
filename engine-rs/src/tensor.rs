@@ -261,9 +261,7 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
         let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
         for id in &order {
             if let Some(tensor) = store.get_mut(id) {
-                for g in &mut tensor.grad {
-                    *g = 0.0;
-                }
+                tensor.grad.fill(0.0);
             }
         }
         let t = store.get_mut(&root).ok_or("unknown tensor")?;

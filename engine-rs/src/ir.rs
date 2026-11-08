@@ -151,10 +151,8 @@ fn optimize_pass(code: &[Op]) -> Vec<Op> {
 
     for op in &mut out {
         match op {
-            Op::Jump(t) | Op::JumpIfFalse(t) | Op::PushHandler(t, _) => {
-                if *t < old_to_new.len() {
-                    *t = old_to_new[*t];
-                }
+            Op::Jump(t) | Op::JumpIfFalse(t) | Op::PushHandler(t, _) if *t < old_to_new.len() => {
+                *t = old_to_new[*t];
             }
             _ => {}
         }

@@ -1,5 +1,6 @@
 #![allow(
     clippy::collapsible_if,
+    clippy::collapsible_match,
     clippy::needless_range_loop,
     clippy::type_complexity,
     clippy::let_and_return,
