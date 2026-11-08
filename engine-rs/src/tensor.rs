@@ -504,12 +504,18 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
                 let mut grad_a = vec![0.0; m * k];
                 let mut grad_b = vec![0.0; k * n];
                 for i in 0..m {
-                    for j in 0..n {
-                        let g = grad[i * n + j];
-                        for p in 0..k {
-                            grad_a[i * k + p] += g * right.data[p * n + j];
-                            grad_b[p * n + j] += g * left.data[i * k + p];
+                    let g_row = &grad[i * n..(i + 1) * n];
+                    for p in 0..k {
+                        let l_ip = left.data[i * k + p];
+                        let r_row = &right.data[p * n..(p + 1) * n];
+                        let gb_row = &mut grad_b[p * n..(p + 1) * n];
+                        let mut sum_a = 0.0;
+                        for j in 0..n {
+                            let g = g_row[j];
+                            sum_a += g * r_row[j];
+                            gb_row[j] += g * l_ip;
                         }
+                        grad_a[i * k + p] += sum_a;
                     }
                 }
                 let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;

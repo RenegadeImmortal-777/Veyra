@@ -392,6 +392,122 @@ impl Vm {
     }
     pub(crate) fn execute(&mut self) -> Result<Val, String> {
         loop {
+            if !self.trace {
+                if self.cells.is_empty() {
+                    if let Some(window) = self.code.get(self.ip..self.ip + 4) {
+                        match window {
+                            [
+                                Op::Load(a),
+                                Op::Load(b),
+                                cmp @ (Op::Lt | Op::Le | Op::Gt | Op::Ge),
+                                Op::JumpIfFalse(target),
+                            ] => {
+                                if let (Some(Val::Num(x)), Some(Val::Num(y))) =
+                                    (self.vars.get(a), self.vars.get(b))
+                                {
+                                    let yes = match cmp {
+                                        Op::Lt => *x < *y,
+                                        Op::Le => *x <= *y,
+                                        Op::Gt => *x > *y,
+                                        _ => *x >= *y,
+                                    };
+                                    self.ip = if yes { self.ip + 4 } else { *target };
+                                    continue;
+                                }
+                            }
+                            [
+                                Op::Load(a),
+                                Op::Const(Val::Num(y)),
+                                cmp @ (Op::Lt | Op::Le | Op::Gt | Op::Ge),
+                                Op::JumpIfFalse(target),
+                            ] => {
+                                if let Some(Val::Num(x)) = self.vars.get(a) {
+                                    let yes = match cmp {
+                                        Op::Lt => *x < *y,
+                                        Op::Le => *x <= *y,
+                                        Op::Gt => *x > *y,
+                                        _ => *x >= *y,
+                                    };
+                                    self.ip = if yes { self.ip + 4 } else { *target };
+                                    continue;
+                                }
+                            }
+                            [
+                                Op::Load(a),
+                                Op::Const(Val::Num(k)),
+                                op @ (Op::Add | Op::Sub | Op::Mul),
+                                Op::Store(s),
+                            ] if a == s
+                                && !self.consts.contains(a)
+                                && !self.var_types.contains_key(a) =>
+                            {
+                                let rhs = *k;
+                                let is_add = matches!(op, Op::Add);
+                                let is_sub = matches!(op, Op::Sub);
+                                if let Some(Val::Num(x)) = self.vars.get_mut(a) {
+                                    *x = if is_add {
+                                        *x + rhs
+                                    } else if is_sub {
+                                        *x - rhs
+                                    } else {
+                                        *x * rhs
+                                    };
+                                    self.ip += 4;
+                                    continue;
+                                }
+                            }
+                            [
+                                Op::Load(a),
+                                Op::Load(b),
+                                op @ (Op::Add | Op::Sub | Op::Mul),
+                                Op::Store(s),
+                            ] if a == s
+                                && !self.consts.contains(a)
+                                && !self.var_types.contains_key(a) =>
+                            {
+                                if let Some(Val::Num(y)) = self.vars.get(b).cloned() {
+                                    let is_add = matches!(op, Op::Add);
+                                    let is_sub = matches!(op, Op::Sub);
+                                    if let Some(Val::Num(x)) = self.vars.get_mut(a) {
+                                        *x = if is_add {
+                                            *x + y
+                                        } else if is_sub {
+                                            *x - y
+                                        } else {
+                                            *x * y
+                                        };
+                                        self.ip += 4;
+                                        continue;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                match self.code.get(self.ip) {
+                    Some(Op::Jump(target)) => {
+                        self.ip = *target;
+                        continue;
+                    }
+                    Some(Op::Const(Val::Num(n))) => {
+                        self.stack.push(Val::Num(*n));
+                        self.ip += 1;
+                        continue;
+                    }
+                    Some(Op::Const(Val::Bool(b))) => {
+                        self.stack.push(Val::Bool(*b));
+                        self.ip += 1;
+                        continue;
+                    }
+                    Some(Op::Const(Val::Null)) => {
+                        self.stack.push(Val::Null);
+                        self.ip += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let op = self
                 .code
                 .get(self.ip)

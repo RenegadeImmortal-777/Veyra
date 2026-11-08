@@ -729,13 +729,46 @@ impl Vm {
                     return Err("tensor_matmul shape mismatch".into());
                 }
                 let mut out = vec![0.0; m * ncols];
-                for i in 0..m {
-                    for p in 0..k {
-                        let a_ip = left.data[i * k + p];
-                        let out_row = &mut out[i * ncols..(i + 1) * ncols];
-                        let r_row = &right.data[p * ncols..(p + 1) * ncols];
-                        for j in 0..ncols {
-                            out_row[j] += a_ip * r_row[j];
+                let ops = m.saturating_mul(k).saturating_mul(ncols);
+                if ops >= 32_768 && m >= 8 {
+                    let threads = thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                        .min(m);
+                    let rows_per_chunk = m.div_ceil(threads);
+                    let l_data = &left.data;
+                    let r_data = &right.data;
+                    thread::scope(|s| {
+                        for (chunk_idx, out_chunk) in
+                            out.chunks_mut(rows_per_chunk * ncols).enumerate()
+                        {
+                            let row_start = chunk_idx * rows_per_chunk;
+                            let chunk_rows = out_chunk.len() / ncols;
+                            s.spawn(move || {
+                                for local_i in 0..chunk_rows {
+                                    let i = row_start + local_i;
+                                    let out_row =
+                                        &mut out_chunk[local_i * ncols..(local_i + 1) * ncols];
+                                    for p in 0..k {
+                                        let a_ip = l_data[i * k + p];
+                                        let r_row = &r_data[p * ncols..(p + 1) * ncols];
+                                        for j in 0..ncols {
+                                            out_row[j] += a_ip * r_row[j];
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+                } else {
+                    for i in 0..m {
+                        for p in 0..k {
+                            let a_ip = left.data[i * k + p];
+                            let out_row = &mut out[i * ncols..(i + 1) * ncols];
+                            let r_row = &right.data[p * ncols..(p + 1) * ncols];
+                            for j in 0..ncols {
+                                out_row[j] += a_ip * r_row[j];
+                            }
                         }
                     }
                 }

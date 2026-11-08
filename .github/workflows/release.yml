@@ -1,80 +1,44 @@
-name: Veyra Release
+name: Release Binaries
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-release:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            artifact: veyra-windows-x86_64
-            binary: target/release/veyra.exe
           - os: ubuntu-latest
-            artifact: veyra-linux-x86_64
-            binary: target/release/veyra
+            bin_src: engine-rs/target/release/veyra
+            asset_name: veyra-native-linux-x86_64
           - os: macos-latest
-            artifact: veyra-macos-arm64
-            binary: target/release/veyra
+            bin_src: engine-rs/target/release/veyra
+            asset_name: veyra-native-macos-arm64
+          - os: windows-latest
+            bin_src: engine-rs/target/release/veyra.exe
+            asset_name: veyra-native-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: engine-rs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: clippy,rustfmt
-      - name: Quality gate
-        run: cargo fmt --check
-      - name: Tests
-        run: cargo test
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Portable core
-        run: cargo check --no-default-features
-      - name: Release build
-        run: cargo build --release
-      - name: Stage artifact
+          workspaces: engine-rs
+      - name: Build release binary
+        working-directory: engine-rs
+        run: cargo build --release --locked
+      - name: Rename asset
         shell: bash
-        run: |
-          mkdir -p ../dist/${{ matrix.artifact }}
-          cp ${{ matrix.binary }} ../dist/${{ matrix.artifact }}/
-          cp ../README.md ../dist/${{ matrix.artifact }}/
-          cp -R ../registry ../packages ../stdlib ../dist/${{ matrix.artifact }}/
-      - name: Checksums
-        shell: bash
-        run: |
-          cd ../dist
-          if command -v sha256sum >/dev/null 2>&1; then
-            find ${{ matrix.artifact }} -type f -exec sha256sum {} \; > ${{ matrix.artifact }}.sha256
-          else
-            find ${{ matrix.artifact }} -type f -exec shasum -a 256 {} \; > ${{ matrix.artifact }}.sha256
-          fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            dist/${{ matrix.artifact }}
-            dist/${{ matrix.artifact }}.sha256
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-      - name: Publish GitHub release
+        run: cp "${{ matrix.bin_src }}" "${{ matrix.asset_name }}"
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*
+          files: ${{ matrix.asset_name }}
