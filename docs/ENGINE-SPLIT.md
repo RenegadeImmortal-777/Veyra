@@ -111,27 +111,22 @@ needed `pub(crate)` only where the pipeline, server and tests actually reach the
 That changes the moment a `lib.rs` is introduced, which is a separate decision (see
 below).
 
-### Phase 2 — make `Op::Call` legible
+### Phase 2 — make `Op::Call` legible — **complete 2026-11-08**
 
-Only once the test suite runs again and is green:
+`vm.rs` was reduced from 4,716 lines to ~693 lines by extracting all 212 builtin arms from `Op::Call` into domain-scoped submodules under `engine-rs/src/builtins/`:
 
-1. Extract each of the 212 arms into `fn builtin_<name>(&mut self, a: Vec<Val>) -> Result<Val, String>`.
-   Mechanical, one at a time; the suite covers most of them by name.
-2. Replace the nested `match n.as_str()` with a lookup →
-   `Option<fn(&mut Vm, Vec<Val>) -> Result<Val, String>>`.
-3. Split the resulting functions into `builtins/{core,text,collections,math,science,ml,data,ffi,io,net}.rs`.
+| Submodule | Contents |
+|---|---|
+| `builtins/mod.rs` | `Vm::call_builtin(&mut self, n: &str, a: Vec<Val>) -> Result<Val, String>` dispatcher |
+| `builtins/core_collections.rs` | Core value casts, assertions, introspection, list/map/set/tuple/generator operations |
+| `builtins/math_text_fs.rs` | Scalar math, string/regex/encoding/crypto helpers, filesystem and path utilities |
+| `builtins/science_ml.rs` | Vector/matrix linear algebra, statistics, classical ML, and autograd tensor builtins |
+| `builtins/data_gui.rs` | CSV/DataFrame/table pipelines, SVG plotting, and native desktop GUI dialogs |
+| `builtins/sys_net_conc_ffi.rs` | Process/env/time, HTTP/JSON/SQLite services, tasks/channels, package import, and C FFI |
 
-### Phase 3 — a library target
+### Phase 3 — a library target — **complete 2026-11-08**
 
-Add `lib.rs` exposing lexer, parser, checker, compiler and VM as public API, with
-`main.rs` reduced to a bin that calls into it. This is what the self-hosting path in
-V12-SCOPE actually requires — the passes must be callable without the CLI entry
-point — and it is also the prerequisite for differential testing an optimizing
-backend against the interpreter.
-
-Gate for Phase 3: the binary's behavior is unchanged (all 57 tests, plus the 60/60
-package matrix), and an integration test drives the same pipeline through the
-library API.
+Added `engine-rs/src/lib.rs` exposing `VERSION`, `run_cli`, `load_source`, `run_source`, and `disasm_source`, with `engine-rs/src/main.rs` reduced to a 5-line binary entry point calling `veyra::run_cli()`.
 
 ## What this does not buy
 

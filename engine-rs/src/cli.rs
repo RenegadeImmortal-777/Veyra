@@ -56,7 +56,7 @@ pub(crate) fn doctor() {
 }
 
 pub(crate) fn repl() -> Result<(), String> {
-    println!("Veyra {VERSION} native REPL Ã¢â‚¬â€ :quit to exit");
+    println!("Veyra {VERSION} native REPL — :quit to exit");
     let mut line = String::new();
     loop {
         print!("vy> ");

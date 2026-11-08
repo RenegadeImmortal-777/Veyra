@@ -7,11 +7,32 @@ use crate::lexer::Tok;
 
 pub(crate) struct Parser {
     t: Vec<Tok>,
+    lines: Vec<usize>,
     i: usize,
 }
 impl Parser {
     pub(crate) fn new(t: Vec<Tok>) -> Self {
-        Self { t, i: 0 }
+        let len = t.len();
+        Self {
+            t,
+            lines: vec![0; len],
+            i: 0,
+        }
+    }
+    pub(crate) fn new_with_lines(tokens: Vec<(Tok, usize)>) -> Self {
+        let (t, lines) = tokens.into_iter().unzip();
+        Self { t, lines, i: 0 }
+    }
+    fn line(&self) -> usize {
+        self.lines.get(self.i).copied().unwrap_or(0)
+    }
+    fn fmt_err(&self, msg: String) -> String {
+        let l = self.line();
+        if l > 0 {
+            format!("line {l}: {msg}")
+        } else {
+            msg
+        }
     }
     fn cur(&self) -> &Tok {
         &self.t[self.i]
@@ -36,7 +57,7 @@ impl Parser {
         if self.eat(w) {
             Ok(())
         } else {
-            Err(format!("{msg}; got {:?}", self.cur()))
+            Err(self.fmt_err(format!("{msg}; got {:?}", self.cur())))
         }
     }
     pub(crate) fn program(&mut self) -> Result<Vec<Stmt>, String> {
@@ -246,7 +267,11 @@ impl Parser {
             let c = self.expr()?;
             let a = self.block()?;
             let b = if self.eat(&Tok::Else) {
-                self.block()?
+                if matches!(self.cur(), Tok::If) {
+                    vec![self.stmt()?]
+                } else {
+                    self.block()?
+                }
             } else {
                 vec![]
             };
@@ -268,12 +293,26 @@ impl Parser {
                 && matches!(self.t[self.i + 1], Tok::Lp)
             {
                 self.i += 2;
-                let start = self.expr()?;
+                let first = self.expr()?;
+                if self.eat(&Tok::Rp) {
+                    let body = self.block()?;
+                    return Ok(Stmt::ForRange(name, Expr::Num(0.0), first, body));
+                }
                 self.need(&Tok::Comma, "expected ',' in range")?;
-                let end = self.expr()?;
+                let second = self.expr()?;
+                if self.eat(&Tok::Rp) {
+                    let body = self.block()?;
+                    return Ok(Stmt::ForRange(name, first, second, body));
+                }
+                self.need(&Tok::Comma, "expected ',' in range")?;
+                let step = self.expr()?;
                 self.need(&Tok::Rp, "expected ')' after range")?;
                 let body = self.block()?;
-                return Ok(Stmt::ForRange(name, start, end, body));
+                return Ok(Stmt::ForEach(
+                    name,
+                    Expr::Call("range".into(), vec![first, second, step]),
+                    body,
+                ));
             }
             let iterable = self.expr()?;
             let body = self.block()?;
@@ -326,22 +365,29 @@ impl Parser {
             }
             return Ok(Stmt::Match(subject, cases));
         }
-        if let Tok::Id(n) = self.cur().clone() {
-            if self.i + 1 < self.t.len() && matches!(self.t[self.i + 1], Tok::Eq) {
-                self.i += 2;
-                let e = self.expr()?;
-                self.eat(&Tok::Semi);
-                return Ok(Stmt::Assign(n, e));
-            }
-        }
         let e = self.expr()?;
-        if self.eat(&Tok::Eq) {
-            let value = self.expr()?;
+        let assign_op = match self.cur() {
+            Tok::Eq => Some(None),
+            Tok::PlusEq => Some(Some("+")),
+            Tok::MinusEq => Some(Some("-")),
+            Tok::StarEq => Some(Some("*")),
+            Tok::SlashEq => Some(Some("/")),
+            _ => None,
+        };
+        if let Some(compound_op) = assign_op {
+            self.i += 1;
+            let rhs = self.expr()?;
             self.eat(&Tok::Semi);
-            if let Expr::Member(obj, name) = e {
-                return Ok(Stmt::SetMember(*obj, name, value));
-            }
-            return Err("invalid assignment target".into());
+            let value = match compound_op {
+                Some(op) => Expr::Bin(Box::new(e.clone()), op.into(), Box::new(rhs)),
+                None => rhs,
+            };
+            return match e {
+                Expr::Var(n) => Ok(Stmt::Assign(n, value)),
+                Expr::Member(obj, name) => Ok(Stmt::SetMember(*obj, name, value)),
+                Expr::Index(target, idx) => Ok(Stmt::SetIndex(*target, *idx, value)),
+                _ => Err("invalid assignment target".into()),
+            };
         }
         self.eat(&Tok::Semi);
         Ok(Stmt::Expr(e))
@@ -432,7 +478,16 @@ impl Parser {
         if self.eat(&Tok::Minus) {
             return Ok(Expr::Unary("-".into(), Box::new(self.unary()?)));
         }
-        self.postfix()
+        self.power()
+    }
+    fn power(&mut self) -> Result<Expr, String> {
+        let base = self.postfix()?;
+        if self.eat(&Tok::StarStar) {
+            let exp = self.unary()?;
+            Ok(Expr::Bin(Box::new(base), "**".into(), Box::new(exp)))
+        } else {
+            Ok(base)
+        }
     }
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
@@ -529,9 +584,28 @@ impl Parser {
                 }
             }
             Tok::Lp => {
-                let e = self.expr()?;
+                if self.eat(&Tok::Rp) {
+                    return Ok(Expr::List(vec![]));
+                }
+                let first = self.expr()?;
+                if self.eat(&Tok::Comma) {
+                    let mut items = vec![first];
+                    if !self.eat(&Tok::Rp) {
+                        loop {
+                            items.push(self.expr()?);
+                            if self.eat(&Tok::Rp) {
+                                break;
+                            }
+                            self.need(&Tok::Comma, "expected ',' in tuple")?;
+                            if self.eat(&Tok::Rp) {
+                                break;
+                            }
+                        }
+                    }
+                    return Ok(Expr::Call("tuple".into(), vec![Expr::List(items)]));
+                }
                 self.need(&Tok::Rp, "expected ')'")?;
-                Ok(e)
+                Ok(first)
             }
             Tok::Ls => {
                 if self.eat(&Tok::Rs) {
@@ -569,22 +643,43 @@ impl Parser {
                 Ok(Expr::List(a))
             }
             Tok::Lb => {
-                let mut pairs = vec![];
-                if !self.eat(&Tok::Rb) {
-                    loop {
-                        let key = self.expr()?;
-                        self.need(&Tok::Colon, "expected ':' in map")?;
-                        let value = self.expr()?;
-                        pairs.push((key, value));
-                        if self.eat(&Tok::Rb) {
-                            break;
-                        }
-                        self.need(&Tok::Comma, "expected ',' in map")?;
-                    }
+                if self.eat(&Tok::Rb) {
+                    return Ok(Expr::Map(vec![]));
                 }
-                Ok(Expr::Map(pairs))
+                let first = self.expr()?;
+                if self.eat(&Tok::Colon) {
+                    let first_val = self.expr()?;
+                    let mut pairs = vec![(first, first_val)];
+                    if !self.eat(&Tok::Rb) {
+                        self.need(&Tok::Comma, "expected ',' in map")?;
+                        while !self.eat(&Tok::Rb) {
+                            let key = self.expr()?;
+                            self.need(&Tok::Colon, "expected ':' in map")?;
+                            let value = self.expr()?;
+                            pairs.push((key, value));
+                            if self.eat(&Tok::Rb) {
+                                break;
+                            }
+                            self.need(&Tok::Comma, "expected ',' in map")?;
+                        }
+                    }
+                    Ok(Expr::Map(pairs))
+                } else {
+                    let mut items = vec![first];
+                    if !self.eat(&Tok::Rb) {
+                        self.need(&Tok::Comma, "expected ',' in set")?;
+                        while !self.eat(&Tok::Rb) {
+                            items.push(self.expr()?);
+                            if self.eat(&Tok::Rb) {
+                                break;
+                            }
+                            self.need(&Tok::Comma, "expected ',' in set")?;
+                        }
+                    }
+                    Ok(Expr::Call("set".into(), vec![Expr::List(items)]))
+                }
             }
-            x => Err(format!("expected expression, got {x:?}")),
+            x => Err(self.fmt_err(format!("expected expression, got {x:?}"))),
         }
     }
 }

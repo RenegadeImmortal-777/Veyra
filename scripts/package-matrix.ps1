@@ -16,9 +16,15 @@ foreach ($name in $names) {
     & $exe new $project | Out-Null
     Push-Location $project
     & $exe add $name | Out-Null
-    ('use "' + $name + '";' + [Environment]::NewLine + 'print("PACKAGE_OK");') | Set-Content '.\src\main.vy'
+    ('use "' + $name + '";' + [Environment]::NewLine + 'let pkg = import_package("' + $name + '");' + [Environment]::NewLine + 'assert(len(keys(pkg)) > 0);') | Set-Content '.\src\main.vy'
     & $exe check *> $null
-    if ($LASTEXITCODE -ne 0) { $failed += $name; Write-Host "FAIL $name" } else { Write-Host "PASS $name" }
+    $checkOk = ($LASTEXITCODE -eq 0)
+    $runOk = $false
+    if ($checkOk) {
+        & $exe run *> $null
+        $runOk = ($LASTEXITCODE -eq 0)
+    }
+    if (-not ($checkOk -and $runOk)) { $failed += $name; Write-Host "FAIL $name" } else { Write-Host "PASS $name" }
     Pop-Location
 }
 Write-Host "TOTAL=$($names.Count)"

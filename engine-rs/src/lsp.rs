@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::VERSION;
 use crate::ast::Stmt;
-use crate::lexer::lex;
+use crate::lexer::{lex, lex_with_lines};
 use crate::parser::Parser;
 use crate::pipeline::semantic_check_ast;
 use crate::project::fmt_source;
@@ -179,9 +179,9 @@ pub(crate) fn lsp_diagnostics(text: &str) -> Vec<JsonValue> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let result = match lex(&filtered) {
+    let result = match lex_with_lines(&filtered) {
         Err(e) => Err(e),
-        Ok(tokens) => match Parser::new(tokens).program() {
+        Ok(tokens) => match Parser::new_with_lines(tokens).program() {
             Err(e) => Err(e),
             Ok(ast) => {
                 if has_imports {
@@ -194,15 +194,23 @@ pub(crate) fn lsp_diagnostics(text: &str) -> Vec<JsonValue> {
     };
     match result {
         Ok(()) => vec![],
-        Err(message) => vec![serde_json::json!({
-            "range": {
-                "start": {"line":0,"character":0},
-                "end": {"line":0,"character":1}
-            },
-            "severity": 1,
-            "source": "veyra",
-            "message": message
-        })],
+        Err(message) => {
+            let line = message
+                .strip_prefix("line ")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|n| n.parse::<usize>().ok())
+                .map(|n| n.saturating_sub(1))
+                .unwrap_or(0);
+            vec![serde_json::json!({
+                "range": {
+                    "start": {"line":line,"character":0},
+                    "end": {"line":line,"character":1}
+                },
+                "severity": 1,
+                "source": "veyra",
+                "message": message
+            })]
+        }
     }
 }
 

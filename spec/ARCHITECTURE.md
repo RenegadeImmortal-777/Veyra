@@ -31,13 +31,15 @@ primitives, and the tensor/autograd runtime. The binary is shipped as
 
 **This path does not require Python.**
 
-### Known structural constraint
+### Modular crate layout
 
-The engine is one 9,495-line source file. Lexer, parser, compiler, VM, LSP, web
-server, registry and tensor stack all live in `engine-rs/src/main.rs`. Nothing about
-the language design depends on this, and it is the largest obstacle to the remaining
-roadmap items — an optimizing backend and self-hosting both want a modular compiler
-with separable passes. Splitting the crate is a prerequisite, not a nice-to-have.
+Phase 1 of the engine split moved the lexer, parser, AST, value helpers, bytecode
+definitions, shared runtime registries, tensor stack, compiler, VM, compile pipeline,
+CLI tooling, LSP, package registry, project helpers, HTTP servers and CLI entry
+points into sixteen focused modules under `engine-rs/src/` (see
+[../docs/ENGINE-SPLIT.md](../docs/ENGINE-SPLIT.md)). Phase 2 decomposes the inline
+builtins inside `vm.rs`, and Phase 3 exposes a library target (`lib.rs`) for the
+optimizing backend and self-hosting work.
 
 ## Secondary path: the Convergence runtime
 

@@ -8,24 +8,60 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 
-use crate::pipeline::{load_source, run_source};
+use crate::pipeline::{compile_to_vybc, load_source, run_source};
 
 pub(crate) fn fmt_source(src: &str) -> String {
     let mut out = String::new();
     let mut indent = 0usize;
+    let mut prev_blank = true;
     for raw in src.lines() {
         let line = raw.trim().to_string();
-        if line.starts_with('}') {
+        if line.is_empty() {
+            if !prev_blank {
+                out.push('\n');
+                prev_blank = true;
+            }
+            continue;
+        }
+        prev_blank = false;
+        let starts_close = line.starts_with('}');
+        if starts_close {
             indent = indent.saturating_sub(1);
         }
-        if !line.is_empty() {
-            out.push_str(&"    ".repeat(indent));
-            out.push_str(&line);
-            out.push('\n');
+        out.push_str(&"    ".repeat(indent));
+        out.push_str(&line);
+        out.push('\n');
+        let mut opens = 0usize;
+        let mut closes = 0usize;
+        let mut in_str = None;
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if let Some(q) = in_str {
+                if c == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    in_str = None;
+                }
+            } else if c == '"' || c == '\'' {
+                in_str = Some(c);
+            } else if (c == '/' && i + 1 < chars.len() && chars[i + 1] == '/') || c == '#' {
+                break;
+            } else if c == '{' {
+                opens += 1;
+            } else if c == '}' {
+                closes += 1;
+            }
+            i += 1;
         }
-        if line.ends_with('{') {
-            indent += 1;
-        }
+        let extra_closes = closes.saturating_sub(if starts_close { 1 } else { 0 });
+        indent = (indent + opens).saturating_sub(extra_closes);
+    }
+    while out.ends_with("\n\n") {
+        out.pop();
     }
     out
 }
@@ -158,6 +194,16 @@ pub(crate) fn build_project() -> Result<(), String> {
         copy_dir_all(&root.join("vendor"), &dist.join("vendor"))?;
     }
     fs::copy(&manifest_path, dist.join("veyra.json")).map_err(|e| e.to_string())?;
+    let entry_rel = manifest
+        .get("entry")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("src/main.vy");
+    let entry_path = root.join(entry_rel);
+    if entry_path.exists() {
+        let bundled = load_source(entry_path.to_string_lossy().as_ref())?;
+        let vybc = compile_to_vybc(&bundled)?;
+        fs::write(dist.join("app.vybc"), vybc).map_err(|e| e.to_string())?;
+    }
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     fs::copy(
         &exe,

@@ -50,8 +50,13 @@ pub(crate) enum Tok {
     Plus,
     Minus,
     Star,
+    StarStar,
     Slash,
     Percent,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
     Eq,
     EqEq,
     Ne,
@@ -65,20 +70,43 @@ pub(crate) enum Tok {
 }
 
 pub(crate) fn lex(src: &str) -> Result<Vec<Tok>, String> {
+    Ok(lex_with_lines(src)?.into_iter().map(|(t, _)| t).collect())
+}
+
+pub(crate) fn lex_with_lines(src: &str) -> Result<Vec<(Tok, usize)>, String> {
     let mut out = Vec::new();
     let cs: Vec<char> = src.chars().collect();
     let mut i = 0;
+    let mut line = 1usize;
     while i < cs.len() {
         let c = cs[i];
         if c.is_whitespace() {
+            if c == '\n' {
+                line += 1;
+            }
             i += 1;
             continue;
         }
-        if c == '/' && i + 1 < cs.len() && cs[i + 1] == '/' {
-            i += 2;
+        if (c == '/' && i + 1 < cs.len() && cs[i + 1] == '/') || c == '#' {
+            i += if c == '#' { 1 } else { 2 };
             while i < cs.len() && cs[i] != '\n' {
                 i += 1;
             }
+            continue;
+        }
+        if c == '/' && i + 1 < cs.len() && cs[i + 1] == '*' {
+            let start_line = line;
+            i += 2;
+            while i + 1 < cs.len() && !(cs[i] == '*' && cs[i + 1] == '/') {
+                if cs[i] == '\n' {
+                    line += 1;
+                }
+                i += 1;
+            }
+            if i + 1 >= cs.len() {
+                return Err(format!("line {start_line}: unterminated block comment"));
+            }
+            i += 2;
             continue;
         }
         if c.is_ascii_digit() {
@@ -91,14 +119,19 @@ pub(crate) fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 .iter()
                 .collect::<String>()
                 .parse()
-                .map_err(|_| "bad number")?;
-            out.push(Tok::Num(n));
+                .map_err(|_| format!("line {line}: bad number"))?;
+            out.push((Tok::Num(n), line));
             continue;
         }
-        if c == '"' {
+        if c == '"' || c == '\'' {
+            let start_line = line;
+            let quote = c;
             i += 1;
             let mut s = String::new();
-            while i < cs.len() && cs[i] != '"' {
+            while i < cs.len() && cs[i] != quote {
+                if cs[i] == '\n' {
+                    line += 1;
+                }
                 if cs[i] == '\\' && i + 1 < cs.len() {
                     i += 1;
                     s.push(match cs[i] {
@@ -113,10 +146,10 @@ pub(crate) fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             if i >= cs.len() {
-                return Err("unterminated string".into());
+                return Err(format!("line {start_line}: unterminated string"));
             }
             i += 1;
-            out.push(Tok::Str(s));
+            out.push((Tok::Str(s), start_line));
             continue;
         }
         if c.is_ascii_alphabetic() || c == '_' {
@@ -126,7 +159,7 @@ pub(crate) fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             let w: String = cs[s..i].iter().collect();
-            out.push(match w.as_str() {
+            let tok = match w.as_str() {
                 "let" => Tok::Let,
                 "const" => Tok::Const,
                 "fn" => Tok::Fn,
@@ -157,98 +190,104 @@ pub(crate) fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 "false" => Tok::False,
                 "null" => Tok::Null,
                 _ => Tok::Id(w),
-            });
+            };
+            out.push((tok, line));
             continue;
         }
         macro_rules! two {
             ($ch:expr,$eq:expr,$one:expr) => {{
                 if i + 1 < cs.len() && cs[i + 1] == '=' {
                     i += 2;
-                    out.push($eq);
+                    out.push(($eq, line));
                 } else {
                     i += 1;
-                    out.push($one);
+                    out.push(($one, line));
                 }
                 continue;
             }};
         }
         match c {
             '(' => {
-                out.push(Tok::Lp);
+                out.push((Tok::Lp, line));
                 i += 1
             }
             ')' => {
-                out.push(Tok::Rp);
+                out.push((Tok::Rp, line));
                 i += 1
             }
             '{' => {
-                out.push(Tok::Lb);
+                out.push((Tok::Lb, line));
                 i += 1
             }
             '}' => {
-                out.push(Tok::Rb);
+                out.push((Tok::Rb, line));
                 i += 1
             }
             '[' => {
-                out.push(Tok::Ls);
+                out.push((Tok::Ls, line));
                 i += 1
             }
             ']' => {
-                out.push(Tok::Rs);
+                out.push((Tok::Rs, line));
                 i += 1
             }
             ',' => {
-                out.push(Tok::Comma);
+                out.push((Tok::Comma, line));
                 i += 1
             }
             '@' => {
-                out.push(Tok::At);
+                out.push((Tok::At, line));
                 i += 1
             }
             ':' => {
-                out.push(Tok::Colon);
+                out.push((Tok::Colon, line));
                 i += 1
             }
             '.' => {
-                out.push(Tok::Dot);
+                out.push((Tok::Dot, line));
                 i += 1
             }
             ';' => {
-                out.push(Tok::Semi);
+                out.push((Tok::Semi, line));
                 i += 1
             }
-            '+' => {
-                out.push(Tok::Plus);
-                i += 1
-            }
+            '+' => two!('=', Tok::PlusEq, Tok::Plus),
             '-' => {
                 if i + 1 < cs.len() && cs[i + 1] == '>' {
-                    out.push(Tok::Arrow);
+                    out.push((Tok::Arrow, line));
+                    i += 2
+                } else if i + 1 < cs.len() && cs[i + 1] == '=' {
+                    out.push((Tok::MinusEq, line));
                     i += 2
                 } else {
-                    out.push(Tok::Minus);
+                    out.push((Tok::Minus, line));
                     i += 1
                 }
             }
             '*' => {
-                out.push(Tok::Star);
-                i += 1
+                if i + 1 < cs.len() && cs[i + 1] == '*' {
+                    out.push((Tok::StarStar, line));
+                    i += 2
+                } else if i + 1 < cs.len() && cs[i + 1] == '=' {
+                    out.push((Tok::StarEq, line));
+                    i += 2
+                } else {
+                    out.push((Tok::Star, line));
+                    i += 1
+                }
             }
-            '/' => {
-                out.push(Tok::Slash);
-                i += 1
-            }
+            '/' => two!('=', Tok::SlashEq, Tok::Slash),
             '%' => {
-                out.push(Tok::Percent);
+                out.push((Tok::Percent, line));
                 i += 1
             }
             '=' => two!('=', Tok::EqEq, Tok::Eq),
             '!' => two!('=', Tok::Ne, Tok::Bang),
             '<' => two!('=', Tok::Le, Tok::Lt),
             '>' => two!('=', Tok::Ge, Tok::Gt),
-            _ => return Err(format!("unexpected character {c:?}")),
+            _ => return Err(format!("line {line}: unexpected character {c:?}")),
         }
     }
-    out.push(Tok::Eof);
+    out.push((Tok::Eof, line));
     Ok(out)
 }

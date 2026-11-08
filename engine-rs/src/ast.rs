@@ -53,6 +53,7 @@ pub(crate) enum Stmt {
     ),
     Class(String, Option<String>, Vec<Stmt>),
     SetMember(Expr, String, Expr),
+    SetIndex(Expr, Expr, Expr),
     Match(Expr, Vec<(Option<Expr>, Vec<Stmt>)>),
     With(Expr, String, Vec<Stmt>),
     Return(Option<Expr>),

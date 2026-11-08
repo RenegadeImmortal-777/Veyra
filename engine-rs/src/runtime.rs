@@ -67,6 +67,14 @@ pub(crate) fn export_function_object(def: FunctionDef) -> Result<String, String>
     Ok(key)
 }
 
+pub(crate) fn register_named_function_object(name: &str, def: FunctionDef) -> Result<(), String> {
+    function_objects()
+        .lock()
+        .map_err(|_| "function object registry poisoned")?
+        .insert(name.to_string(), def);
+    Ok(())
+}
+
 pub(crate) fn resolve_function_object(name: &str) -> Result<Option<FunctionDef>, String> {
     Ok(function_objects()
         .lock()

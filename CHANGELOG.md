@@ -17,6 +17,51 @@ release date in the source material; earlier entries are undated.
 
 ---
 
+## 12.0 Sovereign
+
+Self-hosting, language parity, compiler optimization, and tensor broadcasting release.
+Release gate verified **2026-11-08**.
+
+- **Self-Hosted Compiler (`compiler-vy/src/main.vy`) & `.vybc` Bytecode**:
+  - Added portable `veyra-bc-v1` (`.vybc`) bytecode serialization with SHA-256 tamper
+    detection (`encode_bytecode`, `decode_bytecode`, `compile_to_vybc`, `run_vybc`,
+    `vybc_compile`, `vybc_run`, and `.vybc` CLI execution/output).
+  - Implemented a 100% pure-Veyra tokenizer, recursive-descent parser, and `.vybc`
+    bytecode generator in `compiler-vy/src/main.vy`, verified to a 3-stage bootstrap
+    fixpoint (`Stage 2 .vybc == Stage 3 .vybc`).
+- **Engine Architecture & Builtin Decomposition (`Phase 1`)**:
+  - Decomposed `engine-rs/src/vm.rs` (4,716 lines → ~780 lines) by extracting all
+    210+ built-ins into `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
+  - Separated `engine-rs/src/lib.rs` from the 5-line `engine-rs/src/main.rs` binary
+    entry point.
+- **Language Semantics, Closures, Unwind Safety & Syntax Parity (`Phase 2`)**:
+  - Added per-variable `Arc<Mutex<Val>>` closure upvalue cells (`Vm::cells` and
+    `FunctionDef::upvalues`) so closures maintain independent mutable lexical state
+    across invocations and sync mutations with enclosing scopes.
+  - Added short-circuit `and`/`or` compilation, unwind-safe `try`/`catch` and
+    `with ... as ...` context manager cleanup on exceptions, line-aware lexer/parser/LSP
+    diagnostics, and static parent-class existence checks.
+  - Achieved full syntax parity across runtimes: `/* ... */` and `#` comments, `'...'`
+    single-quoted strings, right-associative `**`, tuple `(a, b)` and set `{a, b}`
+    literals, `else if` chains, `+=`/`-=`/`*=`/`/=`, list/map index assignment
+    (`xs[i] = v`, `m[k] = v`), and 1/2/3-arg `range(...)`.
+- **Bytecode Optimizer & Tensor Runtime (`Phase 3`)**:
+  - Added `engine-rs/src/ir.rs` (`optimize_bytecode`) performing jump-target-safe
+    constant folding, double-negation elimination, dead branch elimination, and jump
+    threading.
+  - Added NumPy/PyTorch-style N-D tensor broadcasting with automatic backward
+    gradient reduction across broadcasted axes, cache-friendly row-major
+    `tensor_matmul`, and unreachable autograd tape garbage collection
+    (`tensor_gc_unreachable`, `tensor_gc`, `tensor_live_count`).
+- **Security, Tooling & Release Gates (`Phase 0` & `Phase 4`)**:
+  - Patched static server path traversal (`resolve_static_path`), multi-`use` line
+    truncation in `load_source`, and `import_package` function reference sharing.
+  - Upgraded `INSTALL.bat` to install the native Horizon binary, upgraded
+    `scripts/package-matrix.ps1` and `scripts/package-matrix.sh` to execute all 60
+    packages, added `examples/zenith/autograd_adam.vy` and
+    `examples/nexus/security_and_data.vy`, and achieved 72/72 unit tests and 8/8
+    passing release gates.
+
 ## 11.0 Nexus
 
 Ecosystem-focused successor to Zenith. Release gate reported **2026-09-21**.

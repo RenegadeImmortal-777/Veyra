@@ -11,6 +11,7 @@ if ($LASTEXITCODE -ne 0) { throw "clippy failed" }
 cargo build --release
 if ($LASTEXITCODE -ne 0) { throw "release build failed" }
 Pop-Location
+Copy-Item "$PSScriptRoot\..\engine-rs\target\release\veyra.exe" "$PSScriptRoot\..\bin\veyra-native.exe" -Force
 & "$PSScriptRoot\package-matrix.ps1"
 & "$PSScriptRoot\ecosystem-gate.ps1"
 Write-Host "Veyra release checks passed."

@@ -3,6 +3,7 @@
 //
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Mutex, OnceLock,
@@ -14,6 +15,10 @@ use crate::value::{Val, as_matrix, as_num_list};
 pub(crate) static TENSOR_IDS: AtomicU64 = AtomicU64::new(1);
 pub(crate) static TENSORS: OnceLock<Mutex<HashMap<u64, TensorData>>> = OnceLock::new();
 pub(crate) static ADAM_STATES: OnceLock<Mutex<HashMap<u64, AdamState>>> = OnceLock::new();
+
+thread_local! {
+    static PENDING_TAPE_IDS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum TensorOp {
@@ -160,6 +165,56 @@ pub(crate) fn tensor_store(
     Ok(tensor_handle(id, &shape))
 }
 
+pub(crate) fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {
+    if a == b {
+        return Ok(a.to_vec());
+    }
+    let rank = a.len().max(b.len());
+    let mut out = vec![1usize; rank];
+    let oa = rank - a.len();
+    let ob = rank - b.len();
+    for d in 0..rank {
+        let da = if d >= oa { a[d - oa] } else { 1 };
+        let db = if d >= ob { b[d - ob] } else { 1 };
+        if da == db {
+            out[d] = da;
+        } else if da == 1 {
+            out[d] = db;
+        } else if db == 1 {
+            out[d] = da;
+        } else {
+            return Err("tensor shapes are not broadcast-compatible".into());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn broadcast_index(flat_out: usize, out_shape: &[usize], in_shape: &[usize]) -> usize {
+    if out_shape == in_shape {
+        return flat_out;
+    }
+    if in_shape.is_empty() {
+        return 0;
+    }
+    let mut rem = flat_out;
+    let mut in_flat = 0usize;
+    let mut in_stride = 1usize;
+    let offset = out_shape.len().saturating_sub(in_shape.len());
+    for d in (0..out_shape.len()).rev() {
+        let dim = out_shape[d].max(1);
+        let coord = rem % dim;
+        rem /= dim;
+        if d >= offset {
+            let in_d = d - offset;
+            let in_dim = in_shape[in_d].max(1);
+            let in_coord = if in_dim == 1 { 0 } else { coord };
+            in_flat += in_coord * in_stride;
+            in_stride *= in_dim;
+        }
+    }
+    in_flat
+}
+
 pub(crate) fn tensor_topology(
     id: u64,
     seen: &mut HashSet<u64>,
@@ -214,7 +269,7 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
         let t = store.get_mut(&root).ok_or("unknown tensor")?;
         t.grad = vec![1.0];
     }
-    for id in order.into_iter().rev() {
+    for id in order.iter().copied().rev() {
         let current = tensor_snapshot(id)?;
         let grad = current.grad.clone();
         match current.op {
@@ -224,8 +279,10 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
                 for parent in [a, b] {
                     if let Some(t) = store.get_mut(&parent) {
                         if t.requires_grad {
-                            for (dst, src) in t.grad.iter_mut().zip(grad.iter()) {
-                                *dst += *src;
+                            let p_shape = t.shape.clone();
+                            for (i, g) in grad.iter().enumerate() {
+                                let pi = broadcast_index(i, &current.shape, &p_shape);
+                                t.grad[pi] += *g;
                             }
                         }
                     }
@@ -235,15 +292,19 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
                 let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
                 if let Some(t) = store.get_mut(&a) {
                     if t.requires_grad {
-                        for (dst, src) in t.grad.iter_mut().zip(grad.iter()) {
-                            *dst += *src;
+                        let p_shape = t.shape.clone();
+                        for (i, g) in grad.iter().enumerate() {
+                            let pi = broadcast_index(i, &current.shape, &p_shape);
+                            t.grad[pi] += *g;
                         }
                     }
                 }
                 if let Some(t) = store.get_mut(&b) {
                     if t.requires_grad {
-                        for (dst, src) in t.grad.iter_mut().zip(grad.iter()) {
-                            *dst -= *src;
+                        let p_shape = t.shape.clone();
+                        for (i, g) in grad.iter().enumerate() {
+                            let pi = broadcast_index(i, &current.shape, &p_shape);
+                            t.grad[pi] -= *g;
                         }
                     }
                 }
@@ -254,15 +315,19 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
                 let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
                 if let Some(t) = store.get_mut(&a) {
                     if t.requires_grad {
-                        for i in 0..t.grad.len() {
-                            t.grad[i] += grad[i] * right.data[i];
+                        for (i, g) in grad.iter().enumerate() {
+                            let ia = broadcast_index(i, &current.shape, &left.shape);
+                            let ib = broadcast_index(i, &current.shape, &right.shape);
+                            t.grad[ia] += *g * right.data[ib];
                         }
                     }
                 }
                 if let Some(t) = store.get_mut(&b) {
                     if t.requires_grad {
-                        for i in 0..t.grad.len() {
-                            t.grad[i] += grad[i] * left.data[i];
+                        for (i, g) in grad.iter().enumerate() {
+                            let ia = broadcast_index(i, &current.shape, &left.shape);
+                            let ib = broadcast_index(i, &current.shape, &right.shape);
+                            t.grad[ib] += *g * left.data[ia];
                         }
                     }
                 }
@@ -273,16 +338,20 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
                 let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
                 if let Some(t) = store.get_mut(&a) {
                     if t.requires_grad {
-                        for i in 0..t.grad.len() {
-                            t.grad[i] += grad[i] / right.data[i];
+                        for (i, g) in grad.iter().enumerate() {
+                            let ia = broadcast_index(i, &current.shape, &left.shape);
+                            let ib = broadcast_index(i, &current.shape, &right.shape);
+                            t.grad[ia] += *g / right.data[ib];
                         }
                     }
                 }
                 if let Some(t) = store.get_mut(&b) {
                     if t.requires_grad {
-                        for i in 0..t.grad.len() {
-                            let denom = right.data[i] * right.data[i];
-                            t.grad[i] -= grad[i] * left.data[i] / denom;
+                        for (i, g) in grad.iter().enumerate() {
+                            let ia = broadcast_index(i, &current.shape, &left.shape);
+                            let ib = broadcast_index(i, &current.shape, &right.shape);
+                            let denom = right.data[ib] * right.data[ib];
+                            t.grad[ib] -= *g * left.data[ia] / denom;
                         }
                     }
                 }
@@ -463,5 +532,60 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
             }
         }
     }
+    PENDING_TAPE_IDS.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        for id in order {
+            if let Ok(t) = tensor_snapshot(id) {
+                if !matches!(t.op, TensorOp::Leaf) {
+                    pending.insert(id);
+                }
+            }
+        }
+    });
     Ok(())
+}
+
+pub(crate) fn collect_val_tensor_ids(val: &Val, out: &mut HashSet<u64>) {
+    match val {
+        Val::Map(_) => {
+            if let Ok(id) = tensor_id(val) {
+                out.insert(id);
+            } else if let Val::Map(pairs) = val {
+                for (k, v) in pairs {
+                    collect_val_tensor_ids(k, out);
+                    collect_val_tensor_ids(v, out);
+                }
+            }
+        }
+        Val::List(items) => {
+            for item in items {
+                collect_val_tensor_ids(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn tensor_gc_unreachable(live_roots: &HashSet<u64>) -> Result<usize, String> {
+    let mut reachable = HashSet::new();
+    for &root in live_roots {
+        let mut order = vec![];
+        let _ = tensor_topology(root, &mut reachable, &mut order);
+    }
+    let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+    let mut removed = 0usize;
+    PENDING_TAPE_IDS.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        pending.retain(|id| {
+            if reachable.contains(id) {
+                true
+            } else {
+                if store.remove(id).is_some() {
+                    removed += 1;
+                }
+                false
+            }
+        });
+    });
+    Ok(removed)
 }

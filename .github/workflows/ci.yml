@@ -37,14 +37,28 @@ jobs:
         working-directory: engine-rs
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-  package-matrix:
+  package-matrix-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build debug compiler
+      - name: Build release compiler
         working-directory: engine-rs
-        run: cargo build
-      - name: Validate registry packages
+        run: cargo build --release
+      - name: Validate registry packages (Windows)
         shell: powershell
         run: powershell -ExecutionPolicy Bypass -File .\scripts\package-matrix.ps1
+      - name: Validate ecosystem gate (Windows)
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\ecosystem-gate.ps1
+
+  package-matrix-posix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release compiler
+        working-directory: engine-rs
+        run: cargo build --release
+      - name: Validate registry packages (POSIX)
+        run: sh ./scripts/package-matrix.sh

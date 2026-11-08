@@ -165,6 +165,39 @@ impl Compiler {
                 self.code.push(if op == "-" { Op::Neg } else { Op::Not });
             }
             Expr::Bin(a, op, b) => {
+                if op == "and" {
+                    self.emit_expr(a)?;
+                    let jf = self.code.len();
+                    self.code.push(Op::JumpIfFalse(0));
+                    self.emit_expr(b)?;
+                    self.code.push(Op::Not);
+                    self.code.push(Op::Not);
+                    let j_end = self.code.len();
+                    self.code.push(Op::Jump(0));
+                    let false_pc = self.code.len();
+                    self.code.push(Op::Const(Val::Bool(false)));
+                    let end_pc = self.code.len();
+                    self.code[jf] = Op::JumpIfFalse(false_pc);
+                    self.code[j_end] = Op::Jump(end_pc);
+                    return Ok(());
+                }
+                if op == "or" {
+                    self.emit_expr(a)?;
+                    self.code.push(Op::Not);
+                    let jf = self.code.len();
+                    self.code.push(Op::JumpIfFalse(0));
+                    self.emit_expr(b)?;
+                    self.code.push(Op::Not);
+                    self.code.push(Op::Not);
+                    let j_end = self.code.len();
+                    self.code.push(Op::Jump(0));
+                    let true_pc = self.code.len();
+                    self.code.push(Op::Const(Val::Bool(true)));
+                    let end_pc = self.code.len();
+                    self.code[jf] = Op::JumpIfFalse(true_pc);
+                    self.code[j_end] = Op::Jump(end_pc);
+                    return Ok(());
+                }
                 self.emit_expr(a)?;
                 self.emit_expr(b)?;
                 self.code.push(match op.as_str() {
@@ -173,14 +206,13 @@ impl Compiler {
                     "*" => Op::Mul,
                     "/" => Op::Div,
                     "%" => Op::Mod,
+                    "**" => Op::Pow,
                     "==" => Op::Eq,
                     "!=" => Op::Ne,
                     "<" => Op::Lt,
                     "<=" => Op::Le,
                     ">" => Op::Gt,
                     ">=" => Op::Ge,
-                    "and" => Op::And,
-                    "or" => Op::Or,
                     _ => return Err("bad operator".into()),
                 });
             }
@@ -355,16 +387,31 @@ impl Compiler {
             }
             Stmt::With(resource, name, body) => {
                 let resource_name = self.temp("with_resource");
+                let err_name = self.temp("with_err");
                 self.emit_expr(resource)?;
                 self.code
                     .push(Op::Define(resource_name.clone(), false, None));
                 self.code.push(Op::Load(resource_name.clone()));
                 self.code.push(Op::CallMethod("enter".into(), 0));
                 self.code.push(Op::Define(name.clone(), false, None));
+                let push = self.code.len();
+                self.code.push(Op::PushHandler(0, err_name.clone()));
                 self.emit_stmts(body)?;
+                self.code.push(Op::PopHandler);
+                self.code.push(Op::Load(resource_name.clone()));
+                self.code.push(Op::CallMethod("exit".into(), 0));
+                self.code.push(Op::Pop);
+                let jump_end = self.code.len();
+                self.code.push(Op::Jump(0));
+                let handler_pc = self.code.len();
+                self.code[push] = Op::PushHandler(handler_pc, err_name.clone());
                 self.code.push(Op::Load(resource_name));
                 self.code.push(Op::CallMethod("exit".into(), 0));
                 self.code.push(Op::Pop);
+                self.code.push(Op::Load(err_name));
+                self.code.push(Op::Throw);
+                let end_pc = self.code.len();
+                self.code[jump_end] = Op::Jump(end_pc);
             }
             Stmt::Try(body, error_name, handler, finally) => {
                 let push = self.code.len();
@@ -389,6 +436,38 @@ impl Compiler {
                 self.emit_expr(value)?;
                 self.code.push(Op::SetMember(name.clone()));
             }
+            Stmt::SetIndex(target, idx, value) => match target {
+                Expr::Var(name) => {
+                    self.code.push(Op::Load(name.clone()));
+                    self.emit_expr(idx)?;
+                    self.emit_expr(value)?;
+                    self.code.push(Op::SetIndex);
+                    self.code.push(Op::Store(name.clone()));
+                }
+                Expr::Member(obj, field) => {
+                    self.emit_expr(obj)?;
+                    self.emit_expr(target)?;
+                    self.emit_expr(idx)?;
+                    self.emit_expr(value)?;
+                    self.code.push(Op::SetIndex);
+                    self.code.push(Op::SetMember(field.clone()));
+                }
+                Expr::Index(outer_target, outer_idx) => {
+                    if let Expr::Var(name) = outer_target.as_ref() {
+                        self.code.push(Op::Load(name.clone()));
+                        self.emit_expr(outer_idx)?;
+                        self.emit_expr(target)?;
+                        self.emit_expr(idx)?;
+                        self.emit_expr(value)?;
+                        self.code.push(Op::SetIndex);
+                        self.code.push(Op::SetIndex);
+                        self.code.push(Op::Store(name.clone()));
+                    } else {
+                        return Err("unsupported nested index assignment target".into());
+                    }
+                }
+                _ => return Err("unsupported index assignment target".into()),
+            },
             Stmt::Class(name, parent, body) => {
                 let mut methods = vec![];
                 for item in body {

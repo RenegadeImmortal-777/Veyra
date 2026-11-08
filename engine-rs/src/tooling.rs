@@ -173,7 +173,7 @@ pub(crate) fn doc_file(path: &Path) -> Result<(), String> {
     let src = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let ast = Parser::new(lex(&src)?).program()?;
     let mut out = format!(
-        "# API â€” {}\n\n",
+        "# API — {}\n\n",
         path.file_name()
             .and_then(|x| x.to_str())
             .unwrap_or("module")

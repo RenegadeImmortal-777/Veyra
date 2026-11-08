@@ -10,15 +10,26 @@ use std::path::{Path, PathBuf};
 use serde_json::Value as JsonValue;
 
 use crate::ast::{Expr, Stmt};
-use crate::bytecode::Op;
+use crate::bytecode::{Op, decode_bytecode, encode_bytecode};
 use crate::compiler::Compiler;
-use crate::lexer::lex;
+use crate::ir::optimize_bytecode;
+use crate::lexer::lex_with_lines;
 use crate::parser::Parser;
 use crate::project::project_root;
 use crate::vm::Vm;
 
-pub(crate) fn load_source(path: &str) -> Result<String, String> {
-    fn load(path: &Path, seen: &mut HashSet<PathBuf>) -> Result<String, String> {
+pub fn load_source(path: &str) -> Result<String, String> {
+    fn is_valid_ident(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars().enumerate().all(|(i, c)| {
+                c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
+            })
+    }
+    fn load(
+        path: &Path,
+        seen: &mut HashSet<PathBuf>,
+        seen_pkgs: &mut HashSet<String>,
+    ) -> Result<String, String> {
         let full = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if !seen.insert(full.clone()) {
             return Ok(String::new());
@@ -27,50 +38,64 @@ pub(crate) fn load_source(path: &str) -> Result<String, String> {
         let base = full.parent().unwrap_or(Path::new("."));
         let mut out = String::new();
         for line in src.lines() {
-            let t = line.trim();
-            if t.starts_with("use ") {
-                if let Some(a) = t.find('"') {
-                    if let Some(b_rel) = t[a + 1..].find('"') {
-                        let b = a + 1 + b_rel;
-                        let rel = &t[a + 1..b];
-                        let target =
-                            if !rel.contains('/') && !rel.contains('\\') && !rel.ends_with(".vy") {
-                                if let Ok(root) = project_root(base) {
-                                    let manifest_path = root.join("veyra.json");
-                                    let manifest: JsonValue = serde_json::from_str(
-                                        &fs::read_to_string(&manifest_path)
-                                            .map_err(|e| e.to_string())?,
-                                    )
-                                    .map_err(|e| e.to_string())?;
-                                    if let Some(meta) =
-                                        manifest.get("packages").and_then(|p| p.get(rel))
-                                    {
-                                        let entry = meta
-                                            .get("entry")
-                                            .and_then(JsonValue::as_str)
-                                            .unwrap_or("main.vy");
-                                        root.join("vendor").join(rel).join(entry)
-                                    } else {
-                                        base.join(rel)
-                                    }
-                                } else {
-                                    base.join(rel)
-                                }
-                            } else {
-                                base.join(rel)
-                            };
-                        out.push_str(&load(&target, seen)?);
-                        out.push('\n');
-                        continue;
+            let mut rest = line.trim();
+            let mut had_use = false;
+            while rest.starts_with("use ") {
+                let Some(a) = rest.find('"') else { break };
+                let Some(b_rel) = rest[a + 1..].find('"') else {
+                    break;
+                };
+                let b = a + 1 + b_rel;
+                let rel = &rest[a + 1..b];
+                let mut is_pkg = false;
+                let target = if !rel.contains('/') && !rel.contains('\\') && !rel.ends_with(".vy") {
+                    if let Ok(root) = project_root(base) {
+                        let manifest_path = root.join("veyra.json");
+                        let manifest: JsonValue = serde_json::from_str(
+                            &fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        if let Some(meta) = manifest.get("packages").and_then(|p| p.get(rel)) {
+                            is_pkg = true;
+                            let entry = meta
+                                .get("entry")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("main.vy");
+                            root.join("vendor").join(rel).join(entry)
+                        } else {
+                            base.join(rel)
+                        }
+                    } else {
+                        base.join(rel)
                     }
+                } else {
+                    base.join(rel)
+                };
+                out.push_str(&load(&target, seen, seen_pkgs)?);
+                out.push('\n');
+                if is_pkg
+                    && is_valid_ident(rel)
+                    && src.contains(&format!("{rel}."))
+                    && !src.contains(&format!("let {rel}"))
+                    && seen_pkgs.insert(rel.to_string())
+                {
+                    out.push_str(&format!("let {rel} = import_package(\"{rel}\");\n"));
                 }
+                had_use = true;
+                let after = rest[b + 1..].trim_start();
+                rest = after.strip_prefix(';').unwrap_or(after).trim_start();
             }
-            out.push_str(line);
-            out.push('\n');
+            if !had_use {
+                out.push_str(line);
+                out.push('\n');
+            } else if !rest.is_empty() {
+                out.push_str(rest);
+                out.push('\n');
+            }
         }
         Ok(out)
     }
-    load(Path::new(path), &mut HashSet::new())
+    load(Path::new(path), &mut HashSet::new(), &mut HashSet::new())
 }
 
 pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
@@ -166,6 +191,11 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                     check_expr(obj, &scopes, errors);
                     check_expr(value, &scopes, errors);
                 }
+                Stmt::SetIndex(target, idx, value) => {
+                    check_expr(target, &scopes, errors);
+                    check_expr(idx, &scopes, errors);
+                    check_expr(value, &scopes, errors);
+                }
                 Stmt::If(c, a, b) => {
                     check_expr(c, &scopes, errors);
                     check_block(a, &scopes, errors);
@@ -227,7 +257,12 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                     nested.push(params.iter().map(|(name, _)| name.clone()).collect());
                     check_block(body, &nested, errors);
                 }
-                Stmt::Class(_, _, body) => {
+                Stmt::Class(_, parent, body) => {
+                    if let Some(p) = parent {
+                        if !known(&scopes, p) {
+                            errors.push(format!("unknown parent class '{p}'"));
+                        }
+                    }
                     for method in body {
                         match method {
                             Stmt::Fn(_, params, _, method_body)
@@ -257,25 +292,38 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
     }
 }
 
-pub(crate) fn compile_source(src: &str) -> Result<Vec<Op>, String> {
-    let t = lex(src)?;
-    let ast = Parser::new(t).program()?;
+pub(crate) fn compile_source_unoptimized(src: &str) -> Result<Vec<Op>, String> {
+    let t = lex_with_lines(src)?;
+    let ast = Parser::new_with_lines(t).program()?;
     semantic_check_ast(&ast)?;
     let mut c = Compiler::new();
     c.emit_stmts(&ast)?;
     Ok(c.finish())
 }
+
+pub(crate) fn compile_source(src: &str) -> Result<Vec<Op>, String> {
+    Ok(optimize_bytecode(compile_source_unoptimized(src)?))
+}
+
 pub(crate) fn prepare_vm(src: &str) -> Result<Vm, String> {
     let mut vm = Vm::new(compile_source(src)?);
     let _ = vm.execute()?;
     Ok(vm)
 }
 
-pub(crate) fn run_source(src: &str) -> Result<(), String> {
+pub fn run_source(src: &str) -> Result<(), String> {
     Vm::new(compile_source(src)?).run()
 }
 
-pub(crate) fn disasm_source(src: &str) -> Result<(), String> {
+pub fn compile_to_vybc(src: &str) -> Result<String, String> {
+    encode_bytecode(&compile_source(src)?)
+}
+
+pub fn run_vybc(vybc_text: &str) -> Result<(), String> {
+    Vm::new(decode_bytecode(vybc_text)?).run()
+}
+
+pub fn disasm_source(src: &str) -> Result<(), String> {
     let code = compile_source(src)?;
     for (i, op) in code.iter().enumerate() {
         println!("{i:04}  {op:?}");

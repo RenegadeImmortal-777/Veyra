@@ -4,26 +4,42 @@
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 use tiny_http::{Header, Response, Server, StatusCode};
 
 use crate::pipeline::{load_source, prepare_vm};
+use crate::registry::safe_package_relative_path;
 use crate::value::{Val, map_lookup, val_to_json};
+
+pub(crate) fn resolve_static_path(dir: &Path, request_url: &str) -> Option<PathBuf> {
+    let raw = request_url.split('?').next().unwrap_or("/");
+    let rel = raw.trim_start_matches('/');
+    let rel_path = if rel.is_empty() {
+        PathBuf::from("index.html")
+    } else {
+        safe_package_relative_path(rel).ok()?
+    };
+    let mut candidate = dir.join(rel_path);
+    if candidate.is_dir() {
+        candidate = candidate.join("index.html");
+    }
+    let canon_dir = dir.canonicalize().ok()?;
+    let canon_file = candidate.canonicalize().ok()?;
+    if canon_file.starts_with(&canon_dir) && canon_file.is_file() {
+        Some(canon_file)
+    } else {
+        None
+    }
+}
 
 pub(crate) fn serve_directory(dir: &Path, port: u16) -> Result<(), String> {
     let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
     println!("Veyra web server: http://127.0.0.1:{port}");
     println!("Serving {}", dir.display());
     for req in server.incoming_requests() {
-        let raw = req.url().split('?').next().unwrap_or("/");
-        let rel = raw.trim_start_matches('/');
-        let mut path = dir.join(if rel.is_empty() { "index.html" } else { rel });
-        if path.is_dir() {
-            path = path.join("index.html");
-        }
-        let response = if path.exists() && path.is_file() {
+        let response = if let Some(path) = resolve_static_path(dir, req.url()) {
             let data = fs::read(&path).map_err(|e| e.to_string())?;
             let mut r = Response::from_data(data);
             let content_type = match path.extension().and_then(|x| x.to_str()).unwrap_or("") {
