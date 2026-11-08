@@ -63,7 +63,16 @@ impl Parser {
     pub(crate) fn program(&mut self) -> Result<Vec<Stmt>, String> {
         let mut v = vec![];
         while !matches!(self.cur(), Tok::Eof) {
-            v.push(self.stmt()?);
+            let mut s = self.stmt()?;
+            if let Stmt::If(Expr::Bool(true), ref mut unpacked, ref empty) = s {
+                if empty.is_empty()
+                    && matches!(unpacked.first(), Some(Stmt::Let(n, _, _, _)) if n.starts_with("__unpack_"))
+                {
+                    v.append(unpacked);
+                    continue;
+                }
+            }
+            v.push(s);
         }
         Ok(v)
     }
@@ -71,7 +80,16 @@ impl Parser {
         self.need(&Tok::Lb, "expected '{'")?;
         let mut v = vec![];
         while !matches!(self.cur(), Tok::Rb | Tok::Eof) {
-            v.push(self.stmt()?);
+            let mut s = self.stmt()?;
+            if let Stmt::If(Expr::Bool(true), ref mut unpacked, ref empty) = s {
+                if empty.is_empty()
+                    && matches!(unpacked.first(), Some(Stmt::Let(n, _, _, _)) if n.starts_with("__unpack_"))
+                {
+                    v.append(unpacked);
+                    continue;
+                }
+            }
+            v.push(s);
         }
         self.need(&Tok::Rb, "expected '}'")?;
         Ok(v)
