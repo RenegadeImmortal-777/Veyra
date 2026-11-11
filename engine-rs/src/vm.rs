@@ -10,7 +10,9 @@ use std::{
     thread,
 };
 
-use crate::bytecode::{ClassDef, FunctionDef, ObjectData, Op};
+use crate::bytecode::{
+    ClassDef, FunctionDef, ObjectData, Op, code_has_yield, collect_referenced_names,
+};
 use crate::runtime::{
     GENERATOR_IDS, OBJECT_IDS, TASK_IDS, export_function_object, resolve_function_object, tasks,
 };
@@ -27,8 +29,10 @@ pub(crate) struct Vm {
     pub(crate) consts: HashSet<String>,
     pub(crate) funcs: Arc<HashMap<String, FunctionDef>>,
     pub(crate) classes: Arc<HashMap<String, ClassDef>>,
+    pub(crate) method_cache: HashMap<(String, String), FunctionDef>,
     pub(crate) objects: Arc<Mutex<HashMap<u64, ObjectData>>>,
     pub(crate) handlers: Vec<(usize, String, usize)>,
+    pub(crate) breakpoints: HashSet<usize>,
     pub(crate) trace: bool,
     pub(crate) finished: bool,
 }
@@ -85,8 +89,10 @@ impl Vm {
             consts: HashSet::new(),
             funcs: Arc::new(HashMap::new()),
             classes: Arc::new(HashMap::new()),
+            method_cache: HashMap::new(),
             objects: Arc::new(Mutex::new(HashMap::new())),
             handlers: vec![],
+            breakpoints: HashSet::new(),
             trace: false,
             finished: false,
         }
@@ -108,8 +114,10 @@ impl Vm {
             consts: HashSet::new(),
             funcs,
             classes,
+            method_cache: HashMap::new(),
             objects,
             handlers: vec![],
+            breakpoints: HashSet::new(),
             trace: false,
             finished: false,
         }
@@ -189,15 +197,48 @@ impl Vm {
         }
         None
     }
-    pub(crate) fn call_def(&self, def: FunctionDef, args: Vec<Val>) -> Result<Val, String> {
-        if def.params.len() != args.len() {
+    fn find_method_cached(&mut self, class_name: &str, method: &str) -> Option<FunctionDef> {
+        let key = (class_name.to_string(), method.to_string());
+        if let Some(cached) = self.method_cache.get(&key) {
+            return Some(cached.clone());
+        }
+        let found = self.find_method(class_name, method)?;
+        self.method_cache.insert(key, found.clone());
+        Some(found)
+    }
+    pub(crate) fn call_def(&self, def: FunctionDef, mut args: Vec<Val>) -> Result<Val, String> {
+        let has_varargs = def.params.last().and_then(|(_, ty)| ty.as_deref()) == Some("*");
+        if has_varargs {
+            let fixed = def.params.len().saturating_sub(1);
+            if args.len() < fixed {
+                return Err(format!(
+                    "function expects at least {fixed} arguments, got {}",
+                    args.len()
+                ));
+            }
+            let rest = args.split_off(fixed);
+            args.push(Val::List(rest));
+        } else if args.len() < def.params.len() {
+            let missing_all_optional = def.params[args.len()..]
+                .iter()
+                .all(|(_, ty)| ty.as_deref() == Some("?default"));
+            if missing_all_optional {
+                args.resize(def.params.len(), Val::Null);
+            } else {
+                return Err(format!(
+                    "function expects {} arguments, got {}",
+                    def.params.len(),
+                    args.len()
+                ));
+            }
+        } else if def.params.len() != args.len() {
             return Err(format!(
                 "function expects {} arguments, got {}",
                 def.params.len(),
                 args.len()
             ));
         }
-        let is_generator = def.code.iter().any(|op| matches!(op, Op::Yield));
+        let is_generator = def.is_generator;
         let is_async = def.is_async;
         if is_async && is_generator {
             return Err("async generator functions are not yet supported".into());
@@ -212,13 +253,15 @@ impl Vm {
         let return_type = def.return_type.clone();
         for ((param, ty), value) in def.params.iter().zip(args) {
             if let Some(expected) = ty {
-                if !self.value_matches(&value, expected) {
-                    return Err(format!(
-                        "argument '{param}' expected {expected}, got {}",
-                        value.show()
-                    ));
+                if expected != "*" && expected != "?default" {
+                    if !self.value_matches(&value, expected) {
+                        return Err(format!(
+                            "argument '{param}' expected {expected}, got {}",
+                            value.show()
+                        ));
+                    }
+                    Arc::make_mut(&mut var_types).insert(param.clone(), expected.clone());
                 }
-                Arc::make_mut(&mut var_types).insert(param.clone(), expected.clone());
             }
             if cells.contains_key(param) {
                 Arc::make_mut(&mut cells).remove(param);
@@ -392,97 +435,168 @@ impl Vm {
     }
     pub(crate) fn execute(&mut self) -> Result<Val, String> {
         loop {
-            if !self.trace {
-                if self.cells.is_empty() {
-                    if let Some(window) = self.code.get(self.ip..self.ip + 4) {
-                        match window {
-                            [
-                                Op::Load(a),
-                                Op::Load(b),
-                                cmp @ (Op::Lt | Op::Le | Op::Gt | Op::Ge),
-                                Op::JumpIfFalse(target),
-                            ] => {
-                                if let (Some(Val::Num(x)), Some(Val::Num(y))) =
-                                    (self.vars.get(a), self.vars.get(b))
-                                {
-                                    let yes = match cmp {
-                                        Op::Lt => *x < *y,
-                                        Op::Le => *x <= *y,
-                                        Op::Gt => *x > *y,
-                                        _ => *x >= *y,
-                                    };
-                                    self.ip = if yes { self.ip + 4 } else { *target };
-                                    continue;
+            if !self.trace && !self.breakpoints.contains(&self.ip) {
+                if let Some(loop_win) = self.code.get(self.ip..self.ip + 13) {
+                    match loop_win {
+                        [
+                            Op::Load(i1),
+                            limit_op @ (Op::Load(_) | Op::Const(Val::Num(_))),
+                            Op::Lt,
+                            Op::JumpIfFalse(target),
+                            Op::Load(s1),
+                            Op::Load(i2),
+                            acc_op @ (Op::Add | Op::Sub),
+                            Op::Store(s2),
+                            Op::Load(i3),
+                            Op::Const(Val::Num(step)),
+                            Op::Add,
+                            Op::Store(i4),
+                            Op::Jump(back),
+                        ] if *back == self.ip
+                            && *target == self.ip + 13
+                            && *step > 0.0
+                            && i1 == i2
+                            && i1 == i3
+                            && i1 == i4
+                            && s1 == s2
+                            && i1 != s1
+                            && !self.cells.contains_key(i1)
+                            && !self.cells.contains_key(s1)
+                            && !self.consts.contains(i1)
+                            && !self.consts.contains(s1) =>
+                        {
+                            let limit_opt = match limit_op {
+                                Op::Load(lim_name) if !self.cells.contains_key(lim_name) => {
+                                    match self.vars.get(lim_name) {
+                                        Some(Val::Num(n)) => Some(*n),
+                                        _ => None,
+                                    }
                                 }
-                            }
-                            [
-                                Op::Load(a),
-                                Op::Const(Val::Num(y)),
-                                cmp @ (Op::Lt | Op::Le | Op::Gt | Op::Ge),
-                                Op::JumpIfFalse(target),
-                            ] => {
-                                if let Some(Val::Num(x)) = self.vars.get(a) {
-                                    let yes = match cmp {
-                                        Op::Lt => *x < *y,
-                                        Op::Le => *x <= *y,
-                                        Op::Gt => *x > *y,
-                                        _ => *x >= *y,
-                                    };
-                                    self.ip = if yes { self.ip + 4 } else { *target };
-                                    continue;
+                                Op::Const(Val::Num(n)) => Some(*n),
+                                _ => None,
+                            };
+                            if let (
+                                Some(limit),
+                                Some(Val::Num(mut i_val)),
+                                Some(Val::Num(mut s_val)),
+                            ) = (
+                                limit_opt,
+                                self.vars.get(i1).cloned(),
+                                self.vars.get(s1).cloned(),
+                            ) {
+                                let is_add = matches!(acc_op, Op::Add);
+                                let st = *step;
+                                let iv_name = i1.clone();
+                                let sv_name = s1.clone();
+                                let exit_ip = *target;
+                                while i_val < limit {
+                                    if is_add {
+                                        s_val += i_val;
+                                    } else {
+                                        s_val -= i_val;
+                                    }
+                                    i_val += st;
                                 }
+                                self.vars.insert(iv_name, Val::Num(i_val));
+                                self.vars.insert(sv_name, Val::Num(s_val));
+                                self.ip = exit_ip;
+                                continue;
                             }
-                            [
-                                Op::Load(a),
-                                Op::Const(Val::Num(k)),
-                                op @ (Op::Add | Op::Sub | Op::Mul),
-                                Op::Store(s),
-                            ] if a == s
-                                && !self.consts.contains(a)
-                                && !self.var_types.contains_key(a) =>
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(window) = self.code.get(self.ip..self.ip + 4) {
+                    match window {
+                        [
+                            Op::Load(a),
+                            Op::Load(b),
+                            cmp @ (Op::Lt | Op::Le | Op::Gt | Op::Ge),
+                            Op::JumpIfFalse(target),
+                        ] if !self.cells.contains_key(a) && !self.cells.contains_key(b) => {
+                            if let (Some(Val::Num(x)), Some(Val::Num(y))) =
+                                (self.vars.get(a), self.vars.get(b))
                             {
-                                let rhs = *k;
+                                let yes = match cmp {
+                                    Op::Lt => *x < *y,
+                                    Op::Le => *x <= *y,
+                                    Op::Gt => *x > *y,
+                                    _ => *x >= *y,
+                                };
+                                self.ip = if yes { self.ip + 4 } else { *target };
+                                continue;
+                            }
+                        }
+                        [
+                            Op::Load(a),
+                            Op::Const(Val::Num(y)),
+                            cmp @ (Op::Lt | Op::Le | Op::Gt | Op::Ge),
+                            Op::JumpIfFalse(target),
+                        ] if !self.cells.contains_key(a) => {
+                            if let Some(Val::Num(x)) = self.vars.get(a) {
+                                let yes = match cmp {
+                                    Op::Lt => *x < *y,
+                                    Op::Le => *x <= *y,
+                                    Op::Gt => *x > *y,
+                                    _ => *x >= *y,
+                                };
+                                self.ip = if yes { self.ip + 4 } else { *target };
+                                continue;
+                            }
+                        }
+                        [
+                            Op::Load(a),
+                            Op::Const(Val::Num(k)),
+                            op @ (Op::Add | Op::Sub | Op::Mul),
+                            Op::Store(s),
+                        ] if a == s
+                            && !self.cells.contains_key(a)
+                            && !self.consts.contains(a)
+                            && !self.var_types.contains_key(a) =>
+                        {
+                            let rhs = *k;
+                            let is_add = matches!(op, Op::Add);
+                            let is_sub = matches!(op, Op::Sub);
+                            if let Some(Val::Num(x)) = self.vars.get_mut(a) {
+                                *x = if is_add {
+                                    *x + rhs
+                                } else if is_sub {
+                                    *x - rhs
+                                } else {
+                                    *x * rhs
+                                };
+                                self.ip += 4;
+                                continue;
+                            }
+                        }
+                        [
+                            Op::Load(a),
+                            Op::Load(b),
+                            op @ (Op::Add | Op::Sub | Op::Mul),
+                            Op::Store(s),
+                        ] if a == s
+                            && !self.cells.contains_key(a)
+                            && !self.cells.contains_key(b)
+                            && !self.consts.contains(a)
+                            && !self.var_types.contains_key(a) =>
+                        {
+                            if let Some(Val::Num(y)) = self.vars.get(b).cloned() {
                                 let is_add = matches!(op, Op::Add);
                                 let is_sub = matches!(op, Op::Sub);
                                 if let Some(Val::Num(x)) = self.vars.get_mut(a) {
                                     *x = if is_add {
-                                        *x + rhs
+                                        *x + y
                                     } else if is_sub {
-                                        *x - rhs
+                                        *x - y
                                     } else {
-                                        *x * rhs
+                                        *x * y
                                     };
                                     self.ip += 4;
                                     continue;
                                 }
                             }
-                            [
-                                Op::Load(a),
-                                Op::Load(b),
-                                op @ (Op::Add | Op::Sub | Op::Mul),
-                                Op::Store(s),
-                            ] if a == s
-                                && !self.consts.contains(a)
-                                && !self.var_types.contains_key(a) =>
-                            {
-                                if let Some(Val::Num(y)) = self.vars.get(b).cloned() {
-                                    let is_add = matches!(op, Op::Add);
-                                    let is_sub = matches!(op, Op::Sub);
-                                    if let Some(Val::Num(x)) = self.vars.get_mut(a) {
-                                        *x = if is_add {
-                                            *x + y
-                                        } else if is_sub {
-                                            *x - y
-                                        } else {
-                                            *x * y
-                                        };
-                                        self.ip += 4;
-                                        continue;
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
                 match self.code.get(self.ip) {
@@ -676,11 +790,33 @@ impl Vm {
                 self.stack.push(match (a, b) {
                     (Val::Num(x), Val::Num(y)) => Val::Num(x + y),
                     (Val::Str(x), Val::Str(y)) => Val::Str(x + &y),
+                    (Val::List(mut x), Val::List(y)) => {
+                        x.extend(y);
+                        Val::List(x)
+                    }
                     _ => return Err("invalid '+' operands".into()),
                 });
             }
             Op::Sub => self.bin_num(|a, b| a - b)?,
-            Op::Mul => self.bin_num(|a, b| a * b)?,
+            Op::Mul => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.stack.push(match (a, b) {
+                    (Val::Num(x), Val::Num(y)) => Val::Num(x * y),
+                    (Val::Str(s), Val::Num(n)) | (Val::Num(n), Val::Str(s)) => {
+                        Val::Str(s.repeat(n.max(0.0) as usize))
+                    }
+                    (Val::List(items), Val::Num(n)) | (Val::Num(n), Val::List(items)) => {
+                        let count = n.max(0.0) as usize;
+                        let mut out = Vec::with_capacity(items.len() * count);
+                        for _ in 0..count {
+                            out.extend(items.iter().cloned());
+                        }
+                        Val::List(out)
+                    }
+                    _ => return Err("numeric operation requires numbers".into()),
+                });
+            }
             Op::Div => self.bin_num(|a, b| a / b)?,
             Op::Mod => self.bin_num(|a, b| a % b)?,
             Op::Pow => self.bin_num(|a, b| a.powf(b))?,
@@ -829,7 +965,7 @@ impl Vm {
                             heap.get(&id).ok_or("dangling object")?.class_name.clone()
                         };
                         let method = self
-                            .find_method(&class_name, &name)
+                            .find_method_cached(&class_name, &name)
                             .ok_or(format!("undefined method '{name}' on {class_name}"))?;
                         let mut call_args = vec![Val::Object(id)];
                         call_args.extend(args);
@@ -1078,25 +1214,33 @@ impl Vm {
                 self.stack.push(Val::Function(key));
             }
             Op::Def(name, params, return_type, is_async, code) => {
-                if self.vars.keys().any(|k| !self.cells.contains_key(k)) {
-                    let cells_mut = Arc::make_mut(&mut self.cells);
-                    for (k, v) in &self.vars {
-                        cells_mut
-                            .entry(k.clone())
-                            .or_insert_with(|| Arc::new(Mutex::new(v.clone())));
+                let mut referenced = HashSet::new();
+                collect_referenced_names(&code, &mut referenced);
+                for (p, _) in &params {
+                    referenced.remove(p);
+                }
+                let mut captured_upvalues = HashMap::new();
+                for k in &referenced {
+                    if let Some(existing_cell) = self.cells.get(k) {
+                        captured_upvalues.insert(k.clone(), existing_cell.clone());
+                    } else if let Some(val) = self.vars.get(k) {
+                        let cell = Arc::new(Mutex::new(val.clone()));
+                        Arc::make_mut(&mut self.cells).insert(k.clone(), cell.clone());
+                        captured_upvalues.insert(k.clone(), cell);
                     }
                 }
-                let upvalues = self.cells.clone();
+                let is_generator = code_has_yield(&code);
                 Arc::make_mut(&mut self.funcs).insert(
                     name,
                     FunctionDef {
                         params: Arc::new(params),
                         return_type,
                         is_async,
+                        is_generator,
                         code: Arc::new(code),
                         captures: Arc::new(HashMap::new()),
                         capture_types: self.var_types.clone(),
-                        upvalues,
+                        upvalues: Arc::new(captured_upvalues),
                     },
                 );
             }
@@ -1106,23 +1250,32 @@ impl Vm {
                         return Err(format!("unknown parent class '{p}'"));
                     }
                 }
-                if self.vars.keys().any(|k| !self.cells.contains_key(k)) {
-                    let cells_mut = Arc::make_mut(&mut self.cells);
-                    for (k, v) in &self.vars {
-                        cells_mut
-                            .entry(k.clone())
-                            .or_insert_with(|| Arc::new(Mutex::new(v.clone())));
+                self.method_cache.clear();
+                let mut referenced = HashSet::new();
+                for (_, _, _, _, body) in &methods {
+                    collect_referenced_names(body, &mut referenced);
+                }
+                let mut captured_upvalues = HashMap::new();
+                for k in &referenced {
+                    if let Some(existing_cell) = self.cells.get(k) {
+                        captured_upvalues.insert(k.clone(), existing_cell.clone());
+                    } else if let Some(val) = self.vars.get(k) {
+                        let cell = Arc::new(Mutex::new(val.clone()));
+                        Arc::make_mut(&mut self.cells).insert(k.clone(), cell.clone());
+                        captured_upvalues.insert(k.clone(), cell);
                     }
                 }
-                let upvalues = self.cells.clone();
+                let upvalues = Arc::new(captured_upvalues);
                 let mut compiled = HashMap::new();
                 for (method, params, return_type, is_async, code) in methods {
+                    let is_generator = code_has_yield(&code);
                     compiled.insert(
                         method,
                         FunctionDef {
                             params: Arc::new(params),
                             return_type,
                             is_async,
+                            is_generator,
                             code: Arc::new(code),
                             captures: Arc::new(HashMap::new()),
                             capture_types: self.var_types.clone(),

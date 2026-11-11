@@ -434,6 +434,59 @@ impl Vm {
                     _ => return Err("tuple expects List".into()),
                 }
             }
+            "list" => {
+                if a.is_empty() {
+                    Val::List(vec![])
+                } else if a.len() == 1 {
+                    match &a[0] {
+                        Val::List(v) => Val::List(v.clone()),
+                        Val::Str(s) => {
+                            Val::List(s.chars().map(|c| Val::Str(c.to_string())).collect())
+                        }
+                        Val::Map(pairs) => {
+                            Val::List(pairs.iter().map(|(k, _)| k.clone()).collect())
+                        }
+                        Val::Generator(id) => Val::List(collect_generator(*id)?),
+                        _ => return Err("list expects iterable".into()),
+                    }
+                } else {
+                    return Err("list expects at most 1 argument".into());
+                }
+            }
+            "dict" => {
+                if a.is_empty() {
+                    Val::Map(vec![])
+                } else if a.len() == 1 {
+                    match &a[0] {
+                        Val::Map(pairs) => Val::Map(pairs.clone()),
+                        Val::List(items) => {
+                            let mut pairs: Vec<(Val, Val)> = Vec::with_capacity(items.len());
+                            for item in items {
+                                match item {
+                                    Val::List(kv) if kv.len() == 2 => {
+                                        if let Some((_, existing)) =
+                                            pairs.iter_mut().find(|(ek, _)| *ek == kv[0])
+                                        {
+                                            *existing = kv[1].clone();
+                                        } else {
+                                            pairs.push((kv[0].clone(), kv[1].clone()));
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(
+                                            "dict expects Map or List of [key, value] pairs".into(),
+                                        );
+                                    }
+                                }
+                            }
+                            Val::Map(pairs)
+                        }
+                        _ => return Err("dict expects Map or List of pairs".into()),
+                    }
+                } else {
+                    return Err("dict expects at most 1 argument".into());
+                }
+            }
             "set" => {
                 if a.len() != 1 {
                     return Err("set expects list".into());

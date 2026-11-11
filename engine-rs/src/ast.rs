@@ -17,6 +17,7 @@ pub(crate) enum Expr {
     Await(Box<Expr>),
     Lambda(Vec<(String, Option<String>)>, Option<String>, Vec<Stmt>),
     ListComp(Box<Expr>, String, Box<Expr>, Option<Box<Expr>>),
+    Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     Unary(String, Box<Expr>),
     Bin(Box<Expr>, String, Box<Expr>),
     Call(String, Vec<Expr>),

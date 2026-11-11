@@ -125,6 +125,11 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                 check_expr(a, scopes, errors);
                 check_expr(b, scopes, errors)
             }
+            Expr::Ternary(c, a, b) => {
+                check_expr(c, scopes, errors);
+                check_expr(a, scopes, errors);
+                check_expr(b, scopes, errors);
+            }
             Expr::Member(obj, _) => check_expr(obj, scopes, errors),
             Expr::MethodCall(obj, _, args) => {
                 check_expr(obj, scopes, errors);

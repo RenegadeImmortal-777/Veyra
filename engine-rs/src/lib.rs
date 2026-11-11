@@ -1090,6 +1090,70 @@ mod tests {
         run_source(src).unwrap();
     }
     #[test]
+    fn python_parity_defaults_varargs_ternary_and_comprehensions() {
+        let src = r#"
+            def greet(name, greeting = "Hello", punct = "!") {
+                return greeting + ", " + name + punct
+            }
+            assert(greet("Ana") == "Hello, Ana!")
+            assert(greet("Bo", "Hi") == "Hi, Bo!")
+            assert(greet("Cy", "Yo", "?") == "Yo, Cy?")
+
+            def total(first, *rest) {
+                let s = first
+                for r in rest { s += r }
+                return s
+            }
+            assert(total(1) == 1)
+            assert(total(1, 2, 3, 4) == 10)
+
+            let n = 7
+            let parity = "even" if n % 2 == 0 else "odd"
+            assert(parity == "odd")
+            let sign = "neg" if n < 0 else "zero" if n == 0 else "pos"
+            assert(sign == "pos")
+
+            let squares = {x: x * x for x in [1, 2, 3]}
+            assert(squares[3] == 9 and len(squares) == 3)
+            let evens = {x % 3 for x in [1, 2, 3, 4, 5, 6]}
+            assert(len(evens) == 3)
+            let picked = [x for x in range(10) if x % 4 == 0]
+            assert(picked == [0, 4, 8])
+
+            assert([1, 2] + [3] == [1, 2, 3])
+            assert("ab" * 3 == "ababab")
+            assert([0] * 3 == [0, 0, 0])
+            assert(list("abc") == ["a", "b", "c"])
+            assert(dict([["k", 1]])["k"] == 1)
+
+            class Counter {
+                fn init(self) -> Null { self.n = 0; return null; }
+                fn tick(self) -> Int { self.n += 1; return self.n; }
+            }
+            let c = Counter()
+            let i = 0
+            while i < 50 { c.tick(); i += 1 }
+            assert(c.n == 50)
+        "#;
+        run_source(src).unwrap();
+    }
+    #[test]
+    fn closures_capture_only_referenced_names() {
+        let src = "
+            let big = [1, 2, 3];
+            let unrelated = 5;
+            let counter = 0;
+            fn bump() -> Int { counter += 1; return counter; }
+            bump(); bump();
+            assert(counter == 2);
+            unrelated += 1;
+            let acc = 0;
+            for k in range(1000) { acc += k; }
+            assert(acc == 499500 and unrelated == 6 and len(big) == 3);
+        ";
+        run_source(src).unwrap();
+    }
+    #[test]
     fn standalone_bundle_round_trip() {
         let payload = compile_to_vybc("let x = 40 + 2; assert(x == 42);").unwrap();
         let mut fake_exe = b"MZ_FAKE_PE_HEADER".to_vec();

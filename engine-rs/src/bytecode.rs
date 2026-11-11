@@ -72,10 +72,34 @@ pub(crate) struct FunctionDef {
     pub(crate) params: Arc<Vec<(String, Option<String>)>>,
     pub(crate) return_type: Option<String>,
     pub(crate) is_async: bool,
+    pub(crate) is_generator: bool,
     pub(crate) code: Arc<Vec<Op>>,
     pub(crate) captures: Arc<HashMap<String, Val>>,
     pub(crate) capture_types: Arc<HashMap<String, String>>,
     pub(crate) upvalues: Arc<HashMap<String, Arc<Mutex<Val>>>>,
+}
+
+pub(crate) fn code_has_yield(code: &[Op]) -> bool {
+    code.iter().any(|op| matches!(op, Op::Yield))
+}
+
+pub(crate) fn collect_referenced_names(code: &[Op], out: &mut std::collections::HashSet<String>) {
+    for op in code {
+        match op {
+            Op::Load(n) | Op::Store(n) | Op::Call(n, _) | Op::FunctionRef(n) => {
+                out.insert(n.clone());
+            }
+            Op::Def(_, _, _, _, body) => {
+                collect_referenced_names(body, out);
+            }
+            Op::DefClass(_, _, methods) => {
+                for (_, _, _, _, body) in methods {
+                    collect_referenced_names(body, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

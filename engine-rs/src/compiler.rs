@@ -160,6 +160,19 @@ impl Compiler {
                 self.code.push(Op::Load(result_name));
             }
             Expr::Var(n) => self.code.push(Op::Load(n.clone())),
+            Expr::Ternary(cond, then_e, else_e) => {
+                self.emit_expr(cond)?;
+                let jf = self.code.len();
+                self.code.push(Op::JumpIfFalse(0));
+                self.emit_expr(then_e)?;
+                let j_end = self.code.len();
+                self.code.push(Op::Jump(0));
+                let else_pc = self.code.len();
+                self.emit_expr(else_e)?;
+                let end_pc = self.code.len();
+                self.code[jf] = Op::JumpIfFalse(else_pc);
+                self.code[j_end] = Op::Jump(end_pc);
+            }
             Expr::Unary(op, x) => {
                 self.emit_expr(x)?;
                 self.code.push(if op == "-" { Op::Neg } else { Op::Not });

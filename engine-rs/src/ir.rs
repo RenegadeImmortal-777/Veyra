@@ -66,8 +66,18 @@ fn fold_binary(a: &Val, b: &Val, op: &Op) -> Option<Val> {
     match (a, b, op) {
         (Val::Num(x), Val::Num(y), Op::Add) => Some(Val::Num(x + y)),
         (Val::Str(x), Val::Str(y), Op::Add) => Some(Val::Str(format!("{x}{y}"))),
+        (Val::List(x), Val::List(y), Op::Add) if x.len() + y.len() <= 256 => {
+            let mut out = x.clone();
+            out.extend(y.iter().cloned());
+            Some(Val::List(out))
+        }
         (Val::Num(x), Val::Num(y), Op::Sub) => Some(Val::Num(x - y)),
         (Val::Num(x), Val::Num(y), Op::Mul) => Some(Val::Num(x * y)),
+        (Val::Str(s), Val::Num(n), Op::Mul) | (Val::Num(n), Val::Str(s), Op::Mul)
+            if *n >= 0.0 && (*n as usize).saturating_mul(s.len()) <= 1024 =>
+        {
+            Some(Val::Str(s.repeat(*n as usize)))
+        }
         (Val::Num(x), Val::Num(y), Op::Div) if *y != 0.0 => Some(Val::Num(x / y)),
         (Val::Num(x), Val::Num(y), Op::Mod) if *y != 0.0 => Some(Val::Num(x % y)),
         (Val::Num(x), Val::Num(y), Op::Pow) => Some(Val::Num(x.powf(*y))),

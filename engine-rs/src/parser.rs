@@ -210,28 +210,7 @@ impl Parser {
                 x => return Err(format!("expected function name, got {x:?}")),
             };
             self.need(&Tok::Lp, "expected '(' after function name")?;
-            let mut params = vec![];
-            if !self.eat(&Tok::Rp) {
-                loop {
-                    let param = match self.bump() {
-                        Tok::Id(s) => s,
-                        x => return Err(format!("expected parameter name, got {x:?}")),
-                    };
-                    let param_type = if self.eat(&Tok::Colon) {
-                        match self.bump() {
-                            Tok::Id(s) => Some(s),
-                            _ => return Err("expected parameter type".into()),
-                        }
-                    } else {
-                        None
-                    };
-                    params.push((param, param_type));
-                    if self.eat(&Tok::Rp) {
-                        break;
-                    }
-                    self.need(&Tok::Comma, "expected ',' between parameters")?;
-                }
-            }
+            let (params, mut default_inits) = self.parse_params()?;
             let return_type = if self.eat(&Tok::Arrow) {
                 match self.bump() {
                     Tok::Id(s) => Some(s),
@@ -240,7 +219,11 @@ impl Parser {
             } else {
                 None
             };
-            let body = self.block()?;
+            let mut body = self.block()?;
+            if !default_inits.is_empty() {
+                default_inits.append(&mut body);
+                body = default_inits;
+            }
             return Ok(Stmt::DecoratedFn(
                 decorator,
                 name,
@@ -256,28 +239,7 @@ impl Parser {
                 x => return Err(format!("expected function name, got {x:?}")),
             };
             self.need(&Tok::Lp, "expected '(' after function name")?;
-            let mut params = vec![];
-            if !self.eat(&Tok::Rp) {
-                loop {
-                    let param = match self.bump() {
-                        Tok::Id(s) => s,
-                        x => return Err(format!("expected parameter name, got {x:?}")),
-                    };
-                    let param_type = if self.eat(&Tok::Colon) {
-                        match self.bump() {
-                            Tok::Id(s) => Some(s),
-                            _ => return Err("expected parameter type".into()),
-                        }
-                    } else {
-                        None
-                    };
-                    params.push((param, param_type));
-                    if self.eat(&Tok::Rp) {
-                        break;
-                    }
-                    self.need(&Tok::Comma, "expected ',' between parameters")?;
-                }
-            }
+            let (params, mut default_inits) = self.parse_params()?;
             let return_type = if self.eat(&Tok::Arrow) {
                 match self.bump() {
                     Tok::Id(s) => Some(s),
@@ -286,7 +248,11 @@ impl Parser {
             } else {
                 None
             };
-            let body = self.block()?;
+            let mut body = self.block()?;
+            if !default_inits.is_empty() {
+                default_inits.append(&mut body);
+                body = default_inits;
+            }
             return Ok(Stmt::AsyncFn(name, params, return_type, body));
         }
         if self.eat(&Tok::Fn) {
@@ -295,28 +261,7 @@ impl Parser {
                 x => return Err(format!("expected function name, got {x:?}")),
             };
             self.need(&Tok::Lp, "expected '(' after function name")?;
-            let mut params = vec![];
-            if !self.eat(&Tok::Rp) {
-                loop {
-                    let param = match self.bump() {
-                        Tok::Id(s) => s,
-                        x => return Err(format!("expected parameter name, got {x:?}")),
-                    };
-                    let param_type = if self.eat(&Tok::Colon) {
-                        match self.bump() {
-                            Tok::Id(s) => Some(s),
-                            _ => return Err("expected parameter type".into()),
-                        }
-                    } else {
-                        None
-                    };
-                    params.push((param, param_type));
-                    if self.eat(&Tok::Rp) {
-                        break;
-                    }
-                    self.need(&Tok::Comma, "expected ',' between parameters")?;
-                }
-            }
+            let (params, mut default_inits) = self.parse_params()?;
             let return_type = if self.eat(&Tok::Arrow) {
                 match self.bump() {
                     Tok::Id(s) => Some(s),
@@ -325,7 +270,11 @@ impl Parser {
             } else {
                 None
             };
-            let body = self.block()?;
+            let mut body = self.block()?;
+            if !default_inits.is_empty() {
+                default_inits.append(&mut body);
+                body = default_inits;
+            }
             return Ok(Stmt::Fn(name, params, return_type, body));
         }
         if self.eat(&Tok::Break) {
@@ -526,8 +475,64 @@ impl Parser {
         }
         Ok(Stmt::Expr(e))
     }
+    fn parse_params(&mut self) -> Result<(Vec<(String, Option<String>)>, Vec<Stmt>), String> {
+        let mut params = vec![];
+        let mut default_inits = vec![];
+        if !self.eat(&Tok::Rp) {
+            loop {
+                let is_vararg = self.eat(&Tok::Star);
+                let param = match self.bump() {
+                    Tok::Id(s) => s,
+                    x => return Err(format!("expected parameter name, got {x:?}")),
+                };
+                let mut param_type = if self.eat(&Tok::Colon) {
+                    match self.bump() {
+                        Tok::Id(s) => Some(s),
+                        _ => return Err("expected parameter type".into()),
+                    }
+                } else {
+                    None
+                };
+                if self.eat(&Tok::Eq) {
+                    let def_expr = self.expr()?;
+                    param_type = Some("?default".into());
+                    default_inits.push(Stmt::If(
+                        Expr::Bin(
+                            Box::new(Expr::Var(param.clone())),
+                            "==".into(),
+                            Box::new(Expr::Null),
+                        ),
+                        vec![Stmt::Assign(param.clone(), def_expr)],
+                        vec![],
+                    ));
+                } else if is_vararg {
+                    param_type = Some("*".into());
+                }
+                params.push((param, param_type));
+                if self.eat(&Tok::Rp) {
+                    break;
+                }
+                self.need(&Tok::Comma, "expected ',' between parameters")?;
+                if self.eat(&Tok::Rp) {
+                    break;
+                }
+            }
+        }
+        Ok((params, default_inits))
+    }
     fn expr(&mut self) -> Result<Expr, String> {
-        self.logic_or()
+        let then_branch = self.logic_or()?;
+        if self.eat(&Tok::If) {
+            let cond = self.logic_or()?;
+            self.need(&Tok::Else, "expected 'else' in conditional expression")?;
+            let else_branch = self.expr()?;
+            return Ok(Expr::Ternary(
+                Box::new(cond),
+                Box::new(then_branch),
+                Box::new(else_branch),
+            ));
+        }
+        Ok(then_branch)
     }
     fn logic_or(&mut self) -> Result<Expr, String> {
         let mut e = self.logic_and()?;
@@ -713,28 +718,7 @@ impl Parser {
             Tok::Null => Ok(Expr::Null),
             Tok::Fn => {
                 self.need(&Tok::Lp, "expected '(' after anonymous fn")?;
-                let mut params = vec![];
-                if !self.eat(&Tok::Rp) {
-                    loop {
-                        let param = match self.bump() {
-                            Tok::Id(s) => s,
-                            x => return Err(format!("expected parameter name, got {x:?}")),
-                        };
-                        let param_type = if self.eat(&Tok::Colon) {
-                            match self.bump() {
-                                Tok::Id(s) => Some(s),
-                                _ => return Err("expected parameter type".into()),
-                            }
-                        } else {
-                            None
-                        };
-                        params.push((param, param_type));
-                        if self.eat(&Tok::Rp) {
-                            break;
-                        }
-                        self.need(&Tok::Comma, "expected ',' between parameters")?;
-                    }
-                }
+                let (params, mut default_inits) = self.parse_params()?;
                 let return_type = if self.eat(&Tok::Arrow) {
                     match self.bump() {
                         Tok::Id(s) => Some(s),
@@ -743,7 +727,11 @@ impl Parser {
                 } else {
                     None
                 };
-                let body = self.block()?;
+                let mut body = self.block()?;
+                if !default_inits.is_empty() {
+                    default_inits.append(&mut body);
+                    body = default_inits;
+                }
                 Ok(Expr::Lambda(params, return_type, body))
             }
             Tok::Id(n) => {
@@ -820,9 +808,9 @@ impl Parser {
                         x => return Err(format!("expected comprehension variable, got {x:?}")),
                     };
                     self.need(&Tok::In, "expected 'in' in comprehension")?;
-                    let iterable = self.expr()?;
+                    let iterable = self.logic_or()?;
                     let condition = if self.eat(&Tok::If) {
-                        Some(Box::new(self.expr()?))
+                        Some(Box::new(self.logic_or()?))
                     } else {
                         None
                     };
@@ -851,6 +839,29 @@ impl Parser {
                 let first = self.expr()?;
                 if self.eat(&Tok::Colon) {
                     let first_val = self.expr()?;
+                    if self.eat(&Tok::For) {
+                        let name = match self.bump() {
+                            Tok::Id(s) => s,
+                            x => return Err(format!("expected comprehension variable, got {x:?}")),
+                        };
+                        self.need(&Tok::In, "expected 'in' in dict comprehension")?;
+                        let iterable = self.logic_or()?;
+                        let condition = if self.eat(&Tok::If) {
+                            Some(Box::new(self.logic_or()?))
+                        } else {
+                            None
+                        };
+                        self.need(&Tok::Rb, "expected '}' after dict comprehension")?;
+                        return Ok(Expr::Call(
+                            "dict".into(),
+                            vec![Expr::ListComp(
+                                Box::new(Expr::List(vec![first, first_val])),
+                                name,
+                                Box::new(iterable),
+                                condition,
+                            )],
+                        ));
+                    }
                     let mut pairs = vec![(first, first_val)];
                     if !self.eat(&Tok::Rb) {
                         self.need(&Tok::Comma, "expected ',' in map")?;
@@ -867,6 +878,29 @@ impl Parser {
                     }
                     Ok(Expr::Map(pairs))
                 } else {
+                    if self.eat(&Tok::For) {
+                        let name = match self.bump() {
+                            Tok::Id(s) => s,
+                            x => return Err(format!("expected comprehension variable, got {x:?}")),
+                        };
+                        self.need(&Tok::In, "expected 'in' in set comprehension")?;
+                        let iterable = self.logic_or()?;
+                        let condition = if self.eat(&Tok::If) {
+                            Some(Box::new(self.logic_or()?))
+                        } else {
+                            None
+                        };
+                        self.need(&Tok::Rb, "expected '}' after set comprehension")?;
+                        return Ok(Expr::Call(
+                            "set".into(),
+                            vec![Expr::ListComp(
+                                Box::new(first),
+                                name,
+                                Box::new(iterable),
+                                condition,
+                            )],
+                        ));
+                    }
                     let mut items = vec![first];
                     if !self.eat(&Tok::Rb) {
                         self.need(&Tok::Comma, "expected ',' in set")?;
