@@ -64,6 +64,7 @@ pub(crate) fn load_source_with_lines(
                 let b = a + 1 + b_rel;
                 let rel = &rest[a + 1..b];
                 let mut is_pkg = false;
+                let mut native_only_pkg = false;
                 let target = if !rel.contains('/') && !rel.contains('\\') && !rel.ends_with(".vy") {
                     if let Ok(root) = project_root(base) {
                         let manifest_path = root.join("veyra.json");
@@ -77,8 +78,19 @@ pub(crate) fn load_source_with_lines(
                                 .get("entry")
                                 .and_then(JsonValue::as_str)
                                 .unwrap_or("main.vy");
-                            root.join("vendor").join(rel).join(entry)
+                            let candidate = root.join("vendor").join(rel).join(entry);
+                            if !candidate.is_file()
+                                && root.join("vendor").join(rel).join("veyra.json").is_file()
+                            {
+                                native_only_pkg = true;
+                            }
+                            candidate
                         } else {
+                            let pkg_manifest = root.join("vendor").join(rel).join("veyra.json");
+                            if pkg_manifest.is_file() {
+                                is_pkg = true;
+                                native_only_pkg = true;
+                            }
                             base.join(rel)
                         }
                     } else {
@@ -87,7 +99,9 @@ pub(crate) fn load_source_with_lines(
                 } else {
                     base.join(rel)
                 };
-                out.push_str(&load(&target, seen, seen_pkgs, origins)?);
+                if !native_only_pkg {
+                    out.push_str(&load(&target, seen, seen_pkgs, origins)?);
+                }
                 push_line(&mut out, origins, "", &full, line_no);
                 if is_pkg
                     && is_valid_ident(rel)

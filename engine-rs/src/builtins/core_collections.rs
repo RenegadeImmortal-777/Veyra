@@ -98,15 +98,28 @@ impl Vm {
                     .get("packages")
                     .and_then(|p| p.get(&package))
                     .ok_or(format!("package '{package}' is not installed"))?;
+                let pkg_dir = root.join("vendor").join(&package);
+                let pkg_manifest_path = pkg_dir.join("veyra.json");
                 let entry = meta
                     .get("entry")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("main.vy");
-                let path = root.join("vendor").join(&package).join(entry);
-                let source = load_source(path.to_string_lossy().as_ref())?;
-                let mut module_vm = Vm::new(compile_source(&source)?);
-                module_vm.objects = self.objects.clone();
-                module_vm.run()?;
+                let path = pkg_dir.join(entry);
+                let module_vm = if path.is_file() {
+                    let source = load_source(path.to_string_lossy().as_ref())?;
+                    let mut mvm = Vm::new(compile_source(&source)?);
+                    mvm.objects = self.objects.clone();
+                    mvm.run()?;
+                    mvm
+                } else if pkg_manifest_path.is_file() {
+                    Vm::new(vec![Op::Halt])
+                } else {
+                    let source = load_source(path.to_string_lossy().as_ref())?;
+                    let mut mvm = Vm::new(compile_source(&source)?);
+                    mvm.objects = self.objects.clone();
+                    mvm.run()?;
+                    mvm
+                };
                 for (class_name, class_def) in module_vm.classes.iter() {
                     Arc::make_mut(&mut self.classes)
                         .entry(class_name.clone())
@@ -146,6 +159,101 @@ impl Vm {
                 for (name, value) in module_vm.vars {
                     if !name.starts_with("__") {
                         exports.push((Val::Str(name), value));
+                    }
+                }
+                // Bind any native `veyra_plugin_v1` shared library declared by vendor/<pkg>/veyra.json
+                let pkg_dir = root.join("vendor").join(&package);
+                let pkg_manifest_path = pkg_dir.join("veyra.json");
+                if pkg_manifest_path.is_file() {
+                    if let Ok(pkg_txt) = fs::read_to_string(&pkg_manifest_path) {
+                        if let Ok(pkg_json) = serde_json::from_str::<JsonValue>(&pkg_txt) {
+                            if let Some(native) = pkg_json.get("native") {
+                                let ext = crate::plugin::platform_shared_ext();
+                                let raw_lib = native
+                                    .get("library")
+                                    .and_then(JsonValue::as_str)
+                                    .unwrap_or("plugin");
+                                let mut lib_path = pkg_dir.join(raw_lib);
+                                if lib_path.extension().is_none() {
+                                    lib_path.set_extension(ext);
+                                }
+                                if !lib_path.is_file() {
+                                    if let Some(src_rel) =
+                                        native.get("source").and_then(JsonValue::as_str)
+                                    {
+                                        let src_path = pkg_dir.join(src_rel);
+                                        if src_path.is_file() {
+                                            let _ = crate::plugin::build_rust_plugin(
+                                                &src_path, &lib_path,
+                                            );
+                                        }
+                                    }
+                                }
+                                if lib_path.is_file() {
+                                    let loaded = crate::plugin::load_plugin(&lib_path)?;
+                                    exports.push((
+                                        Val::Str("__native_plugin".into()),
+                                        loaded.info_val(),
+                                    ));
+                                    for (fn_name, exp) in &loaded.exports {
+                                        let (params, param_named, code) = if let Some(arity) =
+                                            exp.arity
+                                        {
+                                            let mut p = Vec::with_capacity(arity);
+                                            let mut named = Vec::with_capacity(arity);
+                                            let mut ops = Vec::with_capacity(arity + 4);
+                                            ops.push(Op::Const(Val::Str(loaded.id.clone())));
+                                            ops.push(Op::Const(Val::Str(fn_name.clone())));
+                                            for idx in 0..arity {
+                                                p.push((format!("arg{idx}"), None));
+                                                named.push(false);
+                                                ops.push(Op::LoadLocal(idx));
+                                            }
+                                            ops.push(Op::Call(
+                                                "__plugin_trampoline".into(),
+                                                2 + arity,
+                                            ));
+                                            ops.push(Op::Return);
+                                            (p, named, ops)
+                                        } else {
+                                            (
+                                                vec![("args".into(), Some("*".into()))],
+                                                vec![false],
+                                                vec![
+                                                    Op::Const(Val::Str(loaded.id.clone())),
+                                                    Op::Const(Val::Str(fn_name.clone())),
+                                                    Op::LoadLocal(0),
+                                                    Op::Call("__plugin_trampoline_list".into(), 3),
+                                                    Op::Return,
+                                                ],
+                                            )
+                                        };
+                                        let qualified = format!("{prefix}{fn_name}");
+                                        let fn_def = FunctionDef {
+                                            params: Arc::new(params),
+                                            return_type: None,
+                                            is_async: false,
+                                            is_generator: false,
+                                            local_count: exp.arity.unwrap_or(1),
+                                            param_named: Arc::new(param_named),
+                                            code: Arc::new(code),
+                                            captures: Arc::new(HashMap::new()),
+                                            capture_types: Arc::new(HashMap::new()),
+                                            upvalues: Arc::new(HashMap::new()),
+                                            debug_name: fn_name.clone(),
+                                            debug_scope: 0,
+                                        };
+                                        register_named_function_object(&qualified, fn_def.clone())?;
+                                        Arc::make_mut(&mut self.funcs)
+                                            .insert(qualified.clone(), fn_def);
+                                        exports.push((
+                                            Val::Str(fn_name.clone()),
+                                            Val::Function(qualified),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Val::Map(exports)

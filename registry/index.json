@@ -299,7 +299,47 @@
                                      "source":  "../packages/vyserde",
                                      "entry":  "vyserde.vy",
                                      "version":  "0.1.0"
-                                 }
+                                 },
+                     "vyjit":  {
+                                   "source":  "../packages/vyjit",
+                                   "entry":  "vyjit.vy",
+                                   "version":  "0.1.0"
+                               },
+                     "vygpu":  {
+                                   "source":  "../packages/vygpu",
+                                   "entry":  "vygpu.vy",
+                                   "version":  "0.1.0"
+                               },
+                     "vyplugin":  {
+                                      "source":  "../packages/vyplugin",
+                                      "entry":  "vyplugin.vy",
+                                      "version":  "0.1.0"
+                                  },
+                     "vycache":  {
+                                     "source":  "../packages/vycache",
+                                     "entry":  "vycache.vy",
+                                     "version":  "0.1.0"
+                                 },
+                     "vydiff":  {
+                                    "source":  "../packages/vydiff",
+                                    "entry":  "vydiff.vy",
+                                    "version":  "0.1.0"
+                                },
+                     "vytemplate":  {
+                                        "source":  "../packages/vytemplate",
+                                        "entry":  "vytemplate.vy",
+                                        "version":  "0.1.0"
+                                    },
+                     "vyargparse":  {
+                                        "source":  "../packages/vyargparse",
+                                        "entry":  "vyargparse.vy",
+                                        "version":  "0.1.0"
+                                    },
+                     "vydecimal":  {
+                                       "source":  "../packages/vydecimal",
+                                       "entry":  "vydecimal.vy",
+                                       "version":  "0.1.0"
+                                   }
                  },
     "registry_version":  1
 }

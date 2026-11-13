@@ -77,6 +77,7 @@ pub(crate) struct Vm {
     pub(crate) finished: bool,
     pub(crate) debug_scope: usize,
     pub(crate) debugger: Option<Arc<DebugSession>>,
+    pub(crate) call_counts: HashMap<usize, u32>,
 }
 
 static GENERATORS: OnceLock<Mutex<HashMap<u64, Vm>>> = OnceLock::new();
@@ -146,6 +147,7 @@ impl Vm {
             finished: false,
             debug_scope: 0,
             debugger: None,
+            call_counts: HashMap::new(),
         }
     }
     fn nested_from_prepared(&self, prepared: PreparedCall) -> Self {
@@ -173,6 +175,7 @@ impl Vm {
             finished: false,
             debug_scope: prepared.debug_scope,
             debugger: None,
+            call_counts: HashMap::new(),
         }
     }
     fn child_debug_scope(&self, def_ip: usize, sub_idx: usize) -> usize {
@@ -495,6 +498,22 @@ impl Vm {
             let v = self.call_def_kw(def, args, kwargs)?;
             self.stack.push(v);
             return Ok(());
+        }
+        if kwargs.is_empty()
+            && !self.trace
+            && self.breakpoints.is_empty()
+            && self.debugger.is_none()
+        {
+            let ptr_key = Arc::as_ptr(&def.code) as usize;
+            let count = {
+                let entry = self.call_counts.entry(ptr_key).or_insert(0);
+                *entry = entry.saturating_add(1);
+                *entry
+            };
+            if let Some(res) = crate::jit::jit_try_run(&def.debug_name, &def, &args, count) {
+                self.stack.push(res);
+                return Ok(());
+            }
         }
         let prepared = self.prepare_call_kw(def, args, kwargs)?;
         self.push_prepared_frame(prepared);

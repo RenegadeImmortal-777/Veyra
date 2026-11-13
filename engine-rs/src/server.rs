@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use tiny_http::{Header, Response, Server, StatusCode};
 
 use crate::pipeline::{load_source, prepare_vm};
-use crate::registry::safe_package_relative_path;
+use crate::registry::{safe_package_relative_path, unpack_bundle_to_dir};
 use crate::value::{Val, map_lookup, val_to_json};
 
 pub(crate) fn resolve_static_path(dir: &Path, request_url: &str) -> Option<PathBuf> {
@@ -311,6 +311,133 @@ pub(crate) fn serve_veyra_app(
                 }
                 Err(e) => Response::from_string(format!("Veyra handler error: {e}"))
                     .with_status_code(StatusCode(500)),
+            }
+        } else {
+            Response::from_string("404 Not Found").with_status_code(StatusCode(404))
+        };
+        req.respond(response).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
+    let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
+    println!("Veyra Package Registry Server: http://127.0.0.1:{port}");
+    println!("Root {}", dir.display());
+    for mut req in server.incoming_requests() {
+        let method = req.method().as_str().to_string();
+        let path = req.url().split('?').next().unwrap_or("/").to_string();
+        let response = if method == "POST" && (path == "/publish" || path == "/registry/publish") {
+            let mut body = String::new();
+            let resp = match req.as_reader().read_to_string(&mut body) {
+                Ok(_) => match serde_json::from_str::<JsonValue>(&body) {
+                    Ok(bundle) => {
+                        let name = bundle.get("name").and_then(JsonValue::as_str).unwrap_or("");
+                        let version = bundle
+                            .get("version")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("0.1.0");
+                        let entry = bundle
+                            .get("entry")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("src/main.vy");
+                        let sha256 = bundle
+                            .get("sha256")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        if name.is_empty() || name.contains('/') || name.contains('\\') {
+                            Response::from_string("invalid package name")
+                                .with_status_code(StatusCode(400))
+                        } else {
+                            let pkg_dir = dir.join("packages").join(name);
+                            match unpack_bundle_to_dir(&bundle, &pkg_dir) {
+                                Ok(()) => {
+                                    let bundles_dir = dir.join("bundles");
+                                    let _ = fs::create_dir_all(&bundles_dir);
+                                    let _ =
+                                        fs::write(bundles_dir.join(format!("{name}.vypkg")), &body);
+                                    let index_path = dir.join("registry").join("index.json");
+                                    if let Some(parent) = index_path.parent() {
+                                        let _ = fs::create_dir_all(parent);
+                                    }
+                                    let mut index: JsonValue = fs::read_to_string(&index_path)
+                                        .ok()
+                                        .and_then(|t| serde_json::from_str(&t).ok())
+                                        .unwrap_or_else(|| {
+                                            serde_json::json!({"registry_version":1,"packages":{}})
+                                        });
+                                    if !index.get("packages").is_some_and(JsonValue::is_object) {
+                                        index["packages"] =
+                                            JsonValue::Object(serde_json::Map::new());
+                                    }
+                                    let mut meta = serde_json::json!({
+                                        "version": version,
+                                        "entry": entry,
+                                        "source": format!("../packages/{name}"),
+                                        "bundle_path": format!("/bundles/{name}.vypkg"),
+                                        "sha256": sha256
+                                    });
+                                    if let Some(deps) = bundle.get("dependencies") {
+                                        meta["dependencies"] = deps.clone();
+                                    }
+                                    if let Some(nat) = bundle.get("native").filter(|v| !v.is_null())
+                                    {
+                                        meta["native"] = nat.clone();
+                                    }
+                                    index["packages"][name] = meta;
+                                    match serde_json::to_string_pretty(&index) {
+                                        Ok(idx_text) => {
+                                            if let Err(e) = fs::write(&index_path, idx_text) {
+                                                Response::from_string(format!("write failed: {e}"))
+                                                    .with_status_code(StatusCode(500))
+                                            } else {
+                                                let ok_json = serde_json::json!({
+                                                    "published": name,
+                                                    "version": version,
+                                                    "sha256": sha256
+                                                });
+                                                Response::from_string(ok_json.to_string())
+                                            }
+                                        }
+                                        Err(e) => Response::from_string(e.to_string())
+                                            .with_status_code(StatusCode(500)),
+                                    }
+                                }
+                                Err(e) => Response::from_string(format!("bundle error: {e}"))
+                                    .with_status_code(StatusCode(400)),
+                            }
+                        }
+                    }
+                    Err(e) => Response::from_string(format!("invalid JSON: {e}"))
+                        .with_status_code(StatusCode(400)),
+                },
+                Err(e) => Response::from_string(e.to_string()).with_status_code(StatusCode(400)),
+            };
+            resp
+        } else if method == "GET"
+            && (path == "/" || path == "/index.json" || path == "/registry/index.json")
+        {
+            let p1 = dir.join("registry").join("index.json");
+            let p2 = dir.join("index.json");
+            let chosen = if p1.is_file() { p1 } else { p2 };
+            match fs::read(&chosen) {
+                Ok(data) => {
+                    let mut r = Response::from_data(data);
+                    if let Ok(h) = Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json; charset=utf-8"[..],
+                    ) {
+                        r.add_header(h);
+                    }
+                    r
+                }
+                Err(_) => Response::from_string("404 Registry index not found")
+                    .with_status_code(StatusCode(404)),
+            }
+        } else if let Some(sp) = resolve_static_path(dir, req.url()) {
+            match fs::read(&sp) {
+                Ok(data) => Response::from_data(data),
+                Err(_) => Response::from_string("500 Read error").with_status_code(StatusCode(500)),
             }
         } else {
             Response::from_string("404 Not Found").with_status_code(StatusCode(404))

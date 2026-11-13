@@ -22,7 +22,9 @@ Veyra is a native-first general-purpose language and application platform with i
 - LSP completion/hover/definition/references/rename/symbols/formatting
 - VS Code Check/Run/Debug/Test/Profile commands
 - cross-platform CI and tagged release artifact workflow
-- 60 Veyra-native packages
+- 68 Veyra-native packages (including `vyjit`, `vygpu`, `vyplugin`, `vycache`, `vydiff`, `vytemplate`, `vyargparse`, `vydecimal`)
+- In-memory x86_64 SSE2 native JIT compiler (`jit.rs`) and Direct3D 11 (`cs_5_0` HLSL) hardware GPU compute backend (`gpu.rs`)
+- Sovereign HMAC-SHA256 signed registry, `.vypkg` bundles, semver resolution, HTTP registry server (`veyra pkg serve`), and `veyra_plugin_v1` native CDylib extension ABI (`plugin.rs`)
 
 Example:
 

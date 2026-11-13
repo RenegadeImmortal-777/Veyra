@@ -825,6 +825,160 @@ impl Vm {
                 };
                 crate::py_bridge::py_exec(code)?
             }
+            "jit_available" => {
+                if !a.is_empty() {
+                    return Err("jit_available expects 0 arguments".into());
+                }
+                Val::Bool(crate::jit::jit_available())
+            }
+            "jit_info" | "jit_stats" => {
+                if !a.is_empty() {
+                    return Err(format!("{n} expects 0 arguments"));
+                }
+                crate::jit::jit_info_val()
+            }
+            "jit_set_enabled" => {
+                if a.len() != 1 {
+                    return Err("jit_set_enabled expects Bool".into());
+                }
+                Val::Bool(crate::jit::jit_set_enabled(a[0].truthy()))
+            }
+            "jit_compile" => {
+                if a.len() != 1 {
+                    return Err("jit_compile expects function or function name".into());
+                }
+                let (name, def) = match &a[0] {
+                    Val::Function(key) => {
+                        let def = self
+                            .funcs
+                            .get(key)
+                            .cloned()
+                            .or_else(|| resolve_function_object(key).ok().flatten())
+                            .ok_or_else(|| format!("unknown function reference '{key}'"))?;
+                        (def.debug_name.clone(), def)
+                    }
+                    Val::Str(fn_name) => {
+                        let def = match self.vars.get(fn_name) {
+                            Some(Val::Function(key)) => self
+                                .funcs
+                                .get(key)
+                                .cloned()
+                                .or_else(|| resolve_function_object(key).ok().flatten()),
+                            _ => self.funcs.get(fn_name).cloned(),
+                        }
+                        .ok_or_else(|| format!("unknown function '{fn_name}'"))?;
+                        (fn_name.clone(), def)
+                    }
+                    _ => return Err("jit_compile expects Function or String".into()),
+                };
+                let ok = crate::jit::jit_try_compile(&name, &def).is_ok();
+                Val::Bool(ok)
+            }
+            "plugin_load" => {
+                if a.len() != 1 {
+                    return Err("plugin_load expects library path String".into());
+                }
+                let Val::Str(path) = &a[0] else {
+                    return Err("plugin_load path must be String".into());
+                };
+                crate::plugin::load_plugin(Path::new(path))?.info_val()
+            }
+            "plugin_info" => {
+                if a.len() != 1 {
+                    return Err("plugin_info expects plugin handle or name".into());
+                }
+                let key = match &a[0] {
+                    Val::Str(s) => s.clone(),
+                    Val::Map(pairs) => map_lookup(pairs, &Val::Str("id".into()))
+                        .and_then(|v| {
+                            if let Val::Str(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or("invalid plugin handle Map")?,
+                    _ => return Err("plugin_info expects String or plugin Map".into()),
+                };
+                crate::plugin::get_loaded_plugin(&key)?.info_val()
+            }
+            "plugin_list" => {
+                if !a.is_empty() {
+                    return Err("plugin_list expects 0 arguments".into());
+                }
+                Val::List(crate::plugin::list_loaded_plugins())
+            }
+            "plugin_call" => {
+                if a.len() < 2 || a.len() > 3 {
+                    return Err("plugin_call expects (plugin, fn_name[, args])".into());
+                }
+                let key = match &a[0] {
+                    Val::Str(s) => s.clone(),
+                    Val::Map(pairs) => map_lookup(pairs, &Val::Str("id".into()))
+                        .and_then(|v| {
+                            if let Val::Str(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or("invalid plugin handle Map")?,
+                    _ => return Err("plugin_call expects String or plugin Map".into()),
+                };
+                let Val::Str(fn_name) = &a[1] else {
+                    return Err("plugin_call function name must be String".into());
+                };
+                let call_args = match a.get(2) {
+                    None => Vec::new(),
+                    Some(Val::List(xs)) => xs.clone(),
+                    Some(_) => return Err("plugin_call args must be List".into()),
+                };
+                let p = crate::plugin::get_loaded_plugin(&key)?;
+                p.call(fn_name, &call_args)?
+            }
+            "plugin_build" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("plugin_build expects (source_rs_path[, out_lib_path])".into());
+                }
+                let Val::Str(src) = &a[0] else {
+                    return Err("plugin_build source path must be String".into());
+                };
+                let src_path = PathBuf::from(src);
+                let out_path = match a.get(1) {
+                    Some(Val::Str(o)) => PathBuf::from(o),
+                    Some(_) => return Err("plugin_build out path must be String".into()),
+                    None => {
+                        let stem = src_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("veyra_plugin");
+                        src_path.with_file_name(format!(
+                            "{stem}.{}",
+                            crate::plugin::platform_shared_ext()
+                        ))
+                    }
+                };
+                let built = crate::plugin::build_rust_plugin(&src_path, &out_path)?;
+                Val::Str(built.to_string_lossy().to_string())
+            }
+            "__plugin_trampoline" => {
+                if a.len() < 2 {
+                    return Err("__plugin_trampoline expects plugin_id,fn_name,...".into());
+                }
+                let (Val::Str(pid), Val::Str(fname)) = (&a[0], &a[1]) else {
+                    return Err("invalid plugin trampoline arguments".into());
+                };
+                crate::plugin::get_loaded_plugin(pid)?.call(fname, &a[2..])?
+            }
+            "__plugin_trampoline_list" => {
+                if a.len() != 3 {
+                    return Err("__plugin_trampoline_list expects plugin_id,fn_name,args".into());
+                }
+                let (Val::Str(pid), Val::Str(fname), Val::List(xs)) = (&a[0], &a[1], &a[2]) else {
+                    return Err("invalid plugin list trampoline arguments".into());
+                };
+                crate::plugin::get_loaded_plugin(pid)?.call(fname, xs)?
+            }
             _ => return Ok(None),
         };
         Ok(Some(v))

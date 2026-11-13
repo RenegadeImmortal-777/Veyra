@@ -49,7 +49,30 @@ pub(crate) fn new_project(name: &str) -> Result<(), String> {
 
 pub(crate) fn doctor() {
     println!("Veyra {VERSION}");
-    println!("engine: native Rust bytecode VM");
+    println!("engine: native Rust bytecode VM + AOT");
+    println!(
+        "jit: {}",
+        if crate::jit::jit_available() {
+            "x86_64-sse2 (active)"
+        } else {
+            "interpreter-only"
+        }
+    );
+    let gpu = crate::gpu::gpu_info_val();
+    if let crate::value::Val::Map(pairs) = gpu {
+        let backend = crate::value::map_lookup(&pairs, &crate::value::Val::Str("backend".into()))
+            .map(crate::value::Val::show)
+            .unwrap_or_else(|| "cpu-fallback".into());
+        let adapter =
+            crate::value::map_lookup(&pairs, &crate::value::Val::Str("adapter_name".into()))
+                .map(crate::value::Val::show)
+                .unwrap_or_else(|| "CPU".into());
+        println!("gpu: {backend} ({adapter})");
+    }
+    println!(
+        "plugin-abi: veyra_plugin_v{}",
+        crate::plugin::VEYRA_PLUGIN_ABI_VERSION
+    );
     println!("target: {}", env::consts::ARCH);
     println!("os: {}", env::consts::OS);
     println!("status: OK");
@@ -81,6 +104,6 @@ pub(crate) fn repl() -> Result<(), String> {
 
 pub(crate) fn usage() {
     println!(
-        "Veyra {VERSION}\n\nUsage:\n  veyra run [file.vy]\n  veyra check [file.vy]\n  veyra lint [file.vy]\n  veyra debug [file.vy]\n  veyra dap\n  veyra ast [file.vy]\n  veyra symbols [file.vy]\n  veyra lsp\n  veyra test\n  veyra bench [file.vy] [iterations]\n  veyra profile [file.vy]\n  veyra doc [file.vy]\n  veyra aot [file.vy] [out_exe]\n  veyra build [--native]\n  veyra audit\n  veyra serve [dir] [port]\n  veyra web <routes.json> [port]\n  veyra app <app.vy> <routes.json> [port]\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg add <name>\n  veyra pkg remove <name>\n  veyra pkg installed\n  veyra doctor\n  veyra repl\n  veyra --version"
+        "Veyra {VERSION}\n\nUsage:\n  veyra run [file.vy]\n  veyra check [file.vy]\n  veyra lint [file.vy]\n  veyra debug [file.vy]\n  veyra dap\n  veyra ast [file.vy]\n  veyra symbols [file.vy]\n  veyra lsp\n  veyra test\n  veyra bench [file.vy] [iterations]\n  veyra profile [file.vy]\n  veyra doc [file.vy]\n  veyra aot [file.vy] [out_exe]\n  veyra build [--native]\n  veyra audit\n  veyra serve [dir] [port]\n  veyra web <routes.json> [port]\n  veyra app <app.vy> <routes.json> [port]\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg search <term>\n  veyra pkg info <name>\n  veyra pkg tree\n  veyra pkg add <name[@semver]>\n  veyra pkg remove <name>\n  veyra pkg update [name]\n  veyra pkg installed\n  veyra pkg install\n  veyra pkg publish\n  veyra pkg keygen [name]\n  veyra pkg sign [dir] [key]\n  veyra pkg verify [target]\n  veyra pkg pack [dir] [out.vypkg.json]\n  veyra pkg unpack <bundle.vypkg.json> [dest]\n  veyra pkg build-plugin [dir]\n  veyra pkg serve [dir] [port]\n  veyra doctor\n  veyra repl\n  veyra --version"
     );
 }

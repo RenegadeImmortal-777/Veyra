@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
 use crate::value::{Val, as_num_list};
@@ -15,6 +15,31 @@ use crate::value::{Val, as_num_list};
 pub(crate) static TENSOR_IDS: AtomicU64 = AtomicU64::new(1);
 pub(crate) static TENSORS: OnceLock<Mutex<HashMap<u64, TensorData>>> = OnceLock::new();
 pub(crate) static ADAM_STATES: OnceLock<Mutex<HashMap<u64, AdamState>>> = OnceLock::new();
+static DEFAULT_TENSOR_DEVICE: AtomicU8 = AtomicU8::new(0); // 0 = cpu, 1 = gpu
+
+pub(crate) fn tensor_default_device() -> &'static str {
+    if DEFAULT_TENSOR_DEVICE.load(Ordering::Relaxed) == 1 {
+        "gpu"
+    } else {
+        "cpu"
+    }
+}
+
+pub(crate) fn tensor_set_default_device(dev: &str) -> Result<String, String> {
+    match dev.trim().to_ascii_lowercase().as_str() {
+        "cpu" => {
+            DEFAULT_TENSOR_DEVICE.store(0, Ordering::Relaxed);
+            Ok("cpu".into())
+        }
+        "gpu" => {
+            DEFAULT_TENSOR_DEVICE.store(1, Ordering::Relaxed);
+            Ok("gpu".into())
+        }
+        other => Err(format!(
+            "unknown tensor device '{other}' (expected 'cpu' or 'gpu')"
+        )),
+    }
+}
 
 thread_local! {
     static PENDING_TAPE_IDS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
@@ -145,6 +170,7 @@ pub(crate) struct TensorData {
     pub(crate) grad: Vec<f64>,
     pub(crate) requires_grad: bool,
     pub(crate) op: TensorOp,
+    pub(crate) device: String,
 }
 
 #[derive(Clone, Debug)]
@@ -241,6 +267,7 @@ pub(crate) fn tensor_from_value(value: &Val, requires_grad: bool) -> Result<Val,
                 shape: shape.clone(),
                 requires_grad,
                 op: TensorOp::Leaf,
+                device: tensor_default_device().to_string(),
             },
         );
     Ok(tensor_handle(id, &shape))
@@ -261,6 +288,16 @@ pub(crate) fn tensor_store(
     requires_grad: bool,
     op: TensorOp,
 ) -> Result<Val, String> {
+    tensor_store_on_device(data, shape, requires_grad, op, tensor_default_device())
+}
+
+pub(crate) fn tensor_store_on_device(
+    data: Vec<f64>,
+    shape: Vec<usize>,
+    requires_grad: bool,
+    op: TensorOp,
+    device: &str,
+) -> Result<Val, String> {
     let id = TENSOR_IDS.fetch_add(1, Ordering::Relaxed);
     tensors()
         .lock()
@@ -273,9 +310,30 @@ pub(crate) fn tensor_store(
                 shape: shape.clone(),
                 requires_grad,
                 op,
+                device: device.to_string(),
             },
         );
     Ok(tensor_handle(id, &shape))
+}
+
+pub(crate) fn tensor_move_device(id: u64, device: &str) -> Result<Val, String> {
+    let norm = match device.trim().to_ascii_lowercase().as_str() {
+        "cpu" => "cpu",
+        "gpu" => "gpu",
+        other => {
+            return Err(format!(
+                "unknown tensor device '{other}' (expected 'cpu' or 'gpu')"
+            ));
+        }
+    };
+    let snap = tensor_snapshot(id)?;
+    tensor_store_on_device(
+        snap.data,
+        snap.shape,
+        snap.requires_grad,
+        TensorOp::Leaf,
+        norm,
+    )
 }
 
 pub(crate) fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>, String> {

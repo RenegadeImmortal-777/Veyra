@@ -28,11 +28,14 @@ mod bytecode;
 mod cli;
 mod compiler;
 mod dap;
+mod gpu;
 mod ir;
+mod jit;
 mod lexer;
 mod lsp;
 mod parser;
 mod pipeline;
+mod plugin;
 mod project;
 mod py_bridge;
 mod registry;
@@ -58,13 +61,14 @@ use crate::pipeline::compile_source_unoptimized;
 pub use crate::pipeline::{compile_to_vybc, disasm_source, load_source, run_source, run_vybc};
 use crate::project::{build_project, fmt_source, project_entry, project_packages, test_project};
 use crate::registry::{
-    pkg_add, pkg_audit, pkg_install, pkg_list, pkg_publish, pkg_remove, pkg_search,
+    pkg_add, pkg_audit, pkg_build_plugin, pkg_info, pkg_install, pkg_keygen, pkg_list, pkg_pack,
+    pkg_publish, pkg_remove, pkg_search, pkg_sign, pkg_tree, pkg_unpack, pkg_update, pkg_verify,
 };
 #[cfg(test)]
 use crate::runtime::export_function_object;
 #[cfg(test)]
 use crate::server::resolve_static_path;
-use crate::server::{serve_directory, serve_routes, serve_veyra_app};
+use crate::server::{serve_directory, serve_registry, serve_routes, serve_veyra_app};
 use crate::tooling::{
     ast_file, bench_file, debug_file, doc_file, lint_file, profile_file, symbols_file,
 };
@@ -180,6 +184,32 @@ pub fn run_cli() -> ExitCode {
             Some("installed") => project_packages(),
             Some("install") => pkg_install(),
             Some("publish") => pkg_publish(),
+            Some("tree") => pkg_tree(),
+            Some("info") => a
+                .get(3)
+                .ok_or("missing package name".into())
+                .and_then(|n| pkg_info(n)),
+            Some("update") => pkg_update(a.get(3).map(String::as_str)),
+            Some("keygen") => pkg_keygen(a.get(3).map(String::as_str)),
+            Some("sign") => pkg_sign(
+                a.get(3).map(Path::new),
+                a.get(4).map(String::as_str),
+            ),
+            Some("verify") => pkg_verify(a.get(3).map(String::as_str)),
+            Some("pack") => pkg_pack(a.get(3).map(Path::new), a.get(4).map(Path::new)),
+            Some("unpack") => a
+                .get(3)
+                .ok_or("missing bundle path".into())
+                .and_then(|p| pkg_unpack(Path::new(p), a.get(4).map(Path::new))),
+            Some("build-plugin") => pkg_build_plugin(a.get(3).map(Path::new)),
+            Some("serve") => {
+                let dir = a
+                    .get(3)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(crate::project::veyra_home);
+                let port = a.get(4).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8787);
+                serve_registry(&dir, port)
+            }
             Some("search") => a
                 .get(3)
                 .ok_or("missing search term".into())
@@ -193,7 +223,8 @@ pub fn run_cli() -> ExitCode {
                 .ok_or("missing package name".into())
                 .and_then(|n| pkg_remove(n)),
             _ => Err(
-                "usage: veyra pkg <list|search|installed|install|publish|add|remove> [name]".into(),
+                "usage: veyra pkg <list|search|info|tree|installed|install|update|publish|keygen|sign|verify|pack|unpack|build-plugin|serve|add|remove> [args]"
+                    .into(),
             ),
         },
         Some("add") => a
@@ -2161,5 +2192,563 @@ print("PARITY_OUT", async_vals, aw_res, make_mul(4)(5), (lambda z: z + 1)(41), g
             "unexpected parity stdout: {stdout}"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn test_env_cwd_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct EnvCwdGuard<'a> {
+        _guard: std::sync::MutexGuard<'a, ()>,
+        orig_cwd: PathBuf,
+        saved_env: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl<'a> EnvCwdGuard<'a> {
+        fn enter(new_cwd: &Path, vars: &[(&'static str, Option<&str>)]) -> Self {
+            let guard = test_env_cwd_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let orig_cwd = env::current_dir().unwrap();
+            let mut saved_env = Vec::with_capacity(vars.len());
+            for (k, val) in vars {
+                saved_env.push((*k, env::var(k).ok()));
+                match val {
+                    Some(v) => unsafe { env::set_var(k, v) },
+                    None => unsafe { env::remove_var(k) },
+                }
+            }
+            env::set_current_dir(new_cwd).unwrap();
+            Self {
+                _guard: guard,
+                orig_cwd,
+                saved_env,
+            }
+        }
+    }
+
+    impl Drop for EnvCwdGuard<'_> {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.orig_cwd);
+            for (k, old) in self.saved_env.iter().rev() {
+                match old {
+                    Some(v) => unsafe { env::set_var(k, v) },
+                    None => unsafe { env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jit_executes_hot_loops_and_self_recursion_natively() {
+        assert_eq!(crate::jit::jit_available(), cfg!(target_arch = "x86_64"));
+        let src = r#"
+fn sum_squares(n) {
+    let acc = 0.0;
+    let i = 1.0;
+    while i <= n {
+        acc = acc + i * i;
+        i = i + 1.0;
+    }
+    return acc;
+}
+
+fn fib_jit(n) {
+    if n <= 1.0 {
+        return n;
+    }
+    return fib_jit(n - 1.0) + fib_jit(n - 2.0);
+}
+
+fn in_band(x, lo, hi) {
+    return x >= lo and x <= hi;
+}
+
+fn add_int(a: Int, b: Int) -> Int {
+    return a + b;
+}
+
+fn non_jit_text(s) {
+    return "hi " + s;
+}
+
+assert(jit_available() == true);
+assert(jit_compile(fib_jit) == true);
+assert(jit_compile(non_jit_text) == false);
+
+let k = 0;
+let last_sq = 0.0;
+let last_add = 0;
+let band_hits = 0;
+while k < 32 {
+    last_sq = sum_squares(20.0);
+    last_add = add_int(17, 25);
+    if in_band(k, 5, 14) {
+        band_hits = band_hits + 1;
+    }
+    k = k + 1;
+}
+
+assert(abs(last_sq - 2870.0) < 0.0001);
+assert(last_add == 42);
+assert(band_hits == 10);
+assert(abs(fib_jit(20.0) - 6765.0) < 0.0001);
+
+let info = jit_info();
+assert(info["available"] == true);
+assert(info["enabled"] == true);
+assert(info["compiled_functions"] >= 3);
+assert(info["native_calls"] >= 20);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+    }
+
+    #[test]
+    fn gpu_compute_and_tensor_device_parity() {
+        let mut src = String::from(
+            r#"
+let info = gpu_info();
+let devs = gpu_devices();
+assert(len(devs) >= 1);
+
+let mm = gpu_matmul([[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]);
+assert(abs(mm[0][0] - 19.0) < 0.0001);
+assert(abs(mm[0][1] - 22.0) < 0.0001);
+assert(abs(mm[1][0] - 43.0) < 0.0001);
+assert(abs(mm[1][1] - 50.0) < 0.0001);
+
+let vadd = gpu_vec_add([1.5, 2.5, 3.5], [0.5, 1.5, 2.5]);
+assert(abs(vadd[0] - 2.0) < 0.0001);
+assert(abs(vadd[1] - 4.0) < 0.0001);
+assert(abs(vadd[2] - 6.0) < 0.0001);
+
+let vsub = gpu_vec_sub([5.0, 3.0], [2.0, 4.0]);
+assert(abs(vsub[0] - 3.0) < 0.0001);
+assert(abs(vsub[1] + 1.0) < 0.0001);
+
+let vmul = gpu_vec_mul([2.0, 3.0], [4.0, 5.0]);
+assert(abs(vmul[0] - 8.0) < 0.0001);
+assert(abs(vmul[1] - 15.0) < 0.0001);
+
+let vsc = gpu_scale([2.0, 4.0], 2.5);
+assert(abs(vsc[0] - 5.0) < 0.0001);
+assert(abs(vsc[1] - 10.0) < 0.0001);
+
+let vrelu = gpu_relu([-2.0, 0.0, 3.5]);
+assert(abs(vrelu[0]) < 0.0001);
+assert(abs(vrelu[2] - 3.5) < 0.0001);
+
+let vsig = gpu_sigmoid([0.0]);
+assert(abs(vsig[0] - 0.5) < 0.0001);
+
+let sm = gpu_softmax([[1.0, 2.0, 3.0]]);
+assert(abs(sm[0][0] + sm[0][1] + sm[0][2] - 1.0) < 0.0001);
+
+let ta = tensor_to(tensor([[1.0, 2.0], [3.0, 4.0]]), "gpu");
+let tb = tensor_to(tensor([[5.0, -6.0], [7.0, 8.0]]), "gpu");
+let tc = tensor_relu(tensor_matmul(ta, tb));
+assert(tensor_device(tc) == "gpu");
+let vals = tensor_values(tc);
+assert(abs(vals[0] - 19.0) < 0.001);
+assert(abs(vals[1] - 10.0) < 0.001);
+assert(abs(vals[2] - 43.0) < 0.001);
+assert(abs(vals[3] - 14.0) < 0.001);
+let tc_cpu = tensor_to(tc, "cpu");
+assert(tensor_device(tc_cpu) == "cpu");
+"#,
+        );
+        if crate::gpu::gpu_available() {
+            src.push_str(
+                r#"
+let hlsl = "StructuredBuffer<float> bufA;\nStructuredBuffer<float> bufB;\nRWStructuredBuffer<float> outBuf;\n[numthreads(64, 1, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {\n    if (id.x < 3) { outBuf[id.x] = bufA[id.x] * 3.0 + bufB[id.x]; }\n}\n";
+let res = gpu_run_hlsl(hlsl, "main", [3.0, 7.0, 11.0], [4.0, 5.0, 6.0], 3);
+assert(abs(res[0] - 13.0) < 0.0001);
+assert(abs(res[1] - 26.0) < 0.0001);
+assert(abs(res[2] - 39.0) < 0.0001);
+let after = gpu_info();
+assert(after["available"] == true);
+assert(after["dispatches"] >= 1);
+assert(after["shaders_compiled"] >= 1);
+"#,
+            );
+        }
+        assert_eq!(run_source(&src), Ok(()));
+    }
+
+    #[test]
+    fn native_veyra_plugin_abi_and_package_import() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("veyra_plugin_test_{stamp}"));
+        let proj = dir.join("proj");
+        let pkg_dir = proj.join("vendor").join("nmath");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::create_dir_all(&pkg_dir).unwrap();
+
+        let plugin_rs = r#"
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+
+static MANIFEST: &[u8] = b"{\"abi_version\":1,\"name\":\"nmath\",\"version\":\"0.1.0\",\"functions\":[{\"name\":\"vadd_f64\",\"symbol\":\"vadd_f64\",\"kind\":\"f64\",\"arity\":2},{\"name\":\"vscale_slice\",\"symbol\":\"vscale_slice\",\"kind\":\"f64_slice\",\"arity\":1},{\"name\":\"vgreet_json\",\"symbol\":\"vgreet_json\",\"kind\":\"json\",\"arity\":1}]}\0";
+
+#[no_mangle]
+pub extern "C" fn veyra_plugin_abi_version() -> u32 {
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn veyra_plugin_manifest() -> *const c_char {
+    MANIFEST.as_ptr() as *const c_char
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn veyra_plugin_free(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        drop(unsafe { CString::from_raw(ptr) });
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn vadd_f64(a: f64, b: f64) -> f64 {
+    a + b
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vscale_slice(inp: *const f64, len: usize, out: *mut f64) -> usize {
+    for i in 0..len {
+        unsafe { *out.add(i) = *inp.add(i) * 2.5 };
+    }
+    len
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vgreet_json(args_ptr: *const c_char) -> *mut c_char {
+    let raw = if args_ptr.is_null() {
+        "[]"
+    } else {
+        unsafe { CStr::from_ptr(args_ptr) }.to_str().unwrap_or("[]")
+    };
+    let reply = format!("{{\"ok\":\"plugin-ok:{}\"}}", raw.len());
+    CString::new(reply).unwrap().into_raw()
+}
+"#;
+        let rs_path = dir.join("nmath.rs");
+        let ext = crate::plugin::platform_shared_ext();
+        let dll_path = pkg_dir.join(format!("nmath.{ext}"));
+        fs::write(&rs_path, plugin_rs).unwrap();
+        let built = crate::plugin::build_rust_plugin(&rs_path, &dll_path).unwrap();
+        assert!(built.is_file());
+
+        let direct_src = format!(
+            r#"
+let p = plugin_load("{}");
+assert(p["name"] == "nmath");
+assert(p["abi_version"] == 1);
+let s = plugin_call(p["id"], "vadd_f64", [19.5, 22.5]);
+assert(abs(s - 42.0) < 0.00001);
+let sc = plugin_call(p["id"], "vscale_slice", [[2.0, 4.0, 6.0]]);
+assert(abs(sc[0] - 5.0) < 0.00001);
+assert(abs(sc[2] - 15.0) < 0.00001);
+let gr = plugin_call(p["id"], "vgreet_json", ["veyra"]);
+assert(starts_with(gr, "plugin-ok:"));
+assert(len(plugin_list()) >= 1);
+"#,
+            built.to_string_lossy().replace('\\', "\\\\")
+        );
+        assert_eq!(run_source(&direct_src), Ok(()));
+
+        fs::write(
+            proj.join("veyra.json"),
+            r#"{"name":"plugapp","version":"0.1.0","entry":"src/main.vy","packages":{"nmath":{"version":"0.1.0","entry":"nmath.vy"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            pkg_dir.join("veyra.json"),
+            r#"{"name":"nmath","version":"0.1.0","native":{"library":"nmath"}}"#,
+        )
+        .unwrap();
+        let main_vy = proj.join("src/main.vy");
+        fs::write(
+            &main_vy,
+            r#"
+use "nmath";
+assert(abs(nmath.vadd_f64(11.0, 31.0) - 42.0) < 0.00001);
+let sc = nmath.vscale_slice([4.0, 8.0]);
+assert(abs(sc[0] - 10.0) < 0.00001);
+assert(abs(sc[1] - 20.0) < 0.00001);
+let gr = nmath.vgreet_json("native");
+assert(starts_with(gr, "plugin-ok:"));
+"#,
+        )
+        .unwrap();
+
+        let _guard = EnvCwdGuard::enter(&proj, &[]);
+        let loaded = load_source(main_vy.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(run_source(&loaded), Ok(()));
+        drop(_guard);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sovereign_registry_signing_semver_pack_tree_and_http_publish() {
+        assert!(crate::registry::semver_matches("1.2.5", "^1.2.3"));
+        assert!(!crate::registry::semver_matches("2.0.0", "^1.2.3"));
+        assert!(crate::registry::semver_matches("1.2.9", "~1.2.3"));
+        assert!(!crate::registry::semver_matches("1.3.0", "~1.2.3"));
+        assert!(crate::registry::semver_matches("1.5.0", ">=1.2.0 <2.0.0"));
+        assert!(crate::registry::semver_matches("3.4.5", "*"));
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("veyra_reg_test_{stamp}"));
+        let home = root.join("home");
+        let pkg_src = root.join("vy_pkg_a");
+        let consumer = root.join("consumer");
+        let unpacked = root.join("unpacked");
+        fs::create_dir_all(home.join("registry")).unwrap();
+        fs::create_dir_all(home.join("packages")).unwrap();
+        fs::create_dir_all(&pkg_src).unwrap();
+        fs::create_dir_all(consumer.join("src")).unwrap();
+        fs::write(
+            home.join("registry/index.json"),
+            r#"{"registry_version":1,"packages":{}}"#,
+        )
+        .unwrap();
+        fs::write(
+            pkg_src.join("veyra.json"),
+            r#"{"name":"vy_pkg_a","version":"1.2.4","entry":"vy_pkg_a.vy"}"#,
+        )
+        .unwrap();
+        fs::write(
+            pkg_src.join("vy_pkg_a.vy"),
+            "fn answer() -> Int { return 42; }\n",
+        )
+        .unwrap();
+        fs::write(
+            consumer.join("veyra.json"),
+            r#"{"name":"consumer","version":"0.1.0","entry":"src/main.vy"}"#,
+        )
+        .unwrap();
+        fs::write(
+            consumer.join("src/main.vy"),
+            "use \"vy_pkg_a\";\nassert(vy_pkg_a.answer() == 42);\n",
+        )
+        .unwrap();
+
+        let home_str = home.to_string_lossy().to_string();
+        let _guard = EnvCwdGuard::enter(
+            &pkg_src,
+            &[
+                ("VEYRA_HOME", Some(&home_str)),
+                ("VEYRA_SIGNING_KEY", None),
+                ("VEYRA_REGISTRY_URL", None),
+            ],
+        );
+
+        crate::registry::pkg_keygen(Some("ci_key")).unwrap();
+        assert!(home.join("keys/ci_key.json").is_file());
+
+        crate::registry::pkg_sign(Some(&pkg_src), Some("ci_key")).unwrap();
+        assert!(pkg_src.join("veyra.sig.json").is_file());
+        crate::registry::pkg_verify(Some(pkg_src.to_string_lossy().as_ref())).unwrap();
+
+        // Tamper detection
+        fs::write(
+            pkg_src.join("vy_pkg_a.vy"),
+            "fn answer() -> Int { return 99; }\n",
+        )
+        .unwrap();
+        assert!(crate::registry::pkg_verify(Some(pkg_src.to_string_lossy().as_ref())).is_err());
+
+        // Restore & re-sign
+        fs::write(
+            pkg_src.join("vy_pkg_a.vy"),
+            "fn answer() -> Int { return 42; }\n",
+        )
+        .unwrap();
+        crate::registry::pkg_sign(Some(&pkg_src), Some("ci_key")).unwrap();
+
+        // Pack & verify & unpack
+        let bundle = root.join("vy_pkg_a.vypkg");
+        crate::registry::pkg_pack(Some(&pkg_src), Some(&bundle)).unwrap();
+        crate::registry::pkg_verify(Some(bundle.to_string_lossy().as_ref())).unwrap();
+        crate::registry::pkg_unpack(&bundle, Some(&unpacked)).unwrap();
+        assert_eq!(
+            fs::read_to_string(unpacked.join("vy_pkg_a.vy")).unwrap(),
+            "fn answer() -> Int { return 42; }\n"
+        );
+
+        #[cfg(feature = "native-services")]
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let srv_home = home.clone();
+            std::thread::spawn(move || {
+                let _ = crate::server::serve_registry(&srv_home, port);
+            });
+            let url = format!("http://127.0.0.1:{port}");
+            let mut ready = false;
+            for _ in 0..40 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            assert!(ready, "registry server failed to listen on {url}");
+
+            unsafe { env::set_var("VEYRA_REGISTRY_URL", &url) };
+            crate::registry::pkg_publish().unwrap();
+
+            let body = reqwest::blocking::get(format!("{url}/index.json"))
+                .unwrap()
+                .text()
+                .unwrap();
+            let idx: JsonValue = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                idx["packages"]["vy_pkg_a"]["version"].as_str(),
+                Some("1.2.4")
+            );
+            assert!(idx["packages"]["vy_pkg_a"]["sha256"].as_str().is_some());
+
+            env::set_current_dir(&consumer).unwrap();
+            crate::registry::pkg_add("vy_pkg_a").unwrap();
+            crate::registry::pkg_info("vy_pkg_a").unwrap();
+            crate::registry::pkg_tree().unwrap();
+            crate::registry::pkg_audit().unwrap();
+
+            let lock_txt = fs::read_to_string(consumer.join("veyra.lock")).unwrap();
+            let lock: JsonValue = serde_json::from_str(&lock_txt).unwrap();
+            assert_eq!(lock["format"].as_u64(), Some(3));
+            assert_eq!(lock["packages"]["vy_pkg_a"]["signed"].as_bool(), Some(true));
+        }
+
+        drop(_guard);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn all_8_sovereign_packages_end_to_end() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let proj = env::temp_dir().join(format!("veyra_8pkgs_test_{stamp}"));
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(
+            proj.join("veyra.json"),
+            r#"{"name":"eightpkgs","version":"0.1.0","entry":"src/main.vy"}"#,
+        )
+        .unwrap();
+
+        let home_str = workspace_root.to_string_lossy().to_string();
+        let _guard = EnvCwdGuard::enter(
+            &proj,
+            &[
+                ("VEYRA_HOME", Some(&home_str)),
+                ("VEYRA_REGISTRY_URL", None),
+            ],
+        );
+
+        for name in [
+            "vyjit",
+            "vygpu",
+            "vyplugin",
+            "vycache",
+            "vydiff",
+            "vytemplate",
+            "vyargparse",
+            "vydecimal",
+        ] {
+            crate::registry::pkg_add(name).unwrap();
+        }
+
+        let main_vy = proj.join("src/main.vy");
+        fs::write(
+            &main_vy,
+            r#"
+use "vyjit";
+use "vygpu";
+use "vyplugin";
+use "vycache";
+use "vydiff";
+use "vytemplate";
+use "vyargparse";
+use "vydecimal";
+
+fn sq_loop(n) {
+    let s = 0.0;
+    let i = 0.0;
+    while i < n {
+        s = s + i;
+        i = i + 1.0;
+    }
+    return s;
+}
+assert(vyjit.available() == cfg_is_x64());
+let jr = vyjit.bench(sq_loop, 10.0, 20);
+assert(abs(jr["last"] - 45.0) < 0.0001);
+
+let gm = vygpu.matmul([[1.0, 2.0], [3.0, 4.0]], [[2.0, 0.0], [1.0, 2.0]]);
+assert(abs(gm[0][0] - 4.0) < 0.001);
+assert(vyplugin.abi_version() == 1);
+
+let c = vycache.create(2);
+c = vycache.put(c, "k1", 100);
+c = vycache.put(c, "k2", 200);
+c = vycache.put(c, "k3", 300);
+assert(vycache.get(c, "k1", null) == null);
+assert(vycache.get(c, "k3", null) == 300);
+
+let ops = vydiff.diff_lines("a\nb\nc", "a\nx\nc\nd");
+assert(len(ops) >= 4);
+assert(vydiff.ratio("same\nline", "same\nline") == 1.0);
+
+let rendered = vytemplate.render("Hi {{user}}{{#if ok}}!{{/if}}", {"user": "<V>", "ok": true});
+assert(rendered == "Hi &lt;V&gt;!");
+
+let pspec = vyargparse.spec("cli", "Test");
+pspec = vyargparse.add_flag(pspec, "verbose", "v", "Verbose");
+pspec = vyargparse.add_option(pspec, "port", "p", "8080", "Port");
+let parsed = vyargparse.parse(pspec, ["-v", "-p", "9090", "run.vy"]);
+assert(parsed["values"]["verbose"] == true);
+assert(parsed["values"]["port"] == "9090");
+assert(parsed["positionals"][0] == "run.vy");
+
+let d1 = vydecimal.from_str("0.1", 2);
+let d2 = vydecimal.from_str("0.2", 2);
+assert(vydecimal.format(vydecimal.add(d1, d2)) == "0.30");
+assert(vydecimal.format(vydecimal.mul(vydecimal.from_str("1.25", 2), vydecimal.from_str("0.40", 2))) == "0.50");
+"#,
+        )
+        .unwrap();
+
+        // Normalize cfg_is_x64() without inventing a builtin!
+        let code = fs::read_to_string(&main_vy).unwrap().replace(
+            "cfg_is_x64()",
+            if cfg!(target_arch = "x86_64") {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        fs::write(&main_vy, &code).unwrap();
+
+        let loaded = load_source(main_vy.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(run_source(&loaded), Ok(()));
+        drop(_guard);
+
+        let _ = fs::remove_dir_all(proj);
     }
 }

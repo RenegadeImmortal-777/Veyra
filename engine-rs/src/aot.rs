@@ -4401,6 +4401,17 @@ impl Rt {
                 },
                 _ => return Err(Flow::Err("env_get expects String key".into())),
             },
+            "jit_available" => Val::Bool(false),
+            "jit_set_enabled" => Val::Bool(false),
+            "jit_compile" => Val::Bool(true),
+            "jit_info" | "jit_stats" => Val::Map(vec![
+                (Val::Str("available".into()), Val::Bool(false)),
+                (Val::Str("enabled".into()), Val::Bool(false)),
+                (Val::Str("backend".into()), Val::Str("aot-rustc-native".into())),
+                (Val::Str("arch".into()), Val::Str(std::env::consts::ARCH.into())),
+                (Val::Str("os".into()), Val::Str(std::env::consts::OS.into())),
+            ]),
+            "gpu_available" => Val::Bool(false),
             _ => return Ok(None),
         };
         Ok(Some(out))

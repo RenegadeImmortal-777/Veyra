@@ -40,11 +40,11 @@ Last full gate run: **2026-11-13**. Every gate passed (**8/8**).
 | Gate | Result |
 |---|---|
 | `cargo fmt --check` | PASS |
-| `cargo test` | PASS — 85 passed, 0 failed |
+| `cargo test` | PASS — 90 passed, 0 failed |
 | `cargo check --no-default-features` | PASS |
 | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | `cargo build --release` | PASS |
-| `scripts/package-matrix.ps1` | PASS — 60/60 packages checked & executed |
+| `scripts/package-matrix.ps1` | PASS — 68/68 packages checked & executed |
 | `scripts/ecosystem-gate.ps1` | PASS |
 | `scripts/release-check.ps1` | PASS (`bin/veyra-native.exe` synced) |
 
@@ -55,8 +55,21 @@ The engine source is modularized under `engine-rs/src/`:
 - `main.rs` is a 5-line binary entry point calling `veyra::run_cli()` in `lib.rs`.
 - `vm.rs` implements the flat `CallFrame` execution stack, indexed local variable
   slots (`LoadLocal`/`DefineLocal`/`StoreLocal`), loop/indexing superinstructions, shared
-  method cache, and `Arc<Mutex<Val>>` closure upvalue cell management, while built-in
-  operations live in `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
+  method cache, automatic hot-function promotion into `jit.rs`, and `Arc<Mutex<Val>>`
+  closure upvalue cell management, while built-in operations live in
+  `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
+- `jit.rs` provides Veyra's in-memory **x86_64 SSE2 native machine-code JIT compiler**
+  (`W^X` executable allocation, CFG type/stack verification, self-recursion `call rel32`,
+  libm helpers, and `jit_*` builtins) for hot numeric/boolean functions.
+- `gpu.rs` provides Veyra's **DirectCompute / Direct3D 11 (`cs_5_0` HLSL) GPU compute
+  backend** (loading `dxgi.dll`, `d3d11.dll`, `d3dcompiler_47.dll` with multi-threaded
+  CPU fallback), accelerating `gpu_*` ops, custom HLSL (`gpu_run_hlsl`), and
+  `tensor_to(t, "gpu")` device execution.
+- `plugin.rs` and `registry.rs` implement Veyra's `veyra_plugin_v1` native `cdylib`
+  extension ABI (`plugin_load`, `plugin_call`, `plugin_build`, seamless `use "<pkg>"`
+  import), HMAC-SHA256 package signing (`keygen`/`sign`/`verify`), `.vypkg` bundles
+  (`pack`/`unpack`), semver constraints, `veyra.lock` format 3, and HTTP registry
+  publishing/serving (`veyra pkg serve`, `POST /publish`).
 - `aot.rs` implements native AOT compilation (`veyra aot`, `veyra build --native`) via
   standalone optimized Rust codegen compiled by `rustc` (supporting `async fn`/`await`/`gather`,
   `yield` generators + generator expressions, `**kwargs`/chained calls, dunders, and Python interop).
@@ -119,9 +132,11 @@ Native, without Python:
   layers (`tensor_scale`, `tensor_cross_entropy`, `tensor_layer_norm`, `tensor_conv1d`,
   `tensor_conv2d`, `tensor_attention`, `tensor_multihead_attention`), and checkpoint
   save/load serialization.
-- **Packages**: an offline registry by default, hosted registry over HTTP, recursive
-  dependencies with cycle protection, 60 shipped packages verified both statically
-  and at runtime by `scripts/package-matrix.ps1`.
+- **Packages**: an offline registry by default, hosted & self-hosted HTTP registry
+  (`veyra pkg serve`, `POST /publish`, `.vypkg` bundles), HMAC-SHA256 signing &
+  verification, semver constraints, `veyra.lock` format 3, `veyra_plugin_v1` native
+  binary plugins, recursive dependencies with cycle protection, and 68 shipped
+  packages verified both statically and at runtime by `scripts/package-matrix.ps1`.
 - **Tooling**: `run`/`check`/`lint`/`fmt`/`test`/`build`/`aot`/`repl`/`disasm`,
   `bench`/`profile`/`doc`, line-aware LSP diagnostics and navigation (completion,
   hover, definitions, references, rename, hierarchical symbols, formatting), full
@@ -142,18 +157,18 @@ Native, without Python:
 
 ## Remaining long-horizon directions
 
-- Optional LLVM/Cranelift JIT tier (`aot.rs` now covers async, generators, kwargs, dunders, and Python interop natively via `rustc` AOT).
-- GPU tensor backend (CUDA/Vulkan/wgpu).
-- In-process CPython C-API `.pyd`/`.so` ABI loading and a hosted, cryptographically signed community package registry at scale (access to installed Python modules today goes through the out-of-process `py_bridge` Python 3 worker).
+- Broaden the `jit.rs` native backend to additional instruction architectures (ARM64/AArch64) and heap/string/collection operations (numeric loops/recursion run natively on x86_64 today; non-numeric code executes via bytecode VM or `aot.rs`).
+- Expand `gpu.rs` hardware compute coverage to Vulkan/Metal on Linux and macOS alongside Windows Direct3D 11 (`cs_5_0`).
+- Community-hosted mirror federation and registry web UI on top of Veyra's signed `.vypkg` protocol (`veyra pkg keygen`/`sign`/`verify`/`serve`).
 
 ## Repository map
 
 | Path | Contents |
 |---|---|
-| `engine-rs/` | Native Rust Horizon engine (`lib.rs`, `main.rs`, `builtins/`, `ir.rs`, `vm.rs`, etc.) |
+| `engine-rs/` | Native Rust Horizon engine (`lib.rs`, `main.rs`, `builtins/`, `ir.rs`, `vm.rs`, `jit.rs`, `gpu.rs`, `plugin.rs`, `registry.rs`, `aot.rs`, etc.) |
 | `compiler-vy/` | Pure-Veyra self-hosted compiler emitting `veyra-bc-v1` (`.vybc`) |
 | `bin/` | Built native launcher (`bin/veyra-native.exe`) |
-| `packages/` | 60 native Veyra packages |
+| `packages/` | 68 native Veyra packages |
 | `registry/` | Registry index |
 | `stdlib/` | Veyra-written standard library modules |
 | `spec/` | Architecture and language specification |

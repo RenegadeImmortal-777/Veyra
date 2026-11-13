@@ -40,8 +40,9 @@ use crate::runtime::{
 };
 use crate::tensor::{
     AdamState, Conv2dDims, TensorOp, adam_states, broadcast_index, broadcast_shape, conv2d_forward,
-    layer_norm_stats, softmax_rows, tensor_backward, tensor_from_value, tensor_id, tensor_snapshot,
-    tensor_store, tensors,
+    layer_norm_stats, softmax_rows, tensor_backward, tensor_default_device, tensor_from_value,
+    tensor_id, tensor_move_device, tensor_set_default_device, tensor_snapshot, tensor_store,
+    tensor_store_on_device, tensors,
 };
 use crate::value::{
     Val, as_matrix, as_num_list, constant_time_strings_equal, distance_sq, hmac_sha256_hex,
@@ -456,20 +457,33 @@ impl Vm {
                 } else {
                     out_shape.iter().product()
                 };
-                let mut data = Vec::with_capacity(out_len);
-                for i in 0..out_len {
-                    let ia = broadcast_index(i, &out_shape, &left.shape);
-                    let ib = broadcast_index(i, &out_shape, &right.shape);
-                    let x = left.data[ia];
-                    let y = right.data[ib];
-                    let v = match n {
-                        "tensor_add" => x + y,
-                        "tensor_sub" => x - y,
-                        "tensor_mul" => x * y,
-                        _ => x / y,
+                let use_gpu = (left.device == "gpu" || right.device == "gpu")
+                    && left.shape == right.shape
+                    && n != "tensor_div";
+                let data = if use_gpu {
+                    let op_code = match n {
+                        "tensor_add" => 0,
+                        "tensor_sub" => 1,
+                        _ => 2,
                     };
-                    data.push(v);
-                }
+                    crate::gpu::gpu_ewise_f64(&left.data, &right.data, op_code, 0.0)
+                } else {
+                    let mut buf = Vec::with_capacity(out_len);
+                    for i in 0..out_len {
+                        let ia = broadcast_index(i, &out_shape, &left.shape);
+                        let ib = broadcast_index(i, &out_shape, &right.shape);
+                        let x = left.data[ia];
+                        let y = right.data[ib];
+                        let v = match n {
+                            "tensor_add" => x + y,
+                            "tensor_sub" => x - y,
+                            "tensor_mul" => x * y,
+                            _ => x / y,
+                        };
+                        buf.push(v);
+                    }
+                    buf
+                };
                 let requires_grad = left.requires_grad || right.requires_grad;
                 let op = match n {
                     "tensor_add" => TensorOp::Add(left_id, right_id),
@@ -477,7 +491,12 @@ impl Vm {
                     "tensor_mul" => TensorOp::Mul(left_id, right_id),
                     _ => TensorOp::Div(left_id, right_id),
                 };
-                tensor_store(data, out_shape, requires_grad, op)?
+                let target_dev = if use_gpu {
+                    "gpu"
+                } else {
+                    tensor_default_device()
+                };
+                tensor_store_on_device(data, out_shape, requires_grad, op, target_dev)?
             }
             "tensor_neg" => {
                 if a.len() != 1 {
@@ -512,29 +531,17 @@ impl Vm {
                     [r, c] => (*r, *c),
                     _ => return Err("tensor_softmax expects 1D or 2D tensor".into()),
                 };
-                let mut out = vec![0.0; t.data.len()];
-                for row in 0..rows {
-                    let start = row * cols;
-                    let end = start + cols;
-                    let max = t.data[start..end]
-                        .iter()
-                        .copied()
-                        .fold(f64::NEG_INFINITY, f64::max);
-                    let mut denom = 0.0;
-                    for c in 0..cols {
-                        let e = (t.data[start + c] - max).exp();
-                        out[start + c] = e;
-                        denom += e;
-                    }
-                    for c in 0..cols {
-                        out[start + c] /= denom;
-                    }
-                }
-                tensor_store(
+                let out = if t.device == "gpu" {
+                    crate::gpu::gpu_softmax_rows_f64(&t.data, rows, cols)
+                } else {
+                    softmax_rows(&t.data, rows, cols)
+                };
+                tensor_store_on_device(
                     out,
                     t.shape,
                     t.requires_grad,
                     TensorOp::SoftmaxRows(id, rows, cols),
+                    &t.device,
                 )?
             }
             "tensor_detach" => {
@@ -558,8 +565,18 @@ impl Vm {
                 }
                 let id = tensor_id(&a[0])?;
                 let t = tensor_snapshot(id)?;
-                let data = t.data.iter().map(|x| x.max(0.0)).collect();
-                tensor_store(data, t.shape, t.requires_grad, TensorOp::Relu(id))?
+                let data = if t.device == "gpu" {
+                    crate::gpu::gpu_ewise_f64(&t.data, &[], 3, 0.0)
+                } else {
+                    t.data.iter().map(|x| x.max(0.0)).collect()
+                };
+                tensor_store_on_device(
+                    data,
+                    t.shape,
+                    t.requires_grad,
+                    TensorOp::Relu(id),
+                    &t.device,
+                )?
             }
             "tensor_sigmoid" | "tensor_tanh" | "tensor_exp" | "tensor_log" => {
                 if a.len() != 1 {
@@ -737,55 +754,67 @@ impl Vm {
                 if k != k2 {
                     return Err("tensor_matmul shape mismatch".into());
                 }
-                let mut out = vec![0.0; m * ncols];
-                let ops = m.saturating_mul(k).saturating_mul(ncols);
-                if ops >= 32_768 && m >= 8 {
-                    let threads = thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(4)
-                        .min(m);
-                    let rows_per_chunk = m.div_ceil(threads);
-                    let l_data = &left.data;
-                    let r_data = &right.data;
-                    thread::scope(|s| {
-                        for (chunk_idx, out_chunk) in
-                            out.chunks_mut(rows_per_chunk * ncols).enumerate()
-                        {
-                            let row_start = chunk_idx * rows_per_chunk;
-                            let chunk_rows = out_chunk.len() / ncols;
-                            s.spawn(move || {
-                                for local_i in 0..chunk_rows {
-                                    let i = row_start + local_i;
-                                    let out_row =
-                                        &mut out_chunk[local_i * ncols..(local_i + 1) * ncols];
-                                    for p in 0..k {
-                                        let a_ip = l_data[i * k + p];
-                                        let r_row = &r_data[p * ncols..(p + 1) * ncols];
-                                        for j in 0..ncols {
-                                            out_row[j] += a_ip * r_row[j];
+                let use_gpu = left.device == "gpu" || right.device == "gpu";
+                let out = if use_gpu {
+                    crate::gpu::gpu_matmul_f64(&left.data, &right.data, m, k, ncols)
+                } else {
+                    let mut buf = vec![0.0; m * ncols];
+                    let ops = m.saturating_mul(k).saturating_mul(ncols);
+                    if ops >= 32_768 && m >= 8 {
+                        let threads = thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4)
+                            .min(m);
+                        let rows_per_chunk = m.div_ceil(threads);
+                        let l_data = &left.data;
+                        let r_data = &right.data;
+                        thread::scope(|s| {
+                            for (chunk_idx, out_chunk) in
+                                buf.chunks_mut(rows_per_chunk * ncols).enumerate()
+                            {
+                                let row_start = chunk_idx * rows_per_chunk;
+                                let chunk_rows = out_chunk.len() / ncols;
+                                s.spawn(move || {
+                                    for local_i in 0..chunk_rows {
+                                        let i = row_start + local_i;
+                                        let out_row =
+                                            &mut out_chunk[local_i * ncols..(local_i + 1) * ncols];
+                                        for p in 0..k {
+                                            let a_ip = l_data[i * k + p];
+                                            let r_row = &r_data[p * ncols..(p + 1) * ncols];
+                                            for j in 0..ncols {
+                                                out_row[j] += a_ip * r_row[j];
+                                            }
                                         }
                                     }
+                                });
+                            }
+                        });
+                    } else {
+                        for i in 0..m {
+                            for p in 0..k {
+                                let a_ip = left.data[i * k + p];
+                                let out_row = &mut buf[i * ncols..(i + 1) * ncols];
+                                let r_row = &right.data[p * ncols..(p + 1) * ncols];
+                                for j in 0..ncols {
+                                    out_row[j] += a_ip * r_row[j];
                                 }
-                            });
-                        }
-                    });
-                } else {
-                    for i in 0..m {
-                        for p in 0..k {
-                            let a_ip = left.data[i * k + p];
-                            let out_row = &mut out[i * ncols..(i + 1) * ncols];
-                            let r_row = &right.data[p * ncols..(p + 1) * ncols];
-                            for j in 0..ncols {
-                                out_row[j] += a_ip * r_row[j];
                             }
                         }
                     }
-                }
-                tensor_store(
+                    buf
+                };
+                let dev = if use_gpu {
+                    "gpu"
+                } else {
+                    tensor_default_device()
+                };
+                tensor_store_on_device(
                     out,
                     vec![m, ncols],
                     left.requires_grad || right.requires_grad,
                     TensorOp::MatMul(left_id, right_id, m, k, ncols),
+                    dev,
                 )?
             }
             "tensor_scale" => {
@@ -904,12 +933,23 @@ impl Vm {
                     oh: (h - kh) / stride + 1,
                     ow: (w - kw) / stride + 1,
                 };
-                let out = conv2d_forward(&input.data, &weight.data, &dims);
-                tensor_store(
+                let use_gpu = input.device == "gpu" || weight.device == "gpu";
+                let out = if use_gpu {
+                    crate::gpu::gpu_conv2d_f64(&input.data, &weight.data, &dims)
+                } else {
+                    conv2d_forward(&input.data, &weight.data, &dims)
+                };
+                let dev = if use_gpu {
+                    "gpu"
+                } else {
+                    tensor_default_device()
+                };
+                tensor_store_on_device(
                     out,
                     vec![n, o, dims.oh, dims.ow],
                     input.requires_grad || weight.requires_grad,
                     TensorOp::Conv2d(in_id, w_id, dims),
+                    dev,
                 )?
             }
             "tensor_conv1d" => {
@@ -1498,6 +1538,166 @@ impl Vm {
                     }
                 }
                 matrix_to_val(centers)
+            }
+            "tensor_to" => {
+                if a.len() != 2 {
+                    return Err("tensor_to expects tensor,device".into());
+                }
+                let id = tensor_id(&a[0])?;
+                let dev = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("tensor_to device must be String".into()),
+                };
+                tensor_move_device(id, dev)?
+            }
+            "tensor_device" => {
+                if a.len() != 1 {
+                    return Err("tensor_device expects tensor".into());
+                }
+                let id = tensor_id(&a[0])?;
+                Val::Str(tensor_snapshot(id)?.device)
+            }
+            "tensor_default_device" => {
+                if a.is_empty() {
+                    Val::Str(tensor_default_device().to_string())
+                } else if a.len() == 1 {
+                    let Val::Str(dev) = &a[0] else {
+                        return Err("tensor_default_device expects String device".into());
+                    };
+                    Val::Str(tensor_set_default_device(dev)?)
+                } else {
+                    return Err("tensor_default_device expects 0 or 1 argument".into());
+                }
+            }
+            "gpu_available" => {
+                if !a.is_empty() {
+                    return Err("gpu_available expects 0 arguments".into());
+                }
+                Val::Bool(crate::gpu::gpu_available())
+            }
+            "gpu_info" => {
+                if !a.is_empty() {
+                    return Err("gpu_info expects 0 arguments".into());
+                }
+                crate::gpu::gpu_info_val()
+            }
+            "gpu_devices" => {
+                if !a.is_empty() {
+                    return Err("gpu_devices expects 0 arguments".into());
+                }
+                if let Val::Map(pairs) = crate::gpu::gpu_info_val() {
+                    map_lookup(&pairs, &Val::Str("adapters".into()))
+                        .cloned()
+                        .unwrap_or(Val::List(Vec::new()))
+                } else {
+                    Val::List(Vec::new())
+                }
+            }
+            "gpu_matmul" => {
+                if a.len() != 2 {
+                    return Err("gpu_matmul expects two matrices or 2D tensors".into());
+                }
+                if let (Ok(lid), Ok(rid)) = (tensor_id(&a[0]), tensor_id(&a[1])) {
+                    let left = tensor_snapshot(lid)?;
+                    let right = tensor_snapshot(rid)?;
+                    if left.shape.len() != 2 || right.shape.len() != 2 {
+                        return Err("gpu_matmul expects 2D tensors".into());
+                    }
+                    let (m, k) = (left.shape[0], left.shape[1]);
+                    let (k2, ncols) = (right.shape[0], right.shape[1]);
+                    if k != k2 {
+                        return Err("gpu_matmul shape mismatch".into());
+                    }
+                    let out = crate::gpu::gpu_matmul_f64(&left.data, &right.data, m, k, ncols);
+                    tensor_store_on_device(
+                        out,
+                        vec![m, ncols],
+                        left.requires_grad || right.requires_grad,
+                        TensorOp::MatMul(lid, rid, m, k, ncols),
+                        "gpu",
+                    )?
+                } else {
+                    let left = as_matrix(&a[0])?;
+                    let right = as_matrix(&a[1])?;
+                    let m = left.len();
+                    let k = left[0].len();
+                    if right.len() != k {
+                        return Err("gpu_matmul shape mismatch".into());
+                    }
+                    let ncols = right[0].len();
+                    let flat_a: Vec<f64> = left.into_iter().flatten().collect();
+                    let flat_b: Vec<f64> = right.into_iter().flatten().collect();
+                    let flat_c = crate::gpu::gpu_matmul_f64(&flat_a, &flat_b, m, k, ncols);
+                    let rows = flat_c.chunks(ncols).map(|r| r.to_vec()).collect::<Vec<_>>();
+                    matrix_to_val(rows)
+                }
+            }
+            "gpu_vec_add" | "gpu_vec_sub" | "gpu_vec_mul" => {
+                if a.len() != 2 {
+                    return Err(format!("{n} expects two numeric lists"));
+                }
+                let xs = as_num_list(&a[0])?;
+                let ys = as_num_list(&a[1])?;
+                if xs.len() != ys.len() {
+                    return Err(format!("{n} list length mismatch"));
+                }
+                let code = match n {
+                    "gpu_vec_add" => 0,
+                    "gpu_vec_sub" => 1,
+                    _ => 2,
+                };
+                nums_to_val(crate::gpu::gpu_ewise_f64(&xs, &ys, code, 0.0))
+            }
+            "gpu_relu" | "gpu_sigmoid" => {
+                if a.len() != 1 {
+                    return Err(format!("{n} expects numeric list"));
+                }
+                let xs = as_num_list(&a[0])?;
+                let code = if n == "gpu_relu" { 3 } else { 4 };
+                nums_to_val(crate::gpu::gpu_ewise_f64(&xs, &[], code, 0.0))
+            }
+            "gpu_scale" => {
+                if a.len() != 2 {
+                    return Err("gpu_scale expects list,scalar".into());
+                }
+                let xs = as_num_list(&a[0])?;
+                let Val::Num(k) = a[1] else {
+                    return Err("gpu_scale scalar must be Number".into());
+                };
+                nums_to_val(crate::gpu::gpu_ewise_f64(&xs, &[], 5, k))
+            }
+            "gpu_softmax" => {
+                if a.len() != 1 {
+                    return Err("gpu_softmax expects matrix".into());
+                }
+                let mat = as_matrix(&a[0])?;
+                let rows = mat.len();
+                let cols = mat[0].len();
+                let flat: Vec<f64> = mat.into_iter().flatten().collect();
+                let out = crate::gpu::gpu_softmax_rows_f64(&flat, rows, cols);
+                matrix_to_val(out.chunks(cols).map(|r| r.to_vec()).collect())
+            }
+            "gpu_run_hlsl" => {
+                if a.len() < 5 || a.len() > 8 {
+                    return Err(
+                        "gpu_run_hlsl expects (source,entry,buf_a,buf_b,out_len[,gx,gy,gz])".into(),
+                    );
+                }
+                let Val::Str(src) = &a[0] else {
+                    return Err("hlsl source must be String".into());
+                };
+                let Val::Str(entry) = &a[1] else {
+                    return Err("hlsl entry must be String".into());
+                };
+                let buf_a = as_num_list(&a[2])?;
+                let buf_b = as_num_list(&a[3])?;
+                let out_len = parse_pos_int(Some(&a[4]), 1, "gpu_run_hlsl out_len")?;
+                let gx = parse_pos_int(a.get(5), out_len.div_ceil(64).max(1), "gx")? as u32;
+                let gy = parse_pos_int(a.get(6), 1, "gy")? as u32;
+                let gz = parse_pos_int(a.get(7), 1, "gz")? as u32;
+                let out =
+                    crate::gpu::gpu_run_hlsl(src, entry, &buf_a, &buf_b, out_len, gx, gy, gz)?;
+                nums_to_val(out)
             }
             _ => return Ok(None),
         };
