@@ -35,12 +35,12 @@ way to misread the project.
 
 ## Verification status
 
-Last full gate run: **2026-11-08**. Every gate passed (**8/8**).
+Last full gate run: **2026-11-13**. Every gate passed (**8/8**).
 
 | Gate | Result |
 |---|---|
 | `cargo fmt --check` | PASS |
-| `cargo test` | PASS — 72 passed, 0 failed |
+| `cargo test` | PASS — 82 passed, 0 failed |
 | `cargo check --no-default-features` | PASS |
 | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | `cargo build --release` | PASS |
@@ -48,15 +48,19 @@ Last full gate run: **2026-11-08**. Every gate passed (**8/8**).
 | `scripts/ecosystem-gate.ps1` | PASS |
 | `scripts/release-check.ps1` | PASS (`bin/veyra-native.exe` synced) |
 
-Environment of that run: Windows, `cargo`/`rustc` 1.93.1, Python 3.12.10 (`15/15`
-Python compatibility unit tests in `tests/test_veyra.py` also passing). Raw output
+Environment of that run: Windows, `cargo`/`rustc` 1.93.1, Python 3.12.10. Raw output
 and per-gate exit codes are written to `gate-report.txt`.
 
-The engine source is fully modularized under `engine-rs/src/`:
+The engine source is modularized under `engine-rs/src/`:
 - `main.rs` is a 5-line binary entry point calling `veyra::run_cli()` in `lib.rs`.
-- `vm.rs` (~780 lines) contains only the core VM dispatch loop and per-variable
-  `Arc<Mutex<Val>>` closure upvalue cell management, while all 210+ built-in
+- `vm.rs` implements the flat `CallFrame` execution stack, indexed local variable
+  slots (`LoadLocal`/`DefineLocal`/`StoreLocal`), loop/indexing superinstructions, shared
+  method cache, and `Arc<Mutex<Val>>` closure upvalue cell management, while built-in
   operations live in `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
+- `aot.rs` implements native AOT compilation (`veyra aot`, `veyra build --native`) via
+  standalone optimized Rust codegen compiled by `rustc`.
+- `dap.rs` and `lsp.rs` implement the native DAP debugger and LSP server consumed by
+  the VS Code extension (`tooling/vscode/`).
 - See [docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md) and [WAY_FORWARD.md](WAY_FORWARD.md)
   for the full architectural map.
 
@@ -75,18 +79,21 @@ behind a pipe, writes `gate-report.txt`, and exits non-zero if any gate fails.
 
 Native, without Python:
 
-- **Language**: typed functions and recursion, closures with shared mutable lexical
-  upvalues (`Arc<Mutex<Val>>` cells), classes with inheritance and static/runtime
+- **Language**: typed functions and recursion, default parameters and `*rest`
+  varargs, ternary expressions (`a if cond else b`), closures with shared mutable
+  lexical upvalues (`Arc<Mutex<Val>>` cells), classes with inheritance and static/runtime
   type enforcement, unwind-safe `try`/`catch`/`finally` and `with ... as ...`
   context managers, generators, decorators, list comprehensions, `match`/`case`,
   short-circuit `and`/`or`, right-associative `**`, tuple `(a, b)` and set `{a, b}`
-  literals, compound assignments (`+=`, `-=`, `*=`, `/=`), list/map index mutation
-  (`xs[i] = v`, `m[k] = v`), 1/2/3-arg `range(...)`, and async functions with
+  literals, f-strings, compound assignments (`+=`, `-=`, `*=`, `/=`), list/map index
+  mutation (`xs[i] = v`, `m[k] = v`), 1/2/3-arg `range(...)`, and async functions with
   `await`/`gather`, tasks, channels, and timeout-aware waits.
-- **Bytecode & Self-Hosting**: portable `veyra-bc-v1` (`.vybc`) bytecode
+- **Bytecode, VM & Native AOT**: portable `veyra-bc-v1` (`.vybc`) bytecode
   serialization with SHA-256 tamper verification, multi-pass bytecode optimizer
-  (`ir.rs`), and the pure-Veyra self-hosted compiler (`compiler-vy/src/main.vy`)
-  verified to a 3-stage bootstrap fixpoint (`Stage 2 .vybc == Stage 3 .vybc`).
+  (`ir.rs`), flat `CallFrame` + indexed local slot VM (`vm.rs`), pure-Veyra
+  self-hosted compiler (`compiler-vy/src/main.vy`) verified to a 3-stage bootstrap
+  fixpoint (`Stage 2 .vybc == Stage 3 .vybc`), and native AOT compilation (`aot.rs`,
+  `veyra aot`, `veyra build --native`).
 - **Runtime services**: JSON, TOML, CSV, regex, Base64, UUID, date/time, filesystem,
   paths, processes, environment, platform introspection.
 - **Application**: HTTP client, path-traversal-hardened static/routed/dynamic web
@@ -98,14 +105,18 @@ Native, without Python:
   regression, clustering, ML metrics, plus an N-dimensional tensor runtime with
   NumPy/PyTorch-style N-D broadcasting and backward gradient reduction, cache-friendly
   `tensor_matmul`, reverse-mode autograd with automatic unreachable tape GC
-  (`tensor_gc_unreachable`), Adam and SGD optimizers, and serialization.
+  (`tensor_gc_unreachable`), Adam and SGD optimizers, neural network / transformer
+  layers (`tensor_scale`, `tensor_cross_entropy`, `tensor_layer_norm`, `tensor_conv1d`,
+  `tensor_conv2d`, `tensor_attention`, `tensor_multihead_attention`), and checkpoint
+  save/load serialization.
 - **Packages**: an offline registry by default, hosted registry over HTTP, recursive
   dependencies with cycle protection, 60 shipped packages verified both statically
   and at runtime by `scripts/package-matrix.ps1`.
-- **Tooling**: `run`/`check`/`lint`/`fmt`/`test`/`build`/`repl`/`disasm`,
+- **Tooling**: `run`/`check`/`lint`/`fmt`/`test`/`build`/`aot`/`repl`/`disasm`,
   `bench`/`profile`/`doc`, line-aware LSP diagnostics and navigation (completion,
-  hover, definitions, references, rename, symbols, formatting), and the VS Code
-  extension.
+  hover, definitions, references, rename, hierarchical symbols, formatting), full
+  Debug Adapter Protocol server (`veyra dap` with breakpoints, stepping, stack frames,
+  variable inspection, and `evaluate`), and the VS Code extension (`tooling/vscode/`).
 
 ## Resolved inconsistencies (closed in Veyra 12.0)
 
@@ -121,9 +132,8 @@ Native, without Python:
 
 ## Remaining long-horizon directions
 
-- Optimizing native machine-code JIT/AOT backend (Cranelift/LLVM).
-- Full Debug Adapter Protocol (DAP) server.
-- GPU tensor backend (CUDA/Vulkan/wgpu) and convolutional/transformer layers.
+- Async/generator support in the native AOT backend (`aot.rs`) and optional LLVM/Cranelift JIT tier.
+- GPU tensor backend (CUDA/Vulkan/wgpu).
 - Publicly hosted, cryptographically signed community package registry at scale.
 
 ## Repository map

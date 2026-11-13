@@ -9,6 +9,7 @@ pub(crate) struct Parser {
     t: Vec<Tok>,
     lines: Vec<usize>,
     i: usize,
+    track_lines: bool,
 }
 impl Parser {
     pub(crate) fn new(t: Vec<Tok>) -> Self {
@@ -17,11 +18,26 @@ impl Parser {
             t,
             lines: vec![0; len],
             i: 0,
+            track_lines: false,
         }
     }
     pub(crate) fn new_with_lines(tokens: Vec<(Tok, usize)>) -> Self {
         let (t, lines) = tokens.into_iter().unzip();
-        Self { t, lines, i: 0 }
+        Self {
+            t,
+            lines,
+            i: 0,
+            track_lines: false,
+        }
+    }
+    pub(crate) fn new_with_debug_lines(tokens: Vec<(Tok, usize)>) -> Self {
+        let (t, lines) = tokens.into_iter().unzip();
+        Self {
+            t,
+            lines,
+            i: 0,
+            track_lines: true,
+        }
     }
     fn line(&self) -> usize {
         self.lines.get(self.i).copied().unwrap_or(0)
@@ -60,19 +76,27 @@ impl Parser {
             Err(self.fmt_err(format!("{msg}; got {:?}", self.cur())))
         }
     }
+    fn push_next_stmt(&mut self, into: &mut Vec<Stmt>) -> Result<(), String> {
+        let stmt_line = self.line();
+        let mut s = self.stmt()?;
+        if self.track_lines && stmt_line > 0 {
+            into.push(Stmt::SourceLine(stmt_line));
+        }
+        if let Stmt::If(Expr::Bool(true), ref mut unpacked, ref empty) = s {
+            if empty.is_empty()
+                && matches!(unpacked.first(), Some(Stmt::Let(n, _, _, _)) if n.starts_with("__unpack_"))
+            {
+                into.append(unpacked);
+                return Ok(());
+            }
+        }
+        into.push(s);
+        Ok(())
+    }
     pub(crate) fn program(&mut self) -> Result<Vec<Stmt>, String> {
         let mut v = vec![];
         while !matches!(self.cur(), Tok::Eof) {
-            let mut s = self.stmt()?;
-            if let Stmt::If(Expr::Bool(true), ref mut unpacked, ref empty) = s {
-                if empty.is_empty()
-                    && matches!(unpacked.first(), Some(Stmt::Let(n, _, _, _)) if n.starts_with("__unpack_"))
-                {
-                    v.append(unpacked);
-                    continue;
-                }
-            }
-            v.push(s);
+            self.push_next_stmt(&mut v)?;
         }
         Ok(v)
     }
@@ -80,16 +104,7 @@ impl Parser {
         self.need(&Tok::Lb, "expected '{'")?;
         let mut v = vec![];
         while !matches!(self.cur(), Tok::Rb | Tok::Eof) {
-            let mut s = self.stmt()?;
-            if let Stmt::If(Expr::Bool(true), ref mut unpacked, ref empty) = s {
-                if empty.is_empty()
-                    && matches!(unpacked.first(), Some(Stmt::Let(n, _, _, _)) if n.starts_with("__unpack_"))
-                {
-                    v.append(unpacked);
-                    continue;
-                }
-            }
-            v.push(s);
+            self.push_next_stmt(&mut v)?;
         }
         self.need(&Tok::Rb, "expected '}'")?;
         Ok(v)
@@ -304,7 +319,9 @@ impl Parser {
             let a = self.block()?;
             let b = if self.eat(&Tok::Else) {
                 if matches!(self.cur(), Tok::If) {
-                    vec![self.stmt()?]
+                    let mut chained = vec![];
+                    self.push_next_stmt(&mut chained)?;
+                    chained
                 } else {
                     self.block()?
                 }
