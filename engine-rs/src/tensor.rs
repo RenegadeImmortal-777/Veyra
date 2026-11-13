@@ -10,7 +10,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use crate::value::{Val, as_matrix, as_num_list};
+use crate::value::{Val, as_num_list};
 
 pub(crate) static TENSOR_IDS: AtomicU64 = AtomicU64::new(1);
 pub(crate) static TENSORS: OnceLock<Mutex<HashMap<u64, TensorData>>> = OnceLock::new();
@@ -40,6 +40,102 @@ pub(crate) enum TensorOp {
     Sum(u64),
     Mean(u64),
     MatMul(u64, u64, usize, usize, usize),
+    Scale(u64, f64),
+    /// Mean cross-entropy over rows: (logits, target class per row, rows, cols).
+    CrossEntropy(u64, Vec<usize>, usize, usize),
+    /// Normalization over the last dimension: (input, rows, cols, epsilon).
+    LayerNorm(u64, usize, usize, f64),
+    /// 2-D convolution (input NCHW, weight OCKhKw, dims).
+    Conv2d(u64, u64, Conv2dDims),
+    /// Slice columns [col_start .. col_start + col_len] from 2D [rows, total_cols].
+    SliceCols(u64, usize, usize, usize, usize),
+    /// Concatenate 2D tensors horizontally: (parent_ids, rows, col_lens).
+    ConcatCols(Vec<u64>, usize, Vec<usize>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Conv2dDims {
+    pub(crate) n: usize,
+    pub(crate) c: usize,
+    pub(crate) h: usize,
+    pub(crate) w: usize,
+    pub(crate) o: usize,
+    pub(crate) kh: usize,
+    pub(crate) kw: usize,
+    pub(crate) stride: usize,
+    pub(crate) oh: usize,
+    pub(crate) ow: usize,
+}
+
+impl Conv2dDims {
+    pub(crate) fn in_idx(&self, n: usize, c: usize, y: usize, x: usize) -> usize {
+        ((n * self.c + c) * self.h + y) * self.w + x
+    }
+    pub(crate) fn w_idx(&self, o: usize, c: usize, i: usize, j: usize) -> usize {
+        ((o * self.c + c) * self.kh + i) * self.kw + j
+    }
+    pub(crate) fn out_idx(&self, n: usize, o: usize, y: usize, x: usize) -> usize {
+        ((n * self.o + o) * self.oh + y) * self.ow + x
+    }
+}
+
+pub(crate) fn conv2d_forward(input: &[f64], weight: &[f64], d: &Conv2dDims) -> Vec<f64> {
+    let mut out = vec![0.0; d.n * d.o * d.oh * d.ow];
+    for n in 0..d.n {
+        for o in 0..d.o {
+            for y in 0..d.oh {
+                for x in 0..d.ow {
+                    let mut acc = 0.0;
+                    for c in 0..d.c {
+                        for i in 0..d.kh {
+                            for j in 0..d.kw {
+                                acc += input[d.in_idx(n, c, y * d.stride + i, x * d.stride + j)]
+                                    * weight[d.w_idx(o, c, i, j)];
+                            }
+                        }
+                    }
+                    out[d.out_idx(n, o, y, x)] = acc;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Row-wise numerically stable softmax over a `rows x cols` buffer.
+pub(crate) fn softmax_rows(data: &[f64], rows: usize, cols: usize) -> Vec<f64> {
+    let mut out = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let row = &data[r * cols..(r + 1) * cols];
+        let max = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut denom = 0.0;
+        for c in 0..cols {
+            let e = (row[c] - max).exp();
+            out[r * cols + c] = e;
+            denom += e;
+        }
+        for c in 0..cols {
+            out[r * cols + c] /= denom;
+        }
+    }
+    out
+}
+
+/// Per-row mean and inverse standard deviation for layer normalization.
+pub(crate) fn layer_norm_stats(
+    data: &[f64],
+    rows: usize,
+    cols: usize,
+    eps: f64,
+) -> Vec<(f64, f64)> {
+    (0..rows)
+        .map(|r| {
+            let row = &data[r * cols..(r + 1) * cols];
+            let mean = row.iter().sum::<f64>() / cols as f64;
+            let var = row.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / cols as f64;
+            (mean, 1.0 / (var + eps).sqrt())
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -91,31 +187,48 @@ pub(crate) fn tensor_id(value: &Val) -> Result<u64, String> {
     Err("invalid Tensor handle".into())
 }
 
-pub(crate) fn tensor_from_value(value: &Val, requires_grad: bool) -> Result<Val, String> {
-    let (data, shape) = match value {
-        Val::List(rows) if rows.iter().all(|x| matches!(x, Val::List(_))) => {
-            let matrix = as_matrix(value)?;
-            if matrix.is_empty() {
-                (vec![], vec![0, 0])
-            } else {
-                let cols = matrix[0].len();
-                if matrix.iter().any(|r| r.len() != cols) {
-                    return Err("tensor matrix rows must have equal length".into());
+fn extract_nd_tensor(value: &Val) -> Result<(Vec<f64>, Vec<usize>), String> {
+    match value {
+        Val::Num(n) => Ok((vec![*n], vec![])),
+        Val::List(items) => {
+            if items.is_empty() {
+                return Ok((vec![], vec![0]));
+            }
+            if items.iter().all(|x| matches!(x, Val::List(_))) {
+                let mut flat = Vec::new();
+                let mut child_shape: Option<Vec<usize>> = None;
+                for item in items {
+                    let (data, shape) = extract_nd_tensor(item)?;
+                    match &child_shape {
+                        None => child_shape = Some(shape),
+                        Some(expected) if expected != &shape => {
+                            return Err("tensor nested lists must have equal inner shapes".into());
+                        }
+                        _ => {}
+                    }
+                    flat.extend(data);
                 }
-                (
-                    matrix.into_iter().flatten().collect(),
-                    vec![rows.len(), cols],
-                )
+                let mut full_shape =
+                    Vec::with_capacity(1 + child_shape.as_ref().map_or(0, |s| s.len()));
+                full_shape.push(items.len());
+                if let Some(sub) = child_shape {
+                    full_shape.extend(sub);
+                }
+                Ok((flat, full_shape))
+            } else if items.iter().any(|x| matches!(x, Val::List(_))) {
+                Err("tensor nested lists must have consistent rank".into())
+            } else {
+                let xs = as_num_list(value)?;
+                let n = xs.len();
+                Ok((xs, vec![n]))
             }
         }
-        Val::List(_) => {
-            let xs = as_num_list(value)?;
-            let n = xs.len();
-            (xs, vec![n])
-        }
-        Val::Num(n) => (vec![*n], vec![]),
-        _ => return Err("tensor expects Number or numeric List".into()),
-    };
+        _ => Err("tensor expects Number or numeric List".into()),
+    }
+}
+
+pub(crate) fn tensor_from_value(value: &Val, requires_grad: bool) -> Result<Val, String> {
+    let (data, shape) = extract_nd_tensor(value)?;
     let id = TENSOR_IDS.fetch_add(1, Ordering::Relaxed);
     tensors()
         .lock()
@@ -240,8 +353,13 @@ pub(crate) fn tensor_topology(
         | TensorOp::Reshape(a)
         | TensorOp::Transpose(a, _, _)
         | TensorOp::Sum(a)
-        | TensorOp::Mean(a) => vec![a],
-        TensorOp::MatMul(a, b, _, _, _) => vec![a, b],
+        | TensorOp::Mean(a)
+        | TensorOp::Scale(a, _)
+        | TensorOp::CrossEntropy(a, _, _, _)
+        | TensorOp::LayerNorm(a, _, _, _)
+        | TensorOp::SliceCols(a, _, _, _, _) => vec![a],
+        TensorOp::MatMul(a, b, _, _, _) | TensorOp::Conv2d(a, b, _) => vec![a, b],
+        TensorOp::ConcatCols(parents, _, _) => parents,
     };
     for p in parents {
         tensor_topology(p, seen, order)?;
@@ -532,6 +650,136 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
                             *dst += src;
                         }
                     }
+                }
+            }
+            TensorOp::Scale(a, k) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(grad.iter()) {
+                            *dst += *src * k;
+                        }
+                    }
+                }
+            }
+            TensorOp::CrossEntropy(a, targets, rows, cols) => {
+                let parent = tensor_snapshot(a)?;
+                let probs = softmax_rows(&parent.data, rows, cols);
+                let scale = grad[0] / rows as f64;
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                let onehot = if targets[r] == c { 1.0 } else { 0.0 };
+                                t.grad[r * cols + c] += scale * (probs[r * cols + c] - onehot);
+                            }
+                        }
+                    }
+                }
+            }
+            TensorOp::LayerNorm(a, rows, cols, eps) => {
+                let parent = tensor_snapshot(a)?;
+                let stats = layer_norm_stats(&parent.data, rows, cols, eps);
+                let mut incoming = vec![0.0; rows * cols];
+                for r in 0..rows {
+                    let (mean, inv_std) = stats[r];
+                    let base = r * cols;
+                    let mut g_mean = 0.0;
+                    let mut gx_mean = 0.0;
+                    for c in 0..cols {
+                        let xhat = (parent.data[base + c] - mean) * inv_std;
+                        g_mean += grad[base + c];
+                        gx_mean += grad[base + c] * xhat;
+                    }
+                    g_mean /= cols as f64;
+                    gx_mean /= cols as f64;
+                    for c in 0..cols {
+                        let xhat = (parent.data[base + c] - mean) * inv_std;
+                        incoming[base + c] = inv_std * (grad[base + c] - g_mean - xhat * gx_mean);
+                    }
+                }
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(incoming) {
+                            *dst += src;
+                        }
+                    }
+                }
+            }
+            TensorOp::Conv2d(a, b, d) => {
+                let input = tensor_snapshot(a)?;
+                let weight = tensor_snapshot(b)?;
+                let mut grad_in = vec![0.0; input.data.len()];
+                let mut grad_w = vec![0.0; weight.data.len()];
+                for n in 0..d.n {
+                    for o in 0..d.o {
+                        for y in 0..d.oh {
+                            for x in 0..d.ow {
+                                let g = grad[d.out_idx(n, o, y, x)];
+                                if g == 0.0 {
+                                    continue;
+                                }
+                                for c in 0..d.c {
+                                    for i in 0..d.kh {
+                                        for j in 0..d.kw {
+                                            let ii =
+                                                d.in_idx(n, c, y * d.stride + i, x * d.stride + j);
+                                            let wi = d.w_idx(o, c, i, j);
+                                            grad_in[ii] += g * weight.data[wi];
+                                            grad_w[wi] += g * input.data[ii];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(grad_in) {
+                            *dst += src;
+                        }
+                    }
+                }
+                if let Some(t) = store.get_mut(&b) {
+                    if t.requires_grad {
+                        for (dst, src) in t.grad.iter_mut().zip(grad_w) {
+                            *dst += src;
+                        }
+                    }
+                }
+            }
+            TensorOp::SliceCols(a, rows, total_cols, col_start, col_len) => {
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                if let Some(t) = store.get_mut(&a) {
+                    if t.requires_grad {
+                        for r in 0..rows {
+                            for c in 0..col_len {
+                                t.grad[r * total_cols + col_start + c] += grad[r * col_len + c];
+                            }
+                        }
+                    }
+                }
+            }
+            TensorOp::ConcatCols(parents, rows, col_lens) => {
+                let total_cols: usize = col_lens.iter().sum();
+                let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
+                let mut col_offset = 0;
+                for (pid, parent_cols) in parents.into_iter().zip(col_lens.into_iter()) {
+                    if let Some(t) = store.get_mut(&pid) {
+                        if t.requires_grad {
+                            for r in 0..rows {
+                                for c in 0..parent_cols {
+                                    t.grad[r * parent_cols + c] +=
+                                        grad[r * total_cols + col_offset + c];
+                                }
+                            }
+                        }
+                    }
+                    col_offset += parent_cols;
                 }
             }
         }

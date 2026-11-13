@@ -18,7 +18,7 @@ const builtins = [
   'platform_os','platform_arch','platform_family','path_separator',
   'path_join','path_name','path_parent','path_extension','starts_with','ends_with','replace_text',
   'accuracy_score','classification_metrics','train_test_split',
-  'tensor','tensor_values','tensor_shape','tensor_grad','tensor_add','tensor_sub','tensor_mul','tensor_div','tensor_neg','tensor_pow','tensor_matmul','tensor_softmax','tensor_detach','tensor_numel','tensor_relu','tensor_sigmoid','tensor_tanh','tensor_exp','tensor_log','tensor_reshape','tensor_transpose','tensor_save','tensor_load','tensor_sum','tensor_mean','tensor_backward','tensor_step','tensor_adam_step','tensor_reset_optimizer','tensor_zero_grad',
+  'tensor','tensor_values','tensor_shape','tensor_grad','tensor_add','tensor_sub','tensor_mul','tensor_div','tensor_neg','tensor_pow','tensor_matmul','tensor_softmax','tensor_detach','tensor_numel','tensor_relu','tensor_sigmoid','tensor_tanh','tensor_exp','tensor_log','tensor_reshape','tensor_transpose','tensor_scale','tensor_cross_entropy','tensor_layer_norm','tensor_conv1d','tensor_conv2d','tensor_attention','tensor_multihead_attention','tensor_checkpoint_save','tensor_checkpoint_load','tensor_save','tensor_load','tensor_sum','tensor_mean','tensor_backward','tensor_step','tensor_adam_step','tensor_reset_optimizer','tensor_zero_grad',
   'next','collect','generator_done',
   'toml_parse','toml_stringify','base64_encode','base64_decode','uuid_v4','now_utc','now_local','datetime_format',
   'ffi_available','ffi_i32','ffi_i64','ffi_f64',

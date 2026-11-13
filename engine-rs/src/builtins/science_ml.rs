@@ -39,8 +39,9 @@ use crate::runtime::{
     resolve_function_object, tasks,
 };
 use crate::tensor::{
-    AdamState, TensorOp, adam_states, broadcast_index, broadcast_shape, tensor_backward,
-    tensor_from_value, tensor_id, tensor_snapshot, tensor_store, tensors,
+    AdamState, Conv2dDims, TensorOp, adam_states, broadcast_index, broadcast_shape, conv2d_forward,
+    layer_norm_stats, softmax_rows, tensor_backward, tensor_from_value, tensor_id, tensor_snapshot,
+    tensor_store, tensors,
 };
 use crate::value::{
     Val, as_matrix, as_num_list, constant_time_strings_equal, distance_sq, hmac_sha256_hex,
@@ -50,6 +51,14 @@ use crate::value::{
 #[cfg(feature = "native-services")]
 use crate::value::{json_stringify_value, val_to_sql_value};
 use crate::vm::{Vm, collect_generator, generators, resume_generator};
+
+fn parse_pos_int(arg: Option<&Val>, default: usize, label: &str) -> Result<usize, String> {
+    match arg {
+        None => Ok(default),
+        Some(Val::Num(n)) if *n >= 1.0 && n.fract() == 0.0 => Ok(*n as usize),
+        _ => Err(format!("{label} must be a positive integer")),
+    }
+}
 
 impl Vm {
     pub(crate) fn call_builtin_science_ml(
@@ -778,6 +787,355 @@ impl Vm {
                     left.requires_grad || right.requires_grad,
                     TensorOp::MatMul(left_id, right_id, m, k, ncols),
                 )?
+            }
+            "tensor_scale" => {
+                if a.len() != 2 {
+                    return Err("tensor_scale expects tensor,factor".into());
+                }
+                let id = tensor_id(&a[0])?;
+                let k = match a[1] {
+                    Val::Num(n) => n,
+                    _ => return Err("tensor_scale factor must be Number".into()),
+                };
+                let t = tensor_snapshot(id)?;
+                let data = t.data.iter().map(|x| x * k).collect();
+                tensor_store(data, t.shape, t.requires_grad, TensorOp::Scale(id, k))?
+            }
+            "tensor_cross_entropy" => {
+                if a.len() != 2 {
+                    return Err("tensor_cross_entropy expects logits,targets".into());
+                }
+                let id = tensor_id(&a[0])?;
+                let t = tensor_snapshot(id)?;
+                let (rows, cols) = match t.shape.as_slice() {
+                    [c] => (1usize, *c),
+                    [r, c] => (*r, *c),
+                    _ => return Err("tensor_cross_entropy expects 1D or 2D logits".into()),
+                };
+                let targets = as_num_list(&a[1])?;
+                if targets.len() != rows {
+                    return Err(format!(
+                        "tensor_cross_entropy expects {rows} targets, got {}",
+                        targets.len()
+                    ));
+                }
+                let mut classes = Vec::with_capacity(rows);
+                for v in targets {
+                    if v < 0.0 || v.fract() != 0.0 || v as usize >= cols {
+                        return Err(format!("target class {v} out of range 0..{cols}"));
+                    }
+                    classes.push(v as usize);
+                }
+                let probs = softmax_rows(&t.data, rows, cols);
+                let loss = (0..rows)
+                    .map(|r| -probs[r * cols + classes[r]].max(1e-300).ln())
+                    .sum::<f64>()
+                    / rows as f64;
+                tensor_store(
+                    vec![loss],
+                    vec![],
+                    t.requires_grad,
+                    TensorOp::CrossEntropy(id, classes, rows, cols),
+                )?
+            }
+            "tensor_layer_norm" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("tensor_layer_norm expects tensor[,epsilon]".into());
+                }
+                let id = tensor_id(&a[0])?;
+                let eps = match a.get(1) {
+                    None => 1e-5,
+                    Some(Val::Num(n)) if *n > 0.0 => *n,
+                    _ => return Err("tensor_layer_norm epsilon must be positive Number".into()),
+                };
+                let t = tensor_snapshot(id)?;
+                let cols = *t
+                    .shape
+                    .last()
+                    .ok_or("tensor_layer_norm expects non-scalar")?;
+                if cols == 0 {
+                    return Err("tensor_layer_norm last dimension must be non-empty".into());
+                }
+                let rows = t.data.len() / cols;
+                let stats = layer_norm_stats(&t.data, rows, cols, eps);
+                let mut out = vec![0.0; t.data.len()];
+                for r in 0..rows {
+                    let (mean, inv_std) = stats[r];
+                    for c in 0..cols {
+                        out[r * cols + c] = (t.data[r * cols + c] - mean) * inv_std;
+                    }
+                }
+                tensor_store(
+                    out,
+                    t.shape,
+                    t.requires_grad,
+                    TensorOp::LayerNorm(id, rows, cols, eps),
+                )?
+            }
+            "tensor_conv2d" => {
+                if a.len() < 2 || a.len() > 3 {
+                    return Err("tensor_conv2d expects input,weight[,stride]".into());
+                }
+                let in_id = tensor_id(&a[0])?;
+                let w_id = tensor_id(&a[1])?;
+                let stride = parse_pos_int(a.get(2), 1, "tensor_conv2d stride")?;
+                let input = tensor_snapshot(in_id)?;
+                let weight = tensor_snapshot(w_id)?;
+                let (n, c, h, w) = match input.shape.as_slice() {
+                    [n, c, h, w] => (*n, *c, *h, *w),
+                    _ => return Err("tensor_conv2d input must be 4D [N,C,H,W]".into()),
+                };
+                let (o, wc, kh, kw) = match weight.shape.as_slice() {
+                    [o, c, kh, kw] => (*o, *c, *kh, *kw),
+                    _ => return Err("tensor_conv2d weight must be 4D [O,C,KH,KW]".into()),
+                };
+                if wc != c || kh > h || kw > w || kh == 0 || kw == 0 {
+                    return Err("tensor_conv2d shape mismatch".into());
+                }
+                let dims = Conv2dDims {
+                    n,
+                    c,
+                    h,
+                    w,
+                    o,
+                    kh,
+                    kw,
+                    stride,
+                    oh: (h - kh) / stride + 1,
+                    ow: (w - kw) / stride + 1,
+                };
+                let out = conv2d_forward(&input.data, &weight.data, &dims);
+                tensor_store(
+                    out,
+                    vec![n, o, dims.oh, dims.ow],
+                    input.requires_grad || weight.requires_grad,
+                    TensorOp::Conv2d(in_id, w_id, dims),
+                )?
+            }
+            "tensor_conv1d" => {
+                if a.len() < 2 || a.len() > 3 {
+                    return Err("tensor_conv1d expects input,weight[,stride]".into());
+                }
+                let in_id = tensor_id(&a[0])?;
+                let w_id = tensor_id(&a[1])?;
+                let stride = parse_pos_int(a.get(2), 1, "tensor_conv1d stride")?;
+                let input = tensor_snapshot(in_id)?;
+                let weight = tensor_snapshot(w_id)?;
+                let (n, c, l) = match input.shape.as_slice() {
+                    [n, c, l] => (*n, *c, *l),
+                    _ => return Err("tensor_conv1d input must be 3D [N,C,L]".into()),
+                };
+                let (o, wc, k) = match weight.shape.as_slice() {
+                    [o, c, k] => (*o, *c, *k),
+                    _ => return Err("tensor_conv1d weight must be 3D [O,C,K]".into()),
+                };
+                if wc != c || k > l || k == 0 {
+                    return Err("tensor_conv1d shape mismatch".into());
+                }
+                let dims = Conv2dDims {
+                    n,
+                    c,
+                    h: 1,
+                    w: l,
+                    o,
+                    kh: 1,
+                    kw: k,
+                    stride,
+                    oh: 1,
+                    ow: (l - k) / stride + 1,
+                };
+                let out = conv2d_forward(&input.data, &weight.data, &dims);
+                tensor_store(
+                    out,
+                    vec![n, o, dims.ow],
+                    input.requires_grad || weight.requires_grad,
+                    TensorOp::Conv2d(in_id, w_id, dims),
+                )?
+            }
+            "tensor_attention" => {
+                if a.len() != 3 {
+                    return Err("tensor_attention expects q,k,v".into());
+                }
+                let q = tensor_snapshot(tensor_id(&a[0])?)?;
+                if q.shape.len() != 2 {
+                    return Err("tensor_attention expects 2D [seq, dim] tensors".into());
+                }
+                let d = q.shape[1].max(1) as f64;
+                let mut call = |name: &str, args: Vec<Val>| -> Result<Val, String> {
+                    self.call_builtin_science_ml(name, args)?
+                        .ok_or_else(|| format!("internal: missing builtin {name}"))
+                };
+                let kt = call("tensor_transpose", vec![a[1].clone()])?;
+                let scores = call("tensor_matmul", vec![a[0].clone(), kt])?;
+                let scaled = call("tensor_scale", vec![scores, Val::Num(1.0 / d.sqrt())])?;
+                let weights = call("tensor_softmax", vec![scaled])?;
+                call("tensor_matmul", vec![weights, a[2].clone()])?
+            }
+            "tensor_multihead_attention" => {
+                if a.len() != 4 {
+                    return Err("tensor_multihead_attention expects q,k,v,num_heads".into());
+                }
+                let num_heads =
+                    parse_pos_int(Some(&a[3]), 1, "tensor_multihead_attention num_heads")?;
+                let q_id = tensor_id(&a[0])?;
+                let k_id = tensor_id(&a[1])?;
+                let v_id = tensor_id(&a[2])?;
+                let q = tensor_snapshot(q_id)?;
+                let k = tensor_snapshot(k_id)?;
+                let v = tensor_snapshot(v_id)?;
+                if q.shape.len() != 2 || k.shape.len() != 2 || v.shape.len() != 2 {
+                    return Err("tensor_multihead_attention expects 2D [seq, dim] tensors".into());
+                }
+                let (seq_q, d_model) = (q.shape[0], q.shape[1]);
+                let seq_k = k.shape[0];
+                if k.shape[1] != d_model || v.shape[1] != d_model || v.shape[0] != seq_k {
+                    return Err("tensor_multihead_attention shape mismatch".into());
+                }
+                if d_model == 0 || d_model % num_heads != 0 {
+                    return Err(format!(
+                        "tensor_multihead_attention dim {d_model} must be divisible by {num_heads}"
+                    ));
+                }
+                let head_dim = d_model / num_heads;
+                let slice_cols = |data: &[f64],
+                                  req_grad: bool,
+                                  id: u64,
+                                  rows: usize,
+                                  start: usize|
+                 -> Result<Val, String> {
+                    let mut sliced = Vec::with_capacity(rows * head_dim);
+                    for r in 0..rows {
+                        sliced.extend_from_slice(
+                            &data[r * d_model + start..r * d_model + start + head_dim],
+                        );
+                    }
+                    tensor_store(
+                        sliced,
+                        vec![rows, head_dim],
+                        req_grad,
+                        TensorOp::SliceCols(id, rows, d_model, start, head_dim),
+                    )
+                };
+                let mut head_ids = Vec::with_capacity(num_heads);
+                let mut head_snaps = Vec::with_capacity(num_heads);
+                for h in 0..num_heads {
+                    let start = h * head_dim;
+                    let qh = slice_cols(&q.data, q.requires_grad, q_id, seq_q, start)?;
+                    let kh = slice_cols(&k.data, k.requires_grad, k_id, seq_k, start)?;
+                    let vh = slice_cols(&v.data, v.requires_grad, v_id, seq_k, start)?;
+                    let head_val = self
+                        .call_builtin_science_ml("tensor_attention", vec![qh, kh, vh])?
+                        .ok_or_else(|| "internal: missing builtin tensor_attention".to_string())?;
+                    let hid = tensor_id(&head_val)?;
+                    head_ids.push(hid);
+                    head_snaps.push(tensor_snapshot(hid)?);
+                }
+                let mut out = vec![0.0; seq_q * d_model];
+                let mut any_grad = false;
+                for (h, snap) in head_snaps.iter().enumerate() {
+                    any_grad |= snap.requires_grad;
+                    let start = h * head_dim;
+                    for r in 0..seq_q {
+                        for c in 0..head_dim {
+                            out[r * d_model + start + c] = snap.data[r * head_dim + c];
+                        }
+                    }
+                }
+                tensor_store(
+                    out,
+                    vec![seq_q, d_model],
+                    any_grad,
+                    TensorOp::ConcatCols(head_ids, seq_q, vec![head_dim; num_heads]),
+                )?
+            }
+            "tensor_checkpoint_save" => {
+                if a.len() != 2 {
+                    return Err("tensor_checkpoint_save expects map,path".into());
+                }
+                let pairs = match &a[0] {
+                    Val::Map(p) => p,
+                    _ => return Err("tensor_checkpoint_save expects Map of name -> tensor".into()),
+                };
+                let path = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("tensor_checkpoint_save path must be String".into()),
+                };
+                let mut entries = serde_json::Map::new();
+                for (k, v) in pairs {
+                    let name = match k {
+                        Val::Str(s) => s.clone(),
+                        _ => return Err("checkpoint keys must be Strings".into()),
+                    };
+                    let t = tensor_snapshot(tensor_id(v)?)?;
+                    entries.insert(
+                        name,
+                        serde_json::json!({
+                            "shape": t.shape,
+                            "data": t.data,
+                            "requires_grad": t.requires_grad
+                        }),
+                    );
+                }
+                let body = serde_json::json!({
+                    "format": "veyra.checkpoint.v1",
+                    "tensors": entries
+                });
+                fs::write(path, serde_json::to_vec(&body).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                Val::Num(pairs.len() as f64)
+            }
+            "tensor_checkpoint_load" => {
+                if a.len() != 1 {
+                    return Err("tensor_checkpoint_load expects path".into());
+                }
+                let path = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("tensor_checkpoint_load path must be String".into()),
+                };
+                let body: JsonValue =
+                    serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?;
+                if body.get("format").and_then(JsonValue::as_str) != Some("veyra.checkpoint.v1") {
+                    return Err("unsupported checkpoint format".into());
+                }
+                let entries = body
+                    .get("tensors")
+                    .and_then(JsonValue::as_object)
+                    .ok_or("checkpoint missing tensors")?;
+                let mut out = Vec::with_capacity(entries.len());
+                for (name, t) in entries {
+                    let shape = t
+                        .get("shape")
+                        .and_then(JsonValue::as_array)
+                        .ok_or("checkpoint tensor missing shape")?
+                        .iter()
+                        .map(|v| v.as_u64().map(|n| n as usize).ok_or("invalid shape"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let data = t
+                        .get("data")
+                        .and_then(JsonValue::as_array)
+                        .ok_or("checkpoint tensor missing data")?
+                        .iter()
+                        .map(|v| v.as_f64().ok_or("invalid tensor value"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let size: usize = if shape.is_empty() {
+                        1
+                    } else {
+                        shape.iter().product()
+                    };
+                    if size != data.len() {
+                        return Err(format!("checkpoint tensor '{name}' shape/data mismatch"));
+                    }
+                    let requires_grad = t
+                        .get("requires_grad")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false);
+                    out.push((
+                        Val::Str(name.clone()),
+                        tensor_store(data, shape, requires_grad, TensorOp::Leaf)?,
+                    ));
+                }
+                Val::Map(out)
             }
             "tensor_backward" => {
                 if a.len() != 1 {

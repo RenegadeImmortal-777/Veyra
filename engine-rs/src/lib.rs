@@ -1164,4 +1164,115 @@ mod tests {
         assert_eq!(extracted, payload);
         assert!(run_vybc(&extracted).is_ok());
     }
+    #[test]
+    fn ml_layers_forward_and_autograd() {
+        let src = r#"
+            // 1D Convolution forward & backward
+            let x1 = tensor([[[1.0, 2.0, 3.0, 4.0]]], true);
+            let w1 = tensor([[[1.0, 0.0, -1.0]]], true);
+            let y1 = tensor_conv1d(x1, w1);
+            assert(tensor_shape(y1) == [1, 1, 2]);
+            let v1 = tensor_values(y1);
+            assert(v1[0] == -2.0 and v1[1] == -2.0);
+            let loss1 = tensor_sum(tensor_mul(y1, tensor([[[2.0, 3.0]]], false)));
+            tensor_backward(loss1);
+            // dy1 = [2, 3] => dx1[0]=2, dx1[1]=3, dx1[2]=-2, dx1[3]=-3; dw1=[1*2+2*3=8, 2*2+3*3=13, 3*2+4*3=18]
+            assert(tensor_grad(x1) == [2.0, 3.0, -2.0, -3.0]);
+            assert(tensor_grad(w1) == [8.0, 13.0, 18.0]);
+
+            // 2D Convolution forward & backward
+            let x2 = tensor([[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]], true);
+            let w2 = tensor([[[[1.0, 0.0], [0.0, 1.0]]]], true);
+            let y2 = tensor_conv2d(x2, w2);
+            assert(tensor_shape(y2) == [1, 1, 1, 2]);
+            assert(tensor_values(y2) == [6.0, 8.0]);
+            tensor_backward(tensor_sum(y2));
+            assert(tensor_grad(w2) == [3.0, 5.0, 9.0, 11.0]);
+            assert(tensor_grad(x2) == [1.0, 1.0, 0.0, 0.0, 1.0, 1.0]);
+
+            // LayerNorm forward + finite-difference gradient check
+            let xln = tensor([[1.0, 3.0, 2.0], [4.0, 0.0, -1.0]], true);
+            let wln = tensor([[1.0, 2.0, 3.0], [0.5, -1.5, 2.0]], false);
+            let yln = tensor_layer_norm(xln, 0.000001);
+            assert(tensor_shape(yln) == [2, 3]);
+            let lln = tensor_sum(tensor_mul(yln, wln));
+            tensor_backward(lln);
+            let gln = tensor_grad(xln);
+            let eps = 0.00001;
+            let num_ln = (
+                tensor_values(tensor_sum(tensor_mul(tensor_layer_norm(tensor([[1.0 + eps, 3.0, 2.0], [4.0, 0.0, -1.0]], false), 0.000001), wln)))[0]
+                - tensor_values(tensor_sum(tensor_mul(tensor_layer_norm(tensor([[1.0 - eps, 3.0, 2.0], [4.0, 0.0, -1.0]], false), 0.000001), wln)))[0]
+            ) / (2.0 * eps);
+            assert(abs(gln[0] - num_ln) < 0.0001);
+
+            // Cross-Entropy loss + gradient check
+            let logits = tensor([[2.0, 0.5, -1.0], [0.1, 1.5, 0.2]], true);
+            let ce = tensor_cross_entropy(logits, [0, 1]);
+            assert(tensor_shape(ce) == []);
+            assert(tensor_values(ce)[0] > 0.0 and tensor_values(ce)[0] < 1.0);
+            tensor_backward(ce);
+            let gce = tensor_grad(logits);
+            let num_ce = (
+                tensor_values(tensor_cross_entropy(tensor([[2.0 + eps, 0.5, -1.0], [0.1, 1.5, 0.2]], false), [0, 1]))[0]
+                - tensor_values(tensor_cross_entropy(tensor([[2.0 - eps, 0.5, -1.0], [0.1, 1.5, 0.2]], false), [0, 1]))[0]
+            ) / (2.0 * eps);
+            assert(abs(gce[0] - num_ce) < 0.0001);
+
+            // Multi-head Attention forward & finite-difference gradient check
+            let q = tensor([[1.0, 0.5, -0.3, 0.8], [0.2, -0.4, 0.6, 0.1]], true);
+            let k = tensor([[0.4, 1.0, 0.2, -0.5], [-0.2, 0.3, 0.7, 0.9]], true);
+            let v = tensor([[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 1.5, 2.5]], true);
+            let wt = tensor([[1.0, -0.5, 0.25, 0.75], [-0.2, 0.8, 0.4, -0.6]], false);
+            let mha = tensor_multihead_attention(q, k, v, 2);
+            assert(tensor_shape(mha) == [2, 4]);
+            let lmha = tensor_sum(tensor_mul(mha, wt));
+            tensor_backward(lmha);
+            let gq = tensor_grad(q);
+            let gk = tensor_grad(k);
+            let gv = tensor_grad(v);
+            let qp = tensor([[1.0 + eps, 0.5, -0.3, 0.8], [0.2, -0.4, 0.6, 0.1]], false);
+            let qm = tensor([[1.0 - eps, 0.5, -0.3, 0.8], [0.2, -0.4, 0.6, 0.1]], false);
+            let num_q = (
+                tensor_values(tensor_sum(tensor_mul(tensor_multihead_attention(qp, k, v, 2), wt)))[0]
+                - tensor_values(tensor_sum(tensor_mul(tensor_multihead_attention(qm, k, v, 2), wt)))[0]
+            ) / (2.0 * eps);
+            assert(abs(gq[0] - num_q) < 0.0001);
+            let kp = tensor([[0.4 + eps, 1.0, 0.2, -0.5], [-0.2, 0.3, 0.7, 0.9]], false);
+            let km = tensor([[0.4 - eps, 1.0, 0.2, -0.5], [-0.2, 0.3, 0.7, 0.9]], false);
+            let num_k = (
+                tensor_values(tensor_sum(tensor_mul(tensor_multihead_attention(q, kp, v, 2), wt)))[0]
+                - tensor_values(tensor_sum(tensor_mul(tensor_multihead_attention(q, km, v, 2), wt)))[0]
+            ) / (2.0 * eps);
+            assert(abs(gk[0] - num_k) < 0.0001);
+            let vp = tensor([[1.0 + eps, 2.0, 3.0, 4.0], [0.5, -1.0, 1.5, 2.5]], false);
+            let vm = tensor([[1.0 - eps, 2.0, 3.0, 4.0], [0.5, -1.0, 1.5, 2.5]], false);
+            let num_v = (
+                tensor_values(tensor_sum(tensor_mul(tensor_multihead_attention(q, k, vp, 2), wt)))[0]
+                - tensor_values(tensor_sum(tensor_mul(tensor_multihead_attention(q, k, vm, 2), wt)))[0]
+            ) / (2.0 * eps);
+            assert(abs(gv[0] - num_v) < 0.0001);
+        "#;
+        run_source(src).unwrap();
+    }
+    #[test]
+    fn ml_checkpoint_save_and_load() {
+        let path = env::temp_dir().join("veyra_ml_checkpoint_test.json");
+        let escaped = path.to_string_lossy().replace('\\', "\\\\");
+        let src = format!(
+            r#"
+            let w = tensor([[1.5, -2.0], [0.25, 3.0]], true);
+            let b = tensor([0.5, -0.5], true);
+            let n = tensor_checkpoint_save({{"w": w, "b": b}}, "{escaped}");
+            assert(n == 2);
+            let ckpt = tensor_checkpoint_load("{escaped}");
+            assert(tensor_shape(ckpt["w"]) == [2, 2]);
+            assert(tensor_values(ckpt["w"]) == [1.5, -2.0, 0.25, 3.0]);
+            assert(tensor_values(ckpt["b"]) == [0.5, -0.5]);
+            tensor_backward(tensor_sum(ckpt["w"]));
+            assert(tensor_grad(ckpt["w"]) == [1.0, 1.0, 1.0, 1.0]);
+            "#
+        );
+        run_source(&src).unwrap();
+        let _ = fs::remove_file(path);
+    }
 }
