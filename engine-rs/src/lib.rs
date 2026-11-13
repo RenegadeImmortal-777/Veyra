@@ -26,6 +26,7 @@ mod builtins;
 mod bytecode;
 mod cli;
 mod compiler;
+mod dap;
 mod ir;
 mod lexer;
 mod lsp;
@@ -43,6 +44,7 @@ mod vm;
 #[cfg(test)]
 use crate::bytecode::Op;
 use crate::cli::{doctor, new_project, repl, usage};
+use crate::dap::dap_server;
 #[cfg(test)]
 use crate::lexer::lex;
 use crate::lsp::lsp_server;
@@ -255,6 +257,7 @@ pub fn run_cli() -> ExitCode {
             path.and_then(|p| symbols_file(&p))
         }
         Some("lsp") => lsp_server(),
+        Some("dap") => dap_server(),
         Some("test") => test_project(),
         Some("bench") => {
             let path = match a.get(2) {
@@ -1274,5 +1277,325 @@ mod tests {
         );
         run_source(&src).unwrap();
         let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn lsp_async_fn_definition_and_completion_include_ml() {
+        let src =
+            "async fn fetch_data(x: Int) -> Int {\n    return x + 1;\n}\nlet y = fetch_data(2);";
+        let def = lsp_definition(src, "file:///test.vy", "fetch_data");
+        assert_eq!(
+            def.pointer("/range/start/line").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        let comps = crate::lsp::lsp_completion_items();
+        let labels: Vec<&str> = comps
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.get("label").and_then(|v| v.as_str()))
+            .collect();
+        assert!(labels.contains(&"tensor_conv2d"));
+        assert!(labels.contains(&"tensor_multihead_attention"));
+        assert!(labels.contains(&"tensor_checkpoint_save"));
+    }
+    #[test]
+    fn dap_protocol_breakpoints_stepping_and_variables() {
+        use std::collections::VecDeque;
+        use std::io::{BufReader, Read, Write};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        #[derive(Clone, Default)]
+        struct MemPipe {
+            inner: Arc<(Mutex<(VecDeque<u8>, bool)>, Condvar)>,
+        }
+        impl MemPipe {
+            fn close(&self) {
+                let (m, cv) = &*self.inner;
+                let mut g = m.lock().unwrap();
+                g.1 = true;
+                cv.notify_all();
+            }
+        }
+        impl Read for MemPipe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let (m, cv) = &*self.inner;
+                let mut g = m.lock().unwrap();
+                while g.0.is_empty() && !g.1 {
+                    g = cv.wait(g).unwrap();
+                }
+                let mut n = 0;
+                while n < buf.len() {
+                    if let Some(b) = g.0.pop_front() {
+                        buf[n] = b;
+                        n += 1;
+                    } else {
+                        break;
+                    }
+                }
+                Ok(n)
+            }
+        }
+        impl Write for MemPipe {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let (m, cv) = &*self.inner;
+                let mut g = m.lock().unwrap();
+                g.0.extend(buf);
+                cv.notify_all();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let prog = env::temp_dir().join("veyra_dap_test.vy");
+        fs::write(
+            &prog,
+            "fn add_step(x, y) {\n    let z = x + y;\n    return z * 2;\n}\nlet a = 3;\nlet b = 4;\nlet res = add_step(a, b);\nprint(\"res\", res);\nassert(res == 14);\n",
+        )
+        .unwrap();
+
+        let mut c2s = MemPipe::default();
+        let s2c = MemPipe::default();
+        let server_in = c2s.clone();
+        let server_out = s2c.clone();
+        let srv_handle = std::thread::spawn(move || {
+            crate::dap::run_dap_with_io(BufReader::new(server_in), Box::new(server_out))
+        });
+
+        let mut client_reader = BufReader::new(s2c);
+        let mut seq = 1u64;
+        let mut send_req = |cmd: &str, args: serde_json::Value| -> u64 {
+            let id = seq;
+            seq += 1;
+            let payload = serde_json::json!({
+                "seq": id,
+                "type": "request",
+                "command": cmd,
+                "arguments": args
+            });
+            let body = serde_json::to_string(&payload).unwrap();
+            let msg = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+            c2s.write_all(msg.as_bytes()).unwrap();
+            c2s.flush().unwrap();
+            id
+        };
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        fn recv_resp(
+            reader: &mut impl std::io::BufRead,
+            events: &mut Vec<serde_json::Value>,
+            target_cmd: &str,
+        ) -> serde_json::Value {
+            loop {
+                let msg = crate::dap::read_dap_message(reader)
+                    .unwrap()
+                    .expect("expected DAP message");
+                if msg.get("type").and_then(|v| v.as_str()) == Some("response")
+                    && msg.get("command").and_then(|v| v.as_str()) == Some(target_cmd)
+                {
+                    assert_eq!(
+                        msg.get("success").and_then(|v| v.as_bool()),
+                        Some(true),
+                        "DAP command {target_cmd} failed: {msg}"
+                    );
+                    return msg;
+                }
+                events.push(msg);
+            }
+        }
+        fn wait_event(
+            reader: &mut impl std::io::BufRead,
+            events: &mut Vec<serde_json::Value>,
+            target_event: &str,
+        ) -> serde_json::Value {
+            if let Some(pos) = events
+                .iter()
+                .position(|m| m.get("event").and_then(|v| v.as_str()) == Some(target_event))
+            {
+                return events.remove(pos);
+            }
+            loop {
+                let msg = crate::dap::read_dap_message(reader)
+                    .unwrap()
+                    .expect("expected DAP event");
+                if msg.get("type").and_then(|v| v.as_str()) == Some("event")
+                    && msg.get("event").and_then(|v| v.as_str()) == Some(target_event)
+                {
+                    return msg;
+                }
+                events.push(msg);
+            }
+        }
+
+        send_req("initialize", serde_json::json!({"adapterID": "veyra"}));
+        let _ = recv_resp(&mut client_reader, &mut events, "initialize");
+        let _ = wait_event(&mut client_reader, &mut events, "initialized");
+
+        send_req(
+            "launch",
+            serde_json::json!({"program": prog.to_string_lossy(), "stopOnEntry": false}),
+        );
+        let _ = recv_resp(&mut client_reader, &mut events, "launch");
+
+        send_req(
+            "setBreakpoints",
+            serde_json::json!({
+                "source": {"path": prog.to_string_lossy()},
+                "breakpoints": [{"line": 2}, {"line": 8}]
+            }),
+        );
+        let bp_resp = recv_resp(&mut client_reader, &mut events, "setBreakpoints");
+        let bps = bp_resp
+            .pointer("/body/breakpoints")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(bps.len(), 2);
+        assert_eq!(bps[0].get("verified").and_then(|v| v.as_bool()), Some(true));
+
+        send_req("configurationDone", serde_json::json!({}));
+        let _ = recv_resp(&mut client_reader, &mut events, "configurationDone");
+
+        // Hit breakpoint at line 2 inside add_step(3, 4)
+        let stop1 = wait_event(&mut client_reader, &mut events, "stopped");
+        assert_eq!(
+            stop1.pointer("/body/reason").and_then(|v| v.as_str()),
+            Some("breakpoint")
+        );
+
+        send_req("stackTrace", serde_json::json!({"threadId": 1}));
+        let st1 = recv_resp(&mut client_reader, &mut events, "stackTrace");
+        let frames1 = st1
+            .pointer("/body/stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(frames1.len(), 2);
+        assert_eq!(
+            frames1[0].get("name").and_then(|v| v.as_str()),
+            Some("add_step")
+        );
+        assert_eq!(frames1[0].get("line").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            frames1[1].get("name").and_then(|v| v.as_str()),
+            Some("<main>")
+        );
+        let top_fid = frames1[0].get("id").and_then(|v| v.as_u64()).unwrap();
+
+        send_req("scopes", serde_json::json!({"frameId": top_fid}));
+        let sc1 = recv_resp(&mut client_reader, &mut events, "scopes");
+        let scopes1 = sc1.pointer("/body/scopes").unwrap().as_array().unwrap();
+        assert!(scopes1.len() >= 2);
+        let locals_ref = scopes1[0]
+            .get("variablesReference")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+
+        send_req(
+            "variables",
+            serde_json::json!({"variablesReference": locals_ref}),
+        );
+        let vars1 = recv_resp(&mut client_reader, &mut events, "variables");
+        let vlist1 = vars1
+            .pointer("/body/variables")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(vlist1.iter().any(|v| v["name"] == "x" && v["value"] == "3"));
+        assert!(vlist1.iter().any(|v| v["name"] == "y" && v["value"] == "4"));
+
+        send_req(
+            "evaluate",
+            serde_json::json!({"expression": "x * 10 + y", "frameId": top_fid}),
+        );
+        let eval_resp = recv_resp(&mut client_reader, &mut events, "evaluate");
+        assert_eq!(
+            eval_resp.pointer("/body/result").and_then(|v| v.as_str()),
+            Some("34")
+        );
+
+        // Step over to line 3 inside add_step; z should now be 7
+        send_req("next", serde_json::json!({"threadId": 1}));
+        let _ = recv_resp(&mut client_reader, &mut events, "next");
+        let stop2 = wait_event(&mut client_reader, &mut events, "stopped");
+        assert_eq!(
+            stop2.pointer("/body/reason").and_then(|v| v.as_str()),
+            Some("step")
+        );
+
+        send_req("stackTrace", serde_json::json!({"threadId": 1}));
+        let st2 = recv_resp(&mut client_reader, &mut events, "stackTrace");
+        let frames2 = st2
+            .pointer("/body/stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(frames2[0].get("line").and_then(|v| v.as_u64()), Some(3));
+        let top_fid2 = frames2[0].get("id").and_then(|v| v.as_u64()).unwrap();
+
+        send_req("scopes", serde_json::json!({"frameId": top_fid2}));
+        let sc2 = recv_resp(&mut client_reader, &mut events, "scopes");
+        let locals_ref2 = sc2
+            .pointer("/body/scopes/0/variablesReference")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        send_req(
+            "variables",
+            serde_json::json!({"variablesReference": locals_ref2}),
+        );
+        let vars2 = recv_resp(&mut client_reader, &mut events, "variables");
+        assert!(
+            vars2
+                .pointer("/body/variables")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["name"] == "z" && v["value"] == "7")
+        );
+
+        // Continue to line 8 breakpoint in <main>
+        send_req("continue", serde_json::json!({"threadId": 1}));
+        let _ = recv_resp(&mut client_reader, &mut events, "continue");
+        let stop3 = wait_event(&mut client_reader, &mut events, "stopped");
+        assert_eq!(
+            stop3.pointer("/body/reason").and_then(|v| v.as_str()),
+            Some("breakpoint")
+        );
+
+        send_req("stackTrace", serde_json::json!({"threadId": 1}));
+        let st3 = recv_resp(&mut client_reader, &mut events, "stackTrace");
+        let frames3 = st3
+            .pointer("/body/stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(frames3.len(), 1);
+        assert_eq!(frames3[0].get("line").and_then(|v| v.as_u64()), Some(8));
+
+        send_req("continue", serde_json::json!({"threadId": 1}));
+        let _ = recv_resp(&mut client_reader, &mut events, "continue");
+        let out_ev = wait_event(&mut client_reader, &mut events, "output");
+        assert!(
+            out_ev
+                .pointer("/body/output")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .contains("res 14")
+        );
+        let exited = wait_event(&mut client_reader, &mut events, "exited");
+        assert_eq!(
+            exited.pointer("/body/exitCode").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        let _ = wait_event(&mut client_reader, &mut events, "terminated");
+
+        send_req("disconnect", serde_json::json!({}));
+        let _ = recv_resp(&mut client_reader, &mut events, "disconnect");
+        c2s.close();
+        srv_handle.join().unwrap().unwrap();
+        let _ = fs::remove_file(prog);
     }
 }

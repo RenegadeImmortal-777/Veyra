@@ -61,4 +61,6 @@ pub(crate) enum Stmt {
     Yield(Expr),
     Break,
     Continue,
+    /// Debug-only statement marker carrying 1-based source line number.
+    SourceLine(usize),
 }

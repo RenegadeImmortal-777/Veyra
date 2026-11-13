@@ -77,6 +77,8 @@ pub(crate) struct FunctionDef {
     pub(crate) captures: Arc<HashMap<String, Val>>,
     pub(crate) capture_types: Arc<HashMap<String, String>>,
     pub(crate) upvalues: Arc<HashMap<String, Arc<Mutex<Val>>>>,
+    pub(crate) debug_name: String,
+    pub(crate) debug_scope: usize,
 }
 
 pub(crate) fn code_has_yield(code: &[Op]) -> bool {

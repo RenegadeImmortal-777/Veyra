@@ -6,6 +6,12 @@ use crate::ast::{Expr, Stmt};
 use crate::bytecode::Op;
 use crate::value::Val;
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompiledDebug {
+    pub(crate) lines: Vec<(usize, usize)>,
+    pub(crate) children: Vec<(usize, usize, CompiledDebug)>,
+}
+
 struct LoopCtx {
     breaks: Vec<usize>,
     continues: Vec<usize>,
@@ -15,14 +21,54 @@ pub(crate) struct Compiler {
     code: Vec<Op>,
     next_temp: usize,
     loops: Vec<LoopCtx>,
+    cur_line: usize,
+    line_marks: Vec<(usize, usize)>,
+    child_debugs: Vec<(usize, usize, CompiledDebug)>,
 }
 impl Compiler {
     pub(crate) fn new() -> Self {
+        Self::new_at_line(0)
+    }
+    fn new_at_line(cur_line: usize) -> Self {
         Self {
             code: vec![],
             next_temp: 0,
             loops: vec![],
+            cur_line,
+            line_marks: vec![],
+            child_debugs: vec![],
         }
+    }
+    fn push_line_mark(&mut self, line: usize) {
+        if line == 0 {
+            return;
+        }
+        let ip = self.code.len();
+        if let Some((last_ip, last_line)) = self.line_marks.last_mut() {
+            if *last_ip == ip {
+                *last_line = line;
+                return;
+            }
+        }
+        self.line_marks.push((ip, line));
+    }
+    fn compile_child(
+        &self,
+        body: &[Stmt],
+        initial_line: usize,
+    ) -> Result<(Vec<Op>, CompiledDebug), String> {
+        let mut child = Compiler::new_at_line(initial_line);
+        child.emit_stmts(body)?;
+        if child.line_marks.is_empty() && initial_line > 0 {
+            child.line_marks.push((0, initial_line));
+        }
+        child.code.push(Op::Const(Val::Null));
+        child.code.push(Op::Return);
+        let dbg = CompiledDebug {
+            lines: child.line_marks,
+            children: child.child_debugs,
+        };
+        Ok((child.code, dbg))
     }
     fn temp(&mut self, prefix: &str) -> String {
         let n = self.next_temp;
@@ -70,24 +116,35 @@ impl Compiler {
             }
             Expr::Lambda(params, return_type, body) => {
                 let name = self.temp("lambda");
-                let mut child = Compiler::new();
-                child.emit_stmts(body)?;
-                child.code.push(Op::Const(Val::Null));
-                child.code.push(Op::Return);
+                let (child_code, child_dbg) = self.compile_child(body, self.cur_line)?;
+                let def_ip = self.code.len();
+                self.child_debugs.push((def_ip, 0, child_dbg));
                 self.code.push(Op::Def(
                     name.clone(),
                     params.clone(),
                     return_type.clone(),
                     false,
-                    child.code,
+                    child_code,
                 ));
                 self.code.push(Op::FunctionRef(name));
             }
             Expr::ListComp(value, var, iterable, condition) => {
                 let value_fn = self.temp("comp_value");
-                let mut value_compiler = Compiler::new();
+                let mut value_compiler = Compiler::new_at_line(self.cur_line);
+                if self.cur_line > 0 {
+                    value_compiler.line_marks.push((0, self.cur_line));
+                }
                 value_compiler.emit_expr(value)?;
                 value_compiler.code.push(Op::Return);
+                let val_ip = self.code.len();
+                self.child_debugs.push((
+                    val_ip,
+                    0,
+                    CompiledDebug {
+                        lines: value_compiler.line_marks,
+                        children: value_compiler.child_debugs,
+                    },
+                ));
                 self.code.push(Op::Def(
                     value_fn.clone(),
                     vec![(var.clone(), None)],
@@ -97,9 +154,21 @@ impl Compiler {
                 ));
                 let condition_fn = if let Some(cond) = condition {
                     let name = self.temp("comp_cond");
-                    let mut cond_compiler = Compiler::new();
+                    let mut cond_compiler = Compiler::new_at_line(self.cur_line);
+                    if self.cur_line > 0 {
+                        cond_compiler.line_marks.push((0, self.cur_line));
+                    }
                     cond_compiler.emit_expr(cond)?;
                     cond_compiler.code.push(Op::Return);
+                    let cond_ip = self.code.len();
+                    self.child_debugs.push((
+                        cond_ip,
+                        0,
+                        CompiledDebug {
+                            lines: cond_compiler.line_marks,
+                            children: cond_compiler.child_debugs,
+                        },
+                    ));
                     self.code.push(Op::Def(
                         name.clone(),
                         vec![(var.clone(), None)],
@@ -483,64 +552,69 @@ impl Compiler {
             },
             Stmt::Class(name, parent, body) => {
                 let mut methods = vec![];
+                let mut method_dbgs = vec![];
+                let mut method_line = self.cur_line;
                 for item in body {
                     match item {
+                        Stmt::SourceLine(line) => {
+                            method_line = *line;
+                        }
                         Stmt::Fn(method, params, return_type, statements) => {
-                            let mut child = Compiler::new();
-                            child.emit_stmts(statements)?;
-                            child.code.push(Op::Const(Val::Null));
-                            child.code.push(Op::Return);
+                            let (child_code, child_dbg) =
+                                self.compile_child(statements, method_line)?;
+                            method_dbgs.push((methods.len(), child_dbg));
                             methods.push((
                                 method.clone(),
                                 params.clone(),
                                 return_type.clone(),
                                 false,
-                                child.code,
+                                child_code,
                             ));
                         }
                         Stmt::AsyncFn(method, params, return_type, statements) => {
-                            let mut child = Compiler::new();
-                            child.emit_stmts(statements)?;
-                            child.code.push(Op::Const(Val::Null));
-                            child.code.push(Op::Return);
+                            let (child_code, child_dbg) =
+                                self.compile_child(statements, method_line)?;
+                            method_dbgs.push((methods.len(), child_dbg));
                             methods.push((
                                 method.clone(),
                                 params.clone(),
                                 return_type.clone(),
                                 true,
-                                child.code,
+                                child_code,
                             ));
                         }
                         _ => return Err("class bodies currently contain methods only".into()),
                     }
                 }
+                let class_ip = self.code.len();
+                for (sub_idx, dbg) in method_dbgs {
+                    self.child_debugs.push((class_ip, sub_idx, dbg));
+                }
                 self.code
                     .push(Op::DefClass(name.clone(), parent.clone(), methods));
             }
             Stmt::Fn(name, params, return_type, body) => {
-                let mut child = Compiler::new();
-                child.emit_stmts(body)?;
-                child.code.push(Op::Const(Val::Null));
-                child.code.push(Op::Return);
+                let (child_code, child_dbg) = self.compile_child(body, self.cur_line)?;
+                let def_ip = self.code.len();
+                self.child_debugs.push((def_ip, 0, child_dbg));
                 self.code.push(Op::Def(
                     name.clone(),
                     params.clone(),
                     return_type.clone(),
                     false,
-                    child.code,
+                    child_code,
                 ));
             }
             Stmt::DecoratedFn(decorator, name, params, return_type, body) => {
-                let mut child = Compiler::new();
-                child.emit_stmts(body)?;
-                child.code.push(Op::Const(Val::Null));
-                child.code.push(Op::Return);
+                let (child_code, child_dbg) = self.compile_child(body, self.cur_line)?;
+                let def_ip = self.code.len();
+                self.child_debugs.push((def_ip, 0, child_dbg));
                 self.code.push(Op::Def(
                     name.clone(),
                     params.clone(),
                     return_type.clone(),
                     false,
-                    child.code,
+                    child_code,
                 ));
                 self.code.push(Op::FunctionRef(name.clone()));
                 self.code.push(Op::Call(decorator.clone(), 1));
@@ -548,17 +622,20 @@ impl Compiler {
                     .push(Op::Define(name.clone(), false, Some("Function".into())));
             }
             Stmt::AsyncFn(name, params, return_type, body) => {
-                let mut child = Compiler::new();
-                child.emit_stmts(body)?;
-                child.code.push(Op::Const(Val::Null));
-                child.code.push(Op::Return);
+                let (child_code, child_dbg) = self.compile_child(body, self.cur_line)?;
+                let def_ip = self.code.len();
+                self.child_debugs.push((def_ip, 0, child_dbg));
                 self.code.push(Op::Def(
                     name.clone(),
                     params.clone(),
                     return_type.clone(),
                     true,
-                    child.code,
+                    child_code,
                 ));
+            }
+            Stmt::SourceLine(line) => {
+                self.cur_line = *line;
+                self.push_line_mark(*line);
             }
             Stmt::Yield(value) => {
                 self.emit_expr(value)?;
@@ -593,5 +670,13 @@ impl Compiler {
     pub(crate) fn finish(mut self) -> Vec<Op> {
         self.code.push(Op::Halt);
         self.code
+    }
+    pub(crate) fn finish_with_debug(mut self) -> (Vec<Op>, CompiledDebug) {
+        self.code.push(Op::Halt);
+        let dbg = CompiledDebug {
+            lines: self.line_marks,
+            children: self.child_debugs,
+        };
+        (self.code, dbg)
     }
 }

@@ -1,17 +1,61 @@
 {
   "name": "veyra-language",
   "displayName": "Veyra Language",
-  "description": "Language support for Veyra",
+  "description": "LSP and DAP Language support for Veyra",
   "version": "12.0.0",
   "publisher": "veyra",
   "engines": {"vscode": "^1.80.0"},
   "categories": ["Programming Languages", "Linters", "Debuggers"],
-  "activationEvents": ["onLanguage:veyra"],
+  "activationEvents": ["onLanguage:veyra", "onDebugInitialConfigurations", "onDebugResolve:veyra"],
   "main": "./extension.js",
   "contributes": {
     "languages": [{"id":"veyra","aliases":["Veyra","veyra"],"extensions":[".vy"],"configuration":"./language-configuration.json"}],
     "grammars": [{"language":"veyra","scopeName":"source.veyra","path":"./syntaxes/veyra.tmLanguage.json"}],
     "snippets": [{"language":"veyra","path":"./snippets/veyra.json"}],
+    "breakpoints": [{"language": "veyra"}],
+    "debuggers": [
+      {
+        "type": "veyra",
+        "label": "Veyra Debug",
+        "languages": ["veyra"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Absolute path to a Veyra .vy entry file",
+                "default": "${file}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Automatically stop after launching",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "veyra",
+            "request": "launch",
+            "name": "Debug Current Veyra File",
+            "program": "${file}",
+            "stopOnEntry": false
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "Veyra",
+      "properties": {
+        "veyra.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to the native Veyra executable"
+        }
+      }
+    },
     "commands": [
       {"command":"veyra.check","title":"Veyra: Check Current File"},
       {"command":"veyra.run","title":"Veyra: Run Current File"},

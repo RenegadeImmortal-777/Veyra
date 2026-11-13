@@ -13,6 +13,7 @@ use std::{
 use crate::bytecode::{
     ClassDef, FunctionDef, ObjectData, Op, code_has_yield, collect_referenced_names,
 };
+use crate::dap::{DAP_TERMINATED_ERR, DebugFrameGuard, DebugSession};
 use crate::runtime::{
     GENERATOR_IDS, OBJECT_IDS, TASK_IDS, export_function_object, resolve_function_object, tasks,
 };
@@ -35,6 +36,8 @@ pub(crate) struct Vm {
     pub(crate) breakpoints: HashSet<usize>,
     pub(crate) trace: bool,
     pub(crate) finished: bool,
+    pub(crate) debug_scope: usize,
+    pub(crate) debugger: Option<Arc<DebugSession>>,
 }
 
 static GENERATORS: OnceLock<Mutex<HashMap<u64, Vm>>> = OnceLock::new();
@@ -95,6 +98,8 @@ impl Vm {
             breakpoints: HashSet::new(),
             trace: false,
             finished: false,
+            debug_scope: 0,
+            debugger: None,
         }
     }
     pub(crate) fn nested(
@@ -120,7 +125,15 @@ impl Vm {
             breakpoints: HashSet::new(),
             trace: false,
             finished: false,
+            debug_scope: 0,
+            debugger: None,
         }
+    }
+    fn child_debug_scope(&self, def_ip: usize, sub_idx: usize) -> usize {
+        self.debugger
+            .as_ref()
+            .and_then(|d| d.child_scope(self.debug_scope, def_ip, sub_idx))
+            .unwrap_or(0)
     }
     fn get_var(&self, name: &str) -> Option<Val> {
         if let Some(cell) = self.cells.get(name) {
@@ -277,6 +290,7 @@ impl Vm {
         );
         nested.var_types = var_types;
         nested.cells = cells;
+        nested.debug_scope = def.debug_scope;
         if is_async {
             let id = TASK_IDS.fetch_add(1, Ordering::Relaxed);
             let expected_return = return_type.clone();
@@ -306,6 +320,7 @@ impl Vm {
                     ));
                 }
             }
+            nested.debugger = self.debugger.clone();
             let id = GENERATOR_IDS.fetch_add(1, Ordering::Relaxed);
             generators()
                 .lock()
@@ -313,6 +328,26 @@ impl Vm {
                 .insert(id, nested);
             return Ok(Val::Generator(id));
         }
+        let _frame_guard = if let Some(ref dbg) = self.debugger {
+            dbg.update_caller_frame(
+                self.debug_scope,
+                self.ip.saturating_sub(1),
+                &self.vars,
+                &self.cells,
+            );
+            nested.debugger = Some(dbg.clone());
+            Some(DebugFrameGuard::push(
+                dbg.clone(),
+                if def.debug_name.is_empty() {
+                    "<fn>".into()
+                } else {
+                    def.debug_name.clone()
+                },
+                def.debug_scope,
+            ))
+        } else {
+            None
+        };
         let result = nested.execute()?;
         if let Some(expected) = return_type {
             if !self.value_matches(&result, &expected) {
@@ -374,10 +409,12 @@ impl Vm {
         self.execute().map(|_| ())
     }
     pub(crate) fn print_val(&self, args: &[Val]) -> Result<Val, String> {
-        println!(
-            "{}",
-            args.iter().map(Val::show).collect::<Vec<_>>().join(" ")
-        );
+        let rendered = args.iter().map(Val::show).collect::<Vec<_>>().join(" ");
+        if let Some(ref dbg) = self.debugger {
+            dbg.emit_output(&rendered);
+        } else {
+            println!("{rendered}");
+        }
         Ok(Val::Null)
     }
     pub(crate) fn len_val(&self, args: &[Val]) -> Result<Val, String> {
@@ -434,8 +471,14 @@ impl Vm {
         tensor_gc_unreachable(&live)
     }
     pub(crate) fn execute(&mut self) -> Result<Val, String> {
+        let _root_guard = match &self.debugger {
+            Some(dbg) if self.debug_scope == 0 && dbg.frame_depth() == 0 => {
+                Some(DebugFrameGuard::push(dbg.clone(), "<main>".into(), 0))
+            }
+            _ => None,
+        };
         loop {
-            if !self.trace && !self.breakpoints.contains(&self.ip) {
+            if !self.trace && !self.breakpoints.contains(&self.ip) && self.debugger.is_none() {
                 if let Some(loop_win) = self.code.get(self.ip..self.ip + 13) {
                     match loop_win {
                         [
@@ -646,22 +689,35 @@ impl Vm {
                     vars.join(", ")
                 );
             }
+            if let Some(ref dbg) = self.debugger {
+                dbg.before_op(
+                    self.debug_scope,
+                    self.ip,
+                    &self.vars,
+                    &self.cells,
+                    &self.funcs,
+                    &self.classes,
+                    &self.objects,
+                )?;
+            }
             self.ip += 1;
             match self.step_op(op) {
                 Ok(Some(v)) => return Ok(v),
                 Ok(None) => {}
                 Err(err) => {
-                    if let Some((target, name, depth)) = self.handlers.pop() {
-                        self.stack.truncate(depth);
-                        let msg = err
-                            .strip_prefix("uncaught throw: ")
-                            .unwrap_or(&err)
-                            .to_string();
-                        self.set_var(name, Val::Str(msg));
-                        self.ip = target;
-                    } else {
-                        return Err(err);
+                    if err != DAP_TERMINATED_ERR {
+                        if let Some((target, name, depth)) = self.handlers.pop() {
+                            self.stack.truncate(depth);
+                            let msg = err
+                                .strip_prefix("uncaught throw: ")
+                                .unwrap_or(&err)
+                                .to_string();
+                            self.set_var(name, Val::Str(msg));
+                            self.ip = target;
+                            continue;
+                        }
                     }
+                    return Err(err);
                 }
             }
         }
@@ -1230,8 +1286,9 @@ impl Vm {
                     }
                 }
                 let is_generator = code_has_yield(&code);
+                let debug_scope = self.child_debug_scope(self.ip - 1, 0);
                 Arc::make_mut(&mut self.funcs).insert(
-                    name,
+                    name.clone(),
                     FunctionDef {
                         params: Arc::new(params),
                         return_type,
@@ -1241,6 +1298,8 @@ impl Vm {
                         captures: Arc::new(HashMap::new()),
                         capture_types: self.var_types.clone(),
                         upvalues: Arc::new(captured_upvalues),
+                        debug_name: name,
+                        debug_scope,
                     },
                 );
             }
@@ -1267,8 +1326,12 @@ impl Vm {
                 }
                 let upvalues = Arc::new(captured_upvalues);
                 let mut compiled = HashMap::new();
-                for (method, params, return_type, is_async, code) in methods {
+                for (sub_idx, (method, params, return_type, is_async, code)) in
+                    methods.into_iter().enumerate()
+                {
                     let is_generator = code_has_yield(&code);
+                    let debug_scope = self.child_debug_scope(self.ip - 1, sub_idx);
+                    let debug_name = format!("{name}.{method}");
                     compiled.insert(
                         method,
                         FunctionDef {
@@ -1280,6 +1343,8 @@ impl Vm {
                             captures: Arc::new(HashMap::new()),
                             capture_types: self.var_types.clone(),
                             upvalues: upvalues.clone(),
+                            debug_name,
+                            debug_scope,
                         },
                     );
                 }

@@ -11,24 +11,39 @@ use serde_json::Value as JsonValue;
 
 use crate::ast::{Expr, Stmt};
 use crate::bytecode::{Op, decode_bytecode, encode_bytecode};
-use crate::compiler::Compiler;
+use crate::compiler::{CompiledDebug, Compiler};
+use crate::dap::DebugMap;
 use crate::ir::optimize_bytecode;
 use crate::lexer::lex_with_lines;
 use crate::parser::Parser;
 use crate::project::project_root;
 use crate::vm::Vm;
 
-pub fn load_source(path: &str) -> Result<String, String> {
+pub(crate) fn load_source_with_lines(
+    path: &str,
+) -> Result<(String, Vec<(PathBuf, usize)>), String> {
     fn is_valid_ident(s: &str) -> bool {
         !s.is_empty()
             && s.chars().enumerate().all(|(i, c)| {
                 c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
             })
     }
+    fn push_line(
+        out: &mut String,
+        origins: &mut Vec<(PathBuf, usize)>,
+        text: &str,
+        file: &Path,
+        line_no: usize,
+    ) {
+        out.push_str(text);
+        out.push('\n');
+        origins.push((file.to_path_buf(), line_no));
+    }
     fn load(
         path: &Path,
         seen: &mut HashSet<PathBuf>,
         seen_pkgs: &mut HashSet<String>,
+        origins: &mut Vec<(PathBuf, usize)>,
     ) -> Result<String, String> {
         let full = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if !seen.insert(full.clone()) {
@@ -37,7 +52,8 @@ pub fn load_source(path: &str) -> Result<String, String> {
         let src = fs::read_to_string(&full).map_err(|e| e.to_string())?;
         let base = full.parent().unwrap_or(Path::new("."));
         let mut out = String::new();
-        for line in src.lines() {
+        for (idx, line) in src.lines().enumerate() {
+            let line_no = idx + 1;
             let mut rest = line.trim();
             let mut had_use = false;
             while rest.starts_with("use ") {
@@ -71,31 +87,46 @@ pub fn load_source(path: &str) -> Result<String, String> {
                 } else {
                     base.join(rel)
                 };
-                out.push_str(&load(&target, seen, seen_pkgs)?);
-                out.push('\n');
+                out.push_str(&load(&target, seen, seen_pkgs, origins)?);
+                push_line(&mut out, origins, "", &full, line_no);
                 if is_pkg
                     && is_valid_ident(rel)
                     && src.contains(&format!("{rel}."))
                     && !src.contains(&format!("let {rel}"))
                     && seen_pkgs.insert(rel.to_string())
                 {
-                    out.push_str(&format!("let {rel} = import_package(\"{rel}\");\n"));
+                    push_line(
+                        &mut out,
+                        origins,
+                        &format!("let {rel} = import_package(\"{rel}\");"),
+                        &full,
+                        line_no,
+                    );
                 }
                 had_use = true;
                 let after = rest[b + 1..].trim_start();
                 rest = after.strip_prefix(';').unwrap_or(after).trim_start();
             }
             if !had_use {
-                out.push_str(line);
-                out.push('\n');
+                push_line(&mut out, origins, line, &full, line_no);
             } else if !rest.is_empty() {
-                out.push_str(rest);
-                out.push('\n');
+                push_line(&mut out, origins, rest, &full, line_no);
             }
         }
         Ok(out)
     }
-    load(Path::new(path), &mut HashSet::new(), &mut HashSet::new())
+    let mut origins = Vec::new();
+    let combined = load(
+        Path::new(path),
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        &mut origins,
+    )?;
+    Ok((combined, origins))
+}
+
+pub fn load_source(path: &str) -> Result<String, String> {
+    load_source_with_lines(path).map(|(src, _)| src)
 }
 
 pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
@@ -281,7 +312,7 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                     }
                 }
                 Stmt::Return(Some(e)) => check_expr(e, &scopes, errors),
-                Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
+                Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::SourceLine(_) => {}
             }
         }
     }
@@ -301,6 +332,30 @@ pub(crate) fn compile_source_unoptimized(src: &str) -> Result<Vec<Op>, String> {
     let t = lex_with_lines(src)?;
     let ast = Parser::new_with_lines(t).program()?;
     semantic_check_ast(&ast)?;
+    let mut c = Compiler::new();
+    c.emit_stmts(&ast)?;
+    Ok(c.finish())
+}
+
+pub(crate) fn compile_source_with_debug(src: &str) -> Result<(Vec<Op>, CompiledDebug), String> {
+    let t = lex_with_lines(src)?;
+    let ast = Parser::new_with_debug_lines(t).program()?;
+    semantic_check_ast(&ast)?;
+    let mut c = Compiler::new();
+    c.emit_stmts(&ast)?;
+    Ok(c.finish_with_debug())
+}
+
+pub(crate) fn compile_file_with_debug(path: &str) -> Result<(Vec<Op>, DebugMap), String> {
+    let (src, origins) = load_source_with_lines(path)?;
+    let (code, dbg) = compile_source_with_debug(&src)?;
+    Ok((code, DebugMap::from_compiled(dbg, origins)))
+}
+
+pub(crate) fn compile_eval_expr(expr: &str) -> Result<Vec<Op>, String> {
+    let src = format!("return {expr};");
+    let t = lex_with_lines(&src)?;
+    let ast = Parser::new_with_lines(t).program()?;
     let mut c = Compiler::new();
     c.emit_stmts(&ast)?;
     Ok(c.finish())

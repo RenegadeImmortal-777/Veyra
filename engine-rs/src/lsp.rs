@@ -247,6 +247,8 @@ pub(crate) fn lsp_definition(text: &str, uri: &str, word: &str) -> JsonValue {
     }
     let patterns = [
         format!("fn {word}"),
+        format!("async fn {word}"),
+        format!("def {word}"),
         format!("class {word}"),
         format!("let {word}"),
         format!("const {word}"),
@@ -266,6 +268,34 @@ pub(crate) fn lsp_definition(text: &str, uri: &str, word: &str) -> JsonValue {
         }
     }
     JsonValue::Null
+}
+
+fn find_symbol_range(lines: &[&str], name: &str, cursor: &mut usize) -> JsonValue {
+    let name_chars = name.chars().count();
+    for (offset, line) in lines[*cursor..].iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&format!("fn {name}"))
+            || trimmed.starts_with(&format!("async fn {name}"))
+            || trimmed.starts_with(&format!("def {name}"))
+            || trimmed.starts_with(&format!("class {name}"))
+            || trimmed.starts_with(&format!("let {name}"))
+            || trimmed.starts_with(&format!("const {name}"))
+        {
+            if let Some(byte_col) = line.find(name) {
+                let line_idx = *cursor + offset;
+                let char_col = line[..byte_col].chars().count();
+                *cursor = line_idx + 1;
+                return serde_json::json!({
+                    "start": {"line": line_idx, "character": char_col},
+                    "end": {"line": line_idx, "character": char_col + name_chars}
+                });
+            }
+        }
+    }
+    serde_json::json!({
+        "start": {"line": 0, "character": 0},
+        "end": {"line": 0, "character": name_chars.max(1)}
+    })
 }
 
 pub(crate) fn lsp_references(text: &str, uri: &str, word: &str) -> JsonValue {
@@ -334,7 +364,7 @@ pub(crate) fn lsp_server() -> Result<(), String> {
     let (initialize_id, _) = connection.initialize_start().map_err(|e| e.to_string())?;
     let initialize_result = serde_json::json!({
         "capabilities": {
-            "textDocumentSync": 2,
+            "textDocumentSync": 1,
             "completionProvider": {"resolveProvider": false, "triggerCharacters": ["."]},
             "hoverProvider": true,
             "definitionProvider": true,
@@ -475,31 +505,66 @@ pub(crate) fn lsp_server() -> Result<(), String> {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
+                        let src_lines: Vec<&str> = text.lines().collect();
+                        let mut cursor = 0usize;
                         let mut symbols = vec![];
                         if let Ok(tokens) = lex(&filtered) {
                             if let Ok(ast) = Parser::new(tokens).program() {
                                 for stmt in ast {
-                                    let (name, kind) = match stmt {
-                                        Stmt::Fn(name, _, _, _) | Stmt::AsyncFn(name, _, _, _) => {
-                                            (name, 12)
+                                    match stmt {
+                                        Stmt::Fn(name, _, _, _)
+                                        | Stmt::AsyncFn(name, _, _, _)
+                                        | Stmt::DecoratedFn(_, name, _, _, _) => {
+                                            let range =
+                                                find_symbol_range(&src_lines, &name, &mut cursor);
+                                            symbols.push(serde_json::json!({
+                                                "name": name,
+                                                "kind": 12,
+                                                "range": range,
+                                                "selectionRange": range
+                                            }));
                                         }
-                                        Stmt::DecoratedFn(_, name, _, _, _) => (name, 12),
-                                        Stmt::Class(name, _, _) => (name, 5),
-                                        Stmt::Let(name, _, _, _) => (name, 13),
-                                        _ => continue,
-                                    };
-                                    symbols.push(serde_json::json!({
-                                        "name": name,
-                                        "kind": kind,
-                                        "range": {
-                                            "start":{"line":0,"character":0},
-                                            "end":{"line":0,"character":1}
-                                        },
-                                        "selectionRange": {
-                                            "start":{"line":0,"character":0},
-                                            "end":{"line":0,"character":1}
+                                        Stmt::Let(name, _, _, _) => {
+                                            let range =
+                                                find_symbol_range(&src_lines, &name, &mut cursor);
+                                            symbols.push(serde_json::json!({
+                                                "name": name,
+                                                "kind": 13,
+                                                "range": range,
+                                                "selectionRange": range
+                                            }));
                                         }
-                                    }));
+                                        Stmt::Class(name, _, body) => {
+                                            let range =
+                                                find_symbol_range(&src_lines, &name, &mut cursor);
+                                            let mut children = vec![];
+                                            for item in body {
+                                                if let Stmt::Fn(m, _, _, _)
+                                                | Stmt::AsyncFn(m, _, _, _) = item
+                                                {
+                                                    let m_range = find_symbol_range(
+                                                        &src_lines,
+                                                        &m,
+                                                        &mut cursor,
+                                                    );
+                                                    children.push(serde_json::json!({
+                                                        "name": m,
+                                                        "kind": 6,
+                                                        "range": m_range,
+                                                        "selectionRange": m_range
+                                                    }));
+                                                }
+                                            }
+                                            symbols.push(serde_json::json!({
+                                                "name": name,
+                                                "kind": 5,
+                                                "range": range,
+                                                "selectionRange": range,
+                                                "children": children
+                                            }));
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
