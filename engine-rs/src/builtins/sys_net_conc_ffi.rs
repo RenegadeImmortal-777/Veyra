@@ -398,65 +398,12 @@ impl Vm {
                 if a.len() != 2 {
                     return Err("spawn expects callable,args".into());
                 }
-                let (name, def) = self.callable_def(&a[0])?;
+                let (_, def) = self.callable_def(&a[0])?;
                 let args = match &a[1] {
                     Val::List(v) => v.clone(),
                     _ => return Err("spawn args must be List".into()),
                 };
-                if def.params.len() != args.len() {
-                    return Err(format!(
-                        "{name} expects {} arguments, got {}",
-                        def.params.len(),
-                        args.len()
-                    ));
-                }
-                for ((param, ty), value) in def.params.iter().zip(args.iter()) {
-                    if let Some(expected) = ty {
-                        if !self.value_matches(value, expected) {
-                            return Err(format!(
-                                "argument '{param}' expected {expected}, got {}",
-                                value.show()
-                            ));
-                        }
-                    }
-                }
-                let funcs = self.funcs.clone();
-                let classes = self.classes.clone();
-                let objects = self.objects.clone();
-                let id = TASK_IDS.fetch_add(1, Ordering::Relaxed);
-                let handle = thread::spawn(move || {
-                    let mut vars = (*def.captures).clone();
-                    let mut cells = def.upvalues.clone();
-                    let mut var_types = def.capture_types.clone();
-                    let return_type = def.return_type.clone();
-                    for ((param, ty), value) in def.params.iter().zip(args) {
-                        if let Some(expected) = ty {
-                            Arc::make_mut(&mut var_types).insert(param.clone(), expected.clone());
-                        }
-                        if cells.contains_key(param) {
-                            Arc::make_mut(&mut cells).remove(param);
-                        }
-                        vars.insert(param.clone(), value);
-                    }
-                    let mut nested = Vm::nested(def.code, vars, funcs, classes, objects);
-                    nested.var_types = var_types;
-                    nested.cells = cells;
-                    let result = nested.execute()?;
-                    if let Some(expected) = return_type {
-                        if !nested.value_matches(&result, &expected) {
-                            return Err(format!(
-                                "task return value expected {expected}, got {}",
-                                result.show()
-                            ));
-                        }
-                    }
-                    Ok(result)
-                });
-                tasks()
-                    .lock()
-                    .map_err(|_| "task registry poisoned")?
-                    .insert(id, handle);
-                Val::Num(id as f64)
+                self.spawn_task_with_kind(def, args, "task")?
             }
             "task_done" => {
                 if a.len() != 1 {

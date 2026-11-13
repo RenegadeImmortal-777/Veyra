@@ -26,6 +26,7 @@ pub(crate) const DAP_TERMINATED_ERR: &str = "__dap_terminated__";
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DebugMap {
     scopes: Vec<Vec<(usize, usize)>>,
+    scope_local_names: Vec<Vec<String>>,
     edges: HashMap<(usize, usize, usize), usize>,
     origins: Vec<(PathBuf, usize)>,
     valid_lines: HashMap<String, Vec<usize>>,
@@ -35,6 +36,7 @@ impl DebugMap {
     pub(crate) fn from_compiled(root: CompiledDebug, origins: Vec<(PathBuf, usize)>) -> Self {
         let mut map = Self {
             scopes: Vec::new(),
+            scope_local_names: Vec::new(),
             edges: HashMap::new(),
             origins,
             valid_lines: HashMap::new(),
@@ -66,11 +68,42 @@ impl DebugMap {
             }
         }
         self.scopes.push(compiled.lines);
+        self.scope_local_names.push(compiled.local_names);
         for (def_ip, sub_idx, child) in compiled.children {
             let child_id = self.insert_scope(child, valid_sets);
             self.edges.insert((scope_id, def_ip, sub_idx), child_id);
         }
         scope_id
+    }
+
+    pub(crate) fn local_names(&self, scope_id: usize) -> &[String] {
+        self.scope_local_names
+            .get(scope_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn merge_frame_vars(
+        &self,
+        scope_id: usize,
+        vars: &HashMap<String, Val>,
+        cells: &HashMap<String, Arc<Mutex<Val>>>,
+        locals: &[Val],
+        local_defined: &[bool],
+    ) -> HashMap<String, Val> {
+        let mut merged = merge_vars(vars, cells);
+        let names = self.local_names(scope_id);
+        for (slot, val) in locals.iter().enumerate() {
+            if !local_defined.is_empty() && !local_defined.get(slot).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(name) = names.get(slot) {
+                if !name.is_empty() {
+                    merged.insert(name.clone(), val.clone());
+                }
+            }
+        }
+        merged
     }
 
     fn origin_for_combined(&self, combined_line: usize) -> Option<(PathBuf, usize)> {
@@ -321,8 +354,12 @@ impl DebugSession {
         ip: usize,
         vars: &HashMap<String, Val>,
         cells: &HashMap<String, Arc<Mutex<Val>>>,
+        locals: &[Val],
+        local_defined: &[bool],
     ) {
-        let merged = merge_vars(vars, cells);
+        let merged = self
+            .map
+            .merge_frame_vars(scope_id, vars, cells, locals, local_defined);
         let loc = self.map.resolve(scope_id, ip);
         if let Ok(mut g) = self.state.lock() {
             if let Some(frame) = g.frames.last_mut() {
@@ -400,6 +437,8 @@ impl DebugSession {
         ip: usize,
         vars: &HashMap<String, Val>,
         cells: &HashMap<String, Arc<Mutex<Val>>>,
+        locals: &[Val],
+        local_defined: &[bool],
         funcs: &Arc<HashMap<String, FunctionDef>>,
         classes: &Arc<HashMap<String, ClassDef>>,
         objects: &Arc<Mutex<HashMap<u64, ObjectData>>>,
@@ -459,7 +498,9 @@ impl DebugSession {
             return Ok(());
         };
 
-        let merged = merge_vars(vars, cells);
+        let merged = self
+            .map
+            .merge_frame_vars(scope_id, vars, cells, locals, local_defined);
         if let Some(top) = g.frames.last_mut() {
             top.vars = merged;
         }

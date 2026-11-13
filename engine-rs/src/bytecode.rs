@@ -17,6 +17,9 @@ pub(crate) enum Op {
     Load(String),
     Define(String, bool, Option<String>),
     Store(String),
+    LoadLocal(usize),
+    DefineLocal(usize, bool, Option<String>),
+    StoreLocal(usize),
     Pop,
     Add,
     Sub,
@@ -77,8 +80,22 @@ pub(crate) struct FunctionDef {
     pub(crate) captures: Arc<HashMap<String, Val>>,
     pub(crate) capture_types: Arc<HashMap<String, String>>,
     pub(crate) upvalues: Arc<HashMap<String, Arc<Mutex<Val>>>>,
+    pub(crate) local_count: usize,
+    pub(crate) param_named: Arc<Vec<bool>>,
     pub(crate) debug_name: String,
     pub(crate) debug_scope: usize,
+}
+
+pub(crate) fn compute_local_count(code: &[Op], param_len: usize) -> usize {
+    let mut max_plus_one = param_len;
+    for op in code {
+        if let Op::LoadLocal(s) | Op::DefineLocal(s, _, _) | Op::StoreLocal(s) = op {
+            if *s + 1 > max_plus_one {
+                max_plus_one = *s + 1;
+            }
+        }
+    }
+    max_plus_one
 }
 
 pub(crate) fn code_has_yield(code: &[Op]) -> bool {
@@ -201,6 +218,11 @@ fn encode_ops(code: &[Op]) -> JsonValue {
                 Op::Load(n) => json!({"op": "Load", "name": n}),
                 Op::Define(n, c, ty) => json!({"op": "Define", "name": n, "const": c, "type": ty}),
                 Op::Store(n) => json!({"op": "Store", "name": n}),
+                Op::LoadLocal(s) => json!({"op": "LoadLocal", "slot": s}),
+                Op::DefineLocal(s, c, ty) => {
+                    json!({"op": "DefineLocal", "slot": s, "const": c, "type": ty})
+                }
+                Op::StoreLocal(s) => json!({"op": "StoreLocal", "slot": s}),
                 Op::Pop => json!({"op": "Pop"}),
                 Op::Add => json!({"op": "Add"}),
                 Op::Sub => json!({"op": "Sub"}),
@@ -332,6 +354,27 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
                     .and_then(JsonValue::as_str)
                     .ok_or("vybc: Store missing name")?
                     .to_string(),
+            ),
+            "LoadLocal" => Op::LoadLocal(
+                item.get("slot")
+                    .and_then(json_as_usize)
+                    .ok_or("vybc: LoadLocal missing slot")?,
+            ),
+            "DefineLocal" => Op::DefineLocal(
+                item.get("slot")
+                    .and_then(json_as_usize)
+                    .ok_or("vybc: DefineLocal missing slot")?,
+                item.get("const")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                item.get("type")
+                    .and_then(JsonValue::as_str)
+                    .map(ToString::to_string),
+            ),
+            "StoreLocal" => Op::StoreLocal(
+                item.get("slot")
+                    .and_then(json_as_usize)
+                    .ok_or("vybc: StoreLocal missing slot")?,
             ),
             "Pop" => Op::Pop,
             "Add" => Op::Add,

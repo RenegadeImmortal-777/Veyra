@@ -1598,4 +1598,81 @@ mod tests {
         srv_handle.join().unwrap().unwrap();
         let _ = fs::remove_file(prog);
     }
+
+    #[test]
+    fn phase3b_flat_frames_indexed_locals_and_vybc_roundtrip() {
+        let src = r#"
+fn recurse(n: Int) -> Int {
+    if n <= 0 {
+        return 0;
+    }
+    return 1 + recurse(n - 1);
+}
+assert(recurse(5000) == 5000);
+
+fn inner_fail(x: Int) -> Int {
+    let local_y = x + 1;
+    if local_y > 5 {
+        throw "unwind-ok";
+    }
+    return local_y;
+}
+fn outer_call(a: Int) -> Int {
+    let base = 10;
+    let r = inner_fail(a);
+    return base + r;
+}
+let caught = "";
+try {
+    outer_call(10);
+} catch e {
+    caught = e;
+}
+assert(caught == "unwind-ok");
+
+fn apply_fn(f, v: Int) -> Int {
+    return f(v);
+}
+fn make_acc(start: Int) {
+    let local_only = 10;
+    let shared = start;
+    fn step(delta: Int) -> Int {
+        shared = shared + delta;
+        return shared;
+    }
+    let a = apply_fn(step, 5);
+    let b = step(3);
+    return local_only + a + b;
+}
+assert(make_acc(2) == 10 + 7 + 10);
+
+fn sum_loop(n: Int) -> Int {
+    let total = 0;
+    let i = 0;
+    while i < n {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+assert(sum_loop(100) == 4950);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+
+        let vybc = compile_to_vybc(src).unwrap();
+        let decoded = crate::bytecode::decode_bytecode(&vybc).unwrap();
+        let mut saw_local_op = false;
+        for op in &decoded {
+            if let Op::Def(_, _, _, _, body) = op {
+                if body
+                    .iter()
+                    .any(|inner| matches!(inner, Op::LoadLocal(_) | Op::DefineLocal(_, _, _)))
+                {
+                    saw_local_op = true;
+                }
+            }
+        }
+        assert!(saw_local_op);
+        assert_eq!(run_vybc(&vybc), Ok(()));
+    }
 }

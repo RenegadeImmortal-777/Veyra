@@ -12,6 +12,7 @@ use std::{
 
 use crate::bytecode::{
     ClassDef, FunctionDef, ObjectData, Op, code_has_yield, collect_referenced_names,
+    compute_local_count,
 };
 use crate::dap::{DAP_TERMINATED_ERR, DebugFrameGuard, DebugSession};
 use crate::runtime::{
@@ -19,6 +20,38 @@ use crate::runtime::{
 };
 use crate::tensor::{collect_val_tensor_ids, tensor_gc_unreachable};
 use crate::value::Val;
+
+pub(crate) struct CallFrame {
+    code: Arc<Vec<Op>>,
+    ip: usize,
+    vars: HashMap<String, Val>,
+    cells: Arc<HashMap<String, Arc<Mutex<Val>>>>,
+    var_types: Arc<HashMap<String, String>>,
+    consts: HashSet<String>,
+    locals: Vec<Val>,
+    local_defined: Vec<bool>,
+    local_consts: Vec<bool>,
+    local_types: Vec<Option<String>>,
+    handlers: Vec<(usize, String, usize)>,
+    return_type: Option<String>,
+    debug_scope: usize,
+    dap_pushed: bool,
+}
+
+struct PreparedCall {
+    code: Arc<Vec<Op>>,
+    vars: HashMap<String, Val>,
+    cells: Arc<HashMap<String, Arc<Mutex<Val>>>>,
+    var_types: Arc<HashMap<String, String>>,
+    locals: Vec<Val>,
+    local_defined: Vec<bool>,
+    local_consts: Vec<bool>,
+    local_types: Vec<Option<String>>,
+    return_type: Option<String>,
+    is_generator: bool,
+    debug_name: String,
+    debug_scope: usize,
+}
 
 pub(crate) struct Vm {
     pub(crate) code: Arc<Vec<Op>>,
@@ -28,6 +61,12 @@ pub(crate) struct Vm {
     pub(crate) cells: Arc<HashMap<String, Arc<Mutex<Val>>>>,
     pub(crate) var_types: Arc<HashMap<String, String>>,
     pub(crate) consts: HashSet<String>,
+    pub(crate) locals: Vec<Val>,
+    pub(crate) local_defined: Vec<bool>,
+    pub(crate) local_consts: Vec<bool>,
+    pub(crate) local_types: Vec<Option<String>>,
+    pub(crate) return_type: Option<String>,
+    pub(crate) frames: Vec<CallFrame>,
     pub(crate) funcs: Arc<HashMap<String, FunctionDef>>,
     pub(crate) classes: Arc<HashMap<String, ClassDef>>,
     pub(crate) method_cache: HashMap<(String, String), FunctionDef>,
@@ -82,6 +121,7 @@ pub(crate) fn collect_generator(id: u64) -> Result<Vec<Val>, String> {
 
 impl Vm {
     pub(crate) fn new(code: Vec<Op>) -> Self {
+        let local_count = compute_local_count(&code, 0);
         Self {
             code: Arc::new(code),
             ip: 0,
@@ -90,6 +130,12 @@ impl Vm {
             cells: Arc::new(HashMap::new()),
             var_types: Arc::new(HashMap::new()),
             consts: HashSet::new(),
+            locals: vec![Val::Null; local_count],
+            local_defined: vec![false; local_count],
+            local_consts: vec![false; local_count],
+            local_types: vec![None; local_count],
+            return_type: None,
+            frames: Vec::new(),
             funcs: Arc::new(HashMap::new()),
             classes: Arc::new(HashMap::new()),
             method_cache: HashMap::new(),
@@ -102,30 +148,30 @@ impl Vm {
             debugger: None,
         }
     }
-    pub(crate) fn nested(
-        code: Arc<Vec<Op>>,
-        vars: HashMap<String, Val>,
-        funcs: Arc<HashMap<String, FunctionDef>>,
-        classes: Arc<HashMap<String, ClassDef>>,
-        objects: Arc<Mutex<HashMap<u64, ObjectData>>>,
-    ) -> Self {
+    fn nested_from_prepared(&self, prepared: PreparedCall) -> Self {
         Self {
-            code,
+            code: prepared.code,
             ip: 0,
             stack: vec![],
-            vars,
-            cells: Arc::new(HashMap::new()),
-            var_types: Arc::new(HashMap::new()),
+            vars: prepared.vars,
+            cells: prepared.cells,
+            var_types: prepared.var_types,
             consts: HashSet::new(),
-            funcs,
-            classes,
+            locals: prepared.locals,
+            local_defined: prepared.local_defined,
+            local_consts: prepared.local_consts,
+            local_types: prepared.local_types,
+            return_type: None,
+            frames: Vec::new(),
+            funcs: self.funcs.clone(),
+            classes: self.classes.clone(),
             method_cache: HashMap::new(),
-            objects,
+            objects: self.objects.clone(),
             handlers: vec![],
             breakpoints: HashSet::new(),
             trace: false,
             finished: false,
-            debug_scope: 0,
+            debug_scope: prepared.debug_scope,
             debugger: None,
         }
     }
@@ -219,7 +265,7 @@ impl Vm {
         self.method_cache.insert(key, found.clone());
         Some(found)
     }
-    pub(crate) fn call_def(&self, def: FunctionDef, mut args: Vec<Val>) -> Result<Val, String> {
+    fn prepare_call(&self, def: FunctionDef, mut args: Vec<Val>) -> Result<PreparedCall, String> {
         let has_varargs = def.params.last().and_then(|(_, ty)| ty.as_deref()) == Some("*");
         if has_varargs {
             let fixed = def.params.len().saturating_sub(1);
@@ -251,67 +297,172 @@ impl Vm {
                 args.len()
             ));
         }
-        let is_generator = def.is_generator;
-        let is_async = def.is_async;
-        if is_async && is_generator {
+        if def.is_async && def.is_generator {
             return Err("async generator functions are not yet supported".into());
         }
+        let local_count = def.local_count.max(def.params.len());
         let mut vars = if def.captures.is_empty() {
-            HashMap::with_capacity(def.params.len())
+            HashMap::new()
         } else {
             (*def.captures).clone()
         };
-        let mut cells = def.upvalues.clone();
-        let mut var_types = def.capture_types.clone();
-        let return_type = def.return_type.clone();
-        for ((param, ty), value) in def.params.iter().zip(args) {
+        let mut cells = def.upvalues;
+        let mut var_types = def.capture_types;
+        let mut local_types = vec![None; local_count];
+        for (slot, ((param, ty), value)) in def.params.iter().zip(&args).enumerate() {
+            let named = def.param_named.get(slot).copied().unwrap_or(true);
             if let Some(expected) = ty {
                 if expected != "*" && expected != "?default" {
-                    if !self.value_matches(&value, expected) {
+                    if !self.value_matches(value, expected) {
                         return Err(format!(
                             "argument '{param}' expected {expected}, got {}",
                             value.show()
                         ));
                     }
-                    Arc::make_mut(&mut var_types).insert(param.clone(), expected.clone());
-                }
-            }
-            if cells.contains_key(param) {
-                Arc::make_mut(&mut cells).remove(param);
-            }
-            vars.insert(param.clone(), value);
-        }
-        let mut nested = Vm::nested(
-            def.code,
-            vars,
-            self.funcs.clone(),
-            self.classes.clone(),
-            self.objects.clone(),
-        );
-        nested.var_types = var_types;
-        nested.cells = cells;
-        nested.debug_scope = def.debug_scope;
-        if is_async {
-            let id = TASK_IDS.fetch_add(1, Ordering::Relaxed);
-            let expected_return = return_type.clone();
-            let handle = thread::spawn(move || {
-                let result = nested.execute()?;
-                if let Some(expected) = expected_return {
-                    if !nested.value_matches(&result, &expected) {
-                        return Err(format!(
-                            "async return value expected {expected}, got {}",
-                            result.show()
-                        ));
+                    local_types[slot] = Some(expected.clone());
+                    if named {
+                        Arc::make_mut(&mut var_types).insert(param.clone(), expected.clone());
                     }
                 }
-                Ok(result)
-            });
-            tasks()
-                .lock()
-                .map_err(|_| "task registry poisoned")?
-                .insert(id, handle);
-            return Ok(Val::Num(id as f64));
+            }
+            if !cells.is_empty() && cells.contains_key(param) {
+                Arc::make_mut(&mut cells).remove(param);
+            }
+            if named {
+                vars.insert(param.clone(), value.clone());
+            }
         }
+        let param_end = args.len().min(local_count);
+        let mut locals = args;
+        locals.resize(local_count, Val::Null);
+        let mut local_defined = vec![false; local_count];
+        local_defined[..param_end].fill(true);
+        let local_consts = vec![false; local_count];
+        Ok(PreparedCall {
+            code: def.code,
+            vars,
+            cells,
+            var_types,
+            locals,
+            local_defined,
+            local_consts,
+            local_types,
+            return_type: def.return_type,
+            is_generator: def.is_generator,
+            debug_name: def.debug_name,
+            debug_scope: def.debug_scope,
+        })
+    }
+    fn push_prepared_frame(&mut self, prepared: PreparedCall) {
+        let dap_pushed = if let Some(ref dbg) = self.debugger {
+            dbg.update_caller_frame(
+                self.debug_scope,
+                self.ip.saturating_sub(1),
+                &self.vars,
+                &self.cells,
+                &self.locals,
+                &self.local_defined,
+            );
+            let frame_name = if prepared.debug_name.is_empty() {
+                "<fn>".into()
+            } else {
+                prepared.debug_name
+            };
+            dbg.push_frame(frame_name, prepared.debug_scope);
+            true
+        } else {
+            false
+        };
+        let frame = CallFrame {
+            code: std::mem::replace(&mut self.code, prepared.code),
+            ip: std::mem::replace(&mut self.ip, 0),
+            vars: std::mem::replace(&mut self.vars, prepared.vars),
+            cells: std::mem::replace(&mut self.cells, prepared.cells),
+            var_types: std::mem::replace(&mut self.var_types, prepared.var_types),
+            consts: std::mem::take(&mut self.consts),
+            locals: std::mem::replace(&mut self.locals, prepared.locals),
+            local_defined: std::mem::replace(&mut self.local_defined, prepared.local_defined),
+            local_consts: std::mem::replace(&mut self.local_consts, prepared.local_consts),
+            local_types: std::mem::replace(&mut self.local_types, prepared.local_types),
+            handlers: std::mem::take(&mut self.handlers),
+            return_type: std::mem::replace(&mut self.return_type, prepared.return_type),
+            debug_scope: std::mem::replace(&mut self.debug_scope, prepared.debug_scope),
+            dap_pushed,
+        };
+        self.frames.push(frame);
+    }
+    fn restore_frame(&mut self, caller: CallFrame) {
+        if caller.dap_pushed {
+            if let Some(ref dbg) = self.debugger {
+                dbg.pop_frame();
+            }
+        }
+        self.code = caller.code;
+        self.ip = caller.ip;
+        self.vars = caller.vars;
+        self.cells = caller.cells;
+        self.var_types = caller.var_types;
+        self.consts = caller.consts;
+        self.locals = caller.locals;
+        self.local_defined = caller.local_defined;
+        self.local_consts = caller.local_consts;
+        self.local_types = caller.local_types;
+        self.handlers = caller.handlers;
+        self.return_type = caller.return_type;
+        self.debug_scope = caller.debug_scope;
+    }
+    fn invoke_in_execute(&mut self, def: FunctionDef, args: Vec<Val>) -> Result<(), String> {
+        if def.is_async || def.is_generator {
+            let v = self.call_def(def, args)?;
+            self.stack.push(v);
+            return Ok(());
+        }
+        let prepared = self.prepare_call(def, args)?;
+        self.push_prepared_frame(prepared);
+        Ok(())
+    }
+    pub(crate) fn spawn_task_with_kind(
+        &self,
+        def: FunctionDef,
+        args: Vec<Val>,
+        kind: &str,
+    ) -> Result<Val, String> {
+        let prepared = self.prepare_call(def, args)?;
+        let expected_return = prepared.return_type.clone();
+        let mut nested = self.nested_from_prepared(prepared);
+        let id = TASK_IDS.fetch_add(1, Ordering::Relaxed);
+        let label = kind.to_string();
+        let handle = thread::spawn(move || {
+            let result = nested.execute()?;
+            if let Some(expected) = expected_return {
+                if !nested.value_matches(&result, &expected) {
+                    return Err(format!(
+                        "{label} return value expected {expected}, got {}",
+                        result.show()
+                    ));
+                }
+            }
+            Ok(result)
+        });
+        tasks()
+            .lock()
+            .map_err(|_| "task registry poisoned")?
+            .insert(id, handle);
+        Ok(Val::Num(id as f64))
+    }
+    pub(crate) fn call_def(&self, def: FunctionDef, args: Vec<Val>) -> Result<Val, String> {
+        if def.is_async {
+            if def.is_generator {
+                return Err("async generator functions are not yet supported".into());
+            }
+            return self.spawn_task_with_kind(def, args, "async");
+        }
+        let prepared = self.prepare_call(def, args)?;
+        let is_generator = prepared.is_generator;
+        let return_type = prepared.return_type.clone();
+        let debug_name = prepared.debug_name.clone();
+        let debug_scope = prepared.debug_scope;
+        let mut nested = self.nested_from_prepared(prepared);
         if is_generator {
             if let Some(expected) = return_type {
                 if expected != "Generator" && expected != "Any" {
@@ -334,16 +485,18 @@ impl Vm {
                 self.ip.saturating_sub(1),
                 &self.vars,
                 &self.cells,
+                &self.locals,
+                &self.local_defined,
             );
             nested.debugger = Some(dbg.clone());
             Some(DebugFrameGuard::push(
                 dbg.clone(),
-                if def.debug_name.is_empty() {
+                if debug_name.is_empty() {
                     "<fn>".into()
                 } else {
-                    def.debug_name.clone()
+                    debug_name
                 },
-                def.debug_scope,
+                debug_scope,
             ))
         } else {
             None
@@ -460,15 +613,143 @@ impl Vm {
         for v in self.vars.values() {
             collect_val_tensor_ids(v, &mut live);
         }
+        for v in &self.locals {
+            collect_val_tensor_ids(v, &mut live);
+        }
         for cell in self.cells.values() {
             if let Ok(guard) = cell.lock() {
                 collect_val_tensor_ids(&guard, &mut live);
+            }
+        }
+        for frame in &self.frames {
+            for v in frame.vars.values() {
+                collect_val_tensor_ids(v, &mut live);
+            }
+            for v in &frame.locals {
+                collect_val_tensor_ids(v, &mut live);
+            }
+            for cell in frame.cells.values() {
+                if let Ok(guard) = cell.lock() {
+                    collect_val_tensor_ids(&guard, &mut live);
+                }
             }
         }
         for v in &self.stack {
             collect_val_tensor_ids(v, &mut live);
         }
         tensor_gc_unreachable(&live)
+    }
+    fn eval_cmp(cmp: &Op, x: f64, y: f64) -> bool {
+        match cmp {
+            Op::Lt => x < y,
+            Op::Le => x <= y,
+            Op::Gt => x > y,
+            _ => x >= y,
+        }
+    }
+    fn apply_arith_mut(op: &Op, target: &mut f64, rhs: f64) {
+        match op {
+            Op::Add => *target += rhs,
+            Op::Sub => *target -= rhs,
+            _ => *target *= rhs,
+        }
+    }
+    fn run_accum_loop(i_val: &mut f64, s_val: &mut f64, limit: f64, step: f64, is_add: bool) {
+        while *i_val < limit {
+            if is_add {
+                *s_val += *i_val;
+            } else {
+                *s_val -= *i_val;
+            }
+            *i_val += step;
+        }
+    }
+    fn val_index_list(val: &Val, i: usize) -> Option<Result<Val, String>> {
+        match val {
+            Val::List(v) => Some(
+                v.get(i)
+                    .cloned()
+                    .ok_or_else(|| format!("list index {i} out of range")),
+            ),
+            _ => None,
+        }
+    }
+    fn val_len(val: &Val) -> Option<usize> {
+        match val {
+            Val::List(v) => Some(v.len()),
+            Val::Str(s) => Some(s.chars().count()),
+            Val::Map(m) => Some(m.len()),
+            _ => None,
+        }
+    }
+    fn capture_upvalues(&mut self, names: &HashSet<String>) -> HashMap<String, Arc<Mutex<Val>>> {
+        let mut captured = HashMap::new();
+        for k in names {
+            if let Some(existing_cell) = self.cells.get(k) {
+                captured.insert(k.clone(), existing_cell.clone());
+            } else if let Some(val) = self.vars.get(k) {
+                let cell = Arc::new(Mutex::new(val.clone()));
+                Arc::make_mut(&mut self.cells).insert(k.clone(), cell.clone());
+                captured.insert(k.clone(), cell);
+            }
+        }
+        captured
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_function_def(
+        &self,
+        params: Vec<(String, Option<String>)>,
+        return_type: Option<String>,
+        is_async: bool,
+        code: Vec<Op>,
+        debug_name: String,
+        debug_scope: usize,
+        upvalues: Arc<HashMap<String, Arc<Mutex<Val>>>>,
+        param_named: Vec<bool>,
+    ) -> FunctionDef {
+        let local_count = compute_local_count(&code, params.len());
+        let is_generator = code_has_yield(&code);
+        FunctionDef {
+            params: Arc::new(params),
+            return_type,
+            is_async,
+            is_generator,
+            code: Arc::new(code),
+            captures: Arc::new(HashMap::new()),
+            capture_types: self.var_types.clone(),
+            upvalues,
+            local_count,
+            param_named: Arc::new(param_named),
+            debug_name,
+            debug_scope,
+        }
+    }
+    fn pop_frame_or_finish(&mut self, val: Val, context: &str) -> Result<Option<Val>, String> {
+        let expected_ret = self.return_type.clone();
+        if let Some(caller) = self.frames.pop() {
+            self.restore_frame(caller);
+            if let Some(expected) = expected_ret {
+                if !self.value_matches(&val, &expected) {
+                    return Err(format!(
+                        "{context} value expected {expected}, got {}",
+                        val.show()
+                    ));
+                }
+            }
+            self.stack.push(val);
+            Ok(None)
+        } else {
+            if let Some(expected) = expected_ret {
+                if !self.value_matches(&val, &expected) {
+                    return Err(format!(
+                        "{context} value expected {expected}, got {}",
+                        val.show()
+                    ));
+                }
+            }
+            self.finished = true;
+            Ok(Some(val))
+        }
     }
     pub(crate) fn execute(&mut self) -> Result<Val, String> {
         let _root_guard = match &self.debugger {
@@ -481,6 +762,76 @@ impl Vm {
             if !self.trace && !self.breakpoints.contains(&self.ip) && self.debugger.is_none() {
                 if let Some(loop_win) = self.code.get(self.ip..self.ip + 13) {
                     match loop_win {
+                        [
+                            Op::LoadLocal(i1),
+                            limit_op @ (Op::LoadLocal(_) | Op::Load(_) | Op::Const(Val::Num(_))),
+                            Op::Lt,
+                            Op::JumpIfFalse(target),
+                            Op::LoadLocal(s1),
+                            Op::LoadLocal(i2),
+                            acc_op @ (Op::Add | Op::Sub),
+                            Op::StoreLocal(s2),
+                            Op::LoadLocal(i3),
+                            Op::Const(Val::Num(step)),
+                            Op::Add,
+                            Op::StoreLocal(i4),
+                            Op::Jump(back),
+                        ] if *back == self.ip
+                            && *target == self.ip + 13
+                            && *step > 0.0
+                            && i1 == i2
+                            && i1 == i3
+                            && i1 == i4
+                            && s1 == s2
+                            && i1 != s1
+                            && self.local_defined.get(*i1).copied().unwrap_or(false)
+                            && self.local_defined.get(*s1).copied().unwrap_or(false)
+                            && !self.local_consts.get(*i1).copied().unwrap_or(true)
+                            && !self.local_consts.get(*s1).copied().unwrap_or(true)
+                            && self.local_types.get(*i1).and_then(Option::as_ref).is_none()
+                            && self.local_types.get(*s1).and_then(Option::as_ref).is_none() =>
+                        {
+                            let limit_opt = match limit_op {
+                                Op::LoadLocal(lim_slot)
+                                    if lim_slot != i1
+                                        && lim_slot != s1
+                                        && self
+                                            .local_defined
+                                            .get(*lim_slot)
+                                            .copied()
+                                            .unwrap_or(false) =>
+                                {
+                                    match self.locals.get(*lim_slot) {
+                                        Some(Val::Num(n)) => Some(*n),
+                                        _ => None,
+                                    }
+                                }
+                                Op::Load(lim_name) if !self.cells.contains_key(lim_name) => {
+                                    match self.vars.get(lim_name) {
+                                        Some(Val::Num(n)) => Some(*n),
+                                        _ => None,
+                                    }
+                                }
+                                Op::Const(Val::Num(n)) => Some(*n),
+                                _ => None,
+                            };
+                            if let (
+                                Some(limit),
+                                Some(Val::Num(mut i_val)),
+                                Some(Val::Num(mut s_val)),
+                            ) = (
+                                limit_opt,
+                                self.locals.get(*i1).cloned(),
+                                self.locals.get(*s1).cloned(),
+                            ) {
+                                let is_add = matches!(acc_op, Op::Add);
+                                Self::run_accum_loop(&mut i_val, &mut s_val, limit, *step, is_add);
+                                self.locals[*i1] = Val::Num(i_val);
+                                self.locals[*s1] = Val::Num(s_val);
+                                self.ip = *target;
+                                continue;
+                            }
+                        }
                         [
                             Op::Load(i1),
                             limit_op @ (Op::Load(_) | Op::Const(Val::Num(_))),
@@ -506,10 +857,16 @@ impl Vm {
                             && !self.cells.contains_key(i1)
                             && !self.cells.contains_key(s1)
                             && !self.consts.contains(i1)
-                            && !self.consts.contains(s1) =>
+                            && !self.consts.contains(s1)
+                            && !self.var_types.contains_key(i1)
+                            && !self.var_types.contains_key(s1) =>
                         {
                             let limit_opt = match limit_op {
-                                Op::Load(lim_name) if !self.cells.contains_key(lim_name) => {
+                                Op::Load(lim_name)
+                                    if lim_name != i1
+                                        && lim_name != s1
+                                        && !self.cells.contains_key(lim_name) =>
+                                {
                                     match self.vars.get(lim_name) {
                                         Some(Val::Num(n)) => Some(*n),
                                         _ => None,
@@ -532,14 +889,7 @@ impl Vm {
                                 let iv_name = i1.clone();
                                 let sv_name = s1.clone();
                                 let exit_ip = *target;
-                                while i_val < limit {
-                                    if is_add {
-                                        s_val += i_val;
-                                    } else {
-                                        s_val -= i_val;
-                                    }
-                                    i_val += st;
-                                }
+                                Self::run_accum_loop(&mut i_val, &mut s_val, limit, st, is_add);
                                 self.vars.insert(iv_name, Val::Num(i_val));
                                 self.vars.insert(sv_name, Val::Num(s_val));
                                 self.ip = exit_ip;
@@ -552,6 +902,72 @@ impl Vm {
                 if let Some(window) = self.code.get(self.ip..self.ip + 4) {
                     match window {
                         [
+                            Op::LoadLocal(a),
+                            Op::LoadLocal(b),
+                            cmp @ (Op::Lt | Op::Le | Op::Gt | Op::Ge),
+                            Op::JumpIfFalse(target),
+                        ] if self.local_defined.get(*a).copied().unwrap_or(false)
+                            && self.local_defined.get(*b).copied().unwrap_or(false) =>
+                        {
+                            if let (Some(Val::Num(x)), Some(Val::Num(y))) =
+                                (self.locals.get(*a), self.locals.get(*b))
+                            {
+                                let yes = Self::eval_cmp(cmp, *x, *y);
+                                self.ip = if yes { self.ip + 4 } else { *target };
+                                continue;
+                            }
+                        }
+                        [
+                            Op::LoadLocal(a),
+                            Op::Const(Val::Num(y)),
+                            cmp @ (Op::Lt | Op::Le | Op::Gt | Op::Ge),
+                            Op::JumpIfFalse(target),
+                        ] if self.local_defined.get(*a).copied().unwrap_or(false) => {
+                            if let Some(Val::Num(x)) = self.locals.get(*a) {
+                                let yes = Self::eval_cmp(cmp, *x, *y);
+                                self.ip = if yes { self.ip + 4 } else { *target };
+                                continue;
+                            }
+                        }
+                        [
+                            Op::LoadLocal(a),
+                            Op::Const(Val::Num(k)),
+                            op @ (Op::Add | Op::Sub | Op::Mul),
+                            Op::StoreLocal(s),
+                        ] if a == s
+                            && self.local_defined.get(*a).copied().unwrap_or(false)
+                            && !self.local_consts.get(*a).copied().unwrap_or(true)
+                            && self.local_types.get(*a).and_then(Option::as_ref).is_none() =>
+                        {
+                            let rhs = *k;
+                            let arith = op.clone();
+                            if let Some(Val::Num(x)) = self.locals.get_mut(*a) {
+                                Self::apply_arith_mut(&arith, x, rhs);
+                                self.ip += 4;
+                                continue;
+                            }
+                        }
+                        [
+                            Op::LoadLocal(a),
+                            Op::LoadLocal(b),
+                            op @ (Op::Add | Op::Sub | Op::Mul),
+                            Op::StoreLocal(s),
+                        ] if a == s
+                            && self.local_defined.get(*a).copied().unwrap_or(false)
+                            && self.local_defined.get(*b).copied().unwrap_or(false)
+                            && !self.local_consts.get(*a).copied().unwrap_or(true)
+                            && self.local_types.get(*a).and_then(Option::as_ref).is_none() =>
+                        {
+                            if let Some(Val::Num(y)) = self.locals.get(*b).cloned() {
+                                let arith = op.clone();
+                                if let Some(Val::Num(x)) = self.locals.get_mut(*a) {
+                                    Self::apply_arith_mut(&arith, x, y);
+                                    self.ip += 4;
+                                    continue;
+                                }
+                            }
+                        }
+                        [
                             Op::Load(a),
                             Op::Load(b),
                             cmp @ (Op::Lt | Op::Le | Op::Gt | Op::Ge),
@@ -560,12 +976,7 @@ impl Vm {
                             if let (Some(Val::Num(x)), Some(Val::Num(y))) =
                                 (self.vars.get(a), self.vars.get(b))
                             {
-                                let yes = match cmp {
-                                    Op::Lt => *x < *y,
-                                    Op::Le => *x <= *y,
-                                    Op::Gt => *x > *y,
-                                    _ => *x >= *y,
-                                };
+                                let yes = Self::eval_cmp(cmp, *x, *y);
                                 self.ip = if yes { self.ip + 4 } else { *target };
                                 continue;
                             }
@@ -577,12 +988,7 @@ impl Vm {
                             Op::JumpIfFalse(target),
                         ] if !self.cells.contains_key(a) => {
                             if let Some(Val::Num(x)) = self.vars.get(a) {
-                                let yes = match cmp {
-                                    Op::Lt => *x < *y,
-                                    Op::Le => *x <= *y,
-                                    Op::Gt => *x > *y,
-                                    _ => *x >= *y,
-                                };
+                                let yes = Self::eval_cmp(cmp, *x, *y);
                                 self.ip = if yes { self.ip + 4 } else { *target };
                                 continue;
                             }
@@ -598,16 +1004,9 @@ impl Vm {
                             && !self.var_types.contains_key(a) =>
                         {
                             let rhs = *k;
-                            let is_add = matches!(op, Op::Add);
-                            let is_sub = matches!(op, Op::Sub);
+                            let arith = op.clone();
                             if let Some(Val::Num(x)) = self.vars.get_mut(a) {
-                                *x = if is_add {
-                                    *x + rhs
-                                } else if is_sub {
-                                    *x - rhs
-                                } else {
-                                    *x * rhs
-                                };
+                                Self::apply_arith_mut(&arith, x, rhs);
                                 self.ip += 4;
                                 continue;
                             }
@@ -624,16 +1023,9 @@ impl Vm {
                             && !self.var_types.contains_key(a) =>
                         {
                             if let Some(Val::Num(y)) = self.vars.get(b).cloned() {
-                                let is_add = matches!(op, Op::Add);
-                                let is_sub = matches!(op, Op::Sub);
+                                let arith = op.clone();
                                 if let Some(Val::Num(x)) = self.vars.get_mut(a) {
-                                    *x = if is_add {
-                                        *x + y
-                                    } else if is_sub {
-                                        *x - y
-                                    } else {
-                                        *x * y
-                                    };
+                                    Self::apply_arith_mut(&arith, x, y);
                                     self.ip += 4;
                                     continue;
                                 }
@@ -645,6 +1037,22 @@ impl Vm {
                 match self.code.get(self.ip) {
                     Some(Op::Jump(target)) => {
                         self.ip = *target;
+                        continue;
+                    }
+                    Some(Op::LoadLocal(slot))
+                        if *slot < self.locals.len()
+                            && self.local_defined[*slot]
+                            && !matches!(
+                                (self.code.get(self.ip + 1), self.code.get(self.ip + 2)),
+                                (Some(Op::LoadLocal(_) | Op::Load(_)), Some(Op::Index))
+                            )
+                            && !matches!(
+                                self.code.get(self.ip + 1),
+                                Some(Op::Call(fn_name, 1)) if fn_name == "len"
+                            ) =>
+                    {
+                        self.stack.push(self.locals[*slot].clone());
+                        self.ip += 1;
                         continue;
                     }
                     Some(Op::Const(Val::Num(n))) => {
@@ -676,6 +1084,11 @@ impl Vm {
                     .iter()
                     .map(|(k, v)| format!("{k}={}", v.show()))
                     .collect::<Vec<_>>();
+                for (slot, val) in self.locals.iter().enumerate() {
+                    if self.local_defined.get(slot).copied().unwrap_or(false) {
+                        vars.push(format!("#{slot}={}", val.show()));
+                    }
+                }
                 vars.sort();
                 eprintln!(
                     "[veyra-debug pc={:04}] {:?} | stack=[{}] | vars={{ {} }}",
@@ -695,6 +1108,8 @@ impl Vm {
                     self.ip,
                     &self.vars,
                     &self.cells,
+                    &self.locals,
+                    &self.local_defined,
                     &self.funcs,
                     &self.classes,
                     &self.objects,
@@ -706,15 +1121,34 @@ impl Vm {
                 Ok(None) => {}
                 Err(err) => {
                     if err != DAP_TERMINATED_ERR {
-                        if let Some((target, name, depth)) = self.handlers.pop() {
-                            self.stack.truncate(depth);
-                            let msg = err
-                                .strip_prefix("uncaught throw: ")
-                                .unwrap_or(&err)
-                                .to_string();
-                            self.set_var(name, Val::Str(msg));
-                            self.ip = target;
+                        let mut caught = false;
+                        loop {
+                            if let Some((target, name, depth)) = self.handlers.pop() {
+                                self.stack.truncate(depth);
+                                let msg = err
+                                    .strip_prefix("uncaught throw: ")
+                                    .unwrap_or(&err)
+                                    .to_string();
+                                self.set_var(name, Val::Str(msg));
+                                self.ip = target;
+                                caught = true;
+                                break;
+                            }
+                            if let Some(caller) = self.frames.pop() {
+                                self.restore_frame(caller);
+                            } else {
+                                break;
+                            }
+                        }
+                        if caught {
                             continue;
+                        }
+                    }
+                    while let Some(caller) = self.frames.pop() {
+                        if caller.dap_pushed {
+                            if let Some(ref dbg) = self.debugger {
+                                dbg.pop_frame();
+                            }
                         }
                     }
                     return Err(err);
@@ -725,6 +1159,94 @@ impl Vm {
     fn step_op(&mut self, op: Op) -> Result<Option<Val>, String> {
         match op {
             Op::Const(v) => self.stack.push(v),
+            Op::LoadLocal(slot) => {
+                if slot >= self.locals.len() || !self.local_defined[slot] {
+                    return Err(format!("undefined local slot {slot}"));
+                }
+                if let Some(Op::Index) = self.code.get(self.ip + 1) {
+                    let idx_num_opt = match self.code.get(self.ip) {
+                        Some(Op::LoadLocal(idx_slot))
+                            if *idx_slot < self.locals.len() && self.local_defined[*idx_slot] =>
+                        {
+                            match self.locals[*idx_slot] {
+                                Val::Num(n) => Some(n),
+                                _ => None,
+                            }
+                        }
+                        Some(Op::Load(idx_name)) => match self.get_var(idx_name) {
+                            Some(Val::Num(n)) => Some(n),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(idx_num) = idx_num_opt {
+                        if idx_num >= 0.0 {
+                            if let Some(res) =
+                                Self::val_index_list(&self.locals[slot], idx_num as usize)
+                            {
+                                self.ip += 2;
+                                self.stack.push(res?);
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
+                if let Some(Op::Call(fn_name, 1)) = self.code.get(self.ip) {
+                    if fn_name == "len" {
+                        if let Some(len) = Self::val_len(&self.locals[slot]) {
+                            self.ip += 1;
+                            self.stack.push(Val::Num(len as f64));
+                            return Ok(None);
+                        }
+                    }
+                }
+                self.stack.push(self.locals[slot].clone());
+            }
+            Op::DefineLocal(slot, is_const, ty) => {
+                let v = self.pop()?;
+                if slot >= self.locals.len() {
+                    self.locals.resize(slot + 1, Val::Null);
+                    self.local_defined.resize(slot + 1, false);
+                    self.local_consts.resize(slot + 1, false);
+                    self.local_types.resize(slot + 1, None);
+                }
+                if self.local_defined[slot] && self.local_consts[slot] {
+                    return Err("cannot redefine constant local".into());
+                }
+                if self.local_defined[slot] && is_const {
+                    return Err("local already defined".into());
+                }
+                if let Some(ref expected) = ty {
+                    if !self.value_matches(&v, expected) {
+                        return Err(format!("declaration expected {expected}, got {}", v.show()));
+                    }
+                    self.local_types[slot] = Some(expected.clone());
+                }
+                self.locals[slot] = v;
+                self.local_defined[slot] = true;
+                if is_const {
+                    self.local_consts[slot] = true;
+                }
+            }
+            Op::StoreLocal(slot) => {
+                if slot < self.local_consts.len() && self.local_consts[slot] {
+                    return Err("cannot assign to constant local".into());
+                }
+                let v = self.pop()?;
+                if slot >= self.locals.len() {
+                    self.locals.resize(slot + 1, Val::Null);
+                    self.local_defined.resize(slot + 1, false);
+                    self.local_consts.resize(slot + 1, false);
+                    self.local_types.resize(slot + 1, None);
+                }
+                if let Some(ref expected) = self.local_types[slot] {
+                    if !self.value_matches(&v, expected) {
+                        return Err(format!("assignment expected {expected}, got {}", v.show()));
+                    }
+                }
+                self.locals[slot] = v;
+                self.local_defined[slot] = true;
+            }
             Op::Load(n) => {
                 if let (Some(Op::Load(idx_name)), Some(Op::Index)) =
                     (self.code.get(self.ip), self.code.get(self.ip + 1))
@@ -736,20 +1258,9 @@ impl Vm {
                                 let guard = cell
                                     .lock()
                                     .map_err(|_| "upvalue cell poisoned".to_string())?;
-                                match &*guard {
-                                    Val::List(v) => {
-                                        Some(v.get(i).cloned().ok_or_else(|| {
-                                            format!("list index {i} out of range")
-                                        })?)
-                                    }
-                                    _ => None,
-                                }
-                            } else if let Some(Val::List(v)) = self.vars.get(&n) {
-                                Some(
-                                    v.get(i)
-                                        .cloned()
-                                        .ok_or_else(|| format!("list index {i} out of range"))?,
-                                )
+                                Self::val_index_list(&guard, i).transpose()?
+                            } else if let Some(val) = self.vars.get(&n) {
+                                Self::val_index_list(val, i).transpose()?
                             } else {
                                 None
                             };
@@ -767,19 +1278,9 @@ impl Vm {
                             let guard = cell
                                 .lock()
                                 .map_err(|_| "upvalue cell poisoned".to_string())?;
-                            match &*guard {
-                                Val::List(v) => Some(v.len()),
-                                Val::Str(s) => Some(s.chars().count()),
-                                Val::Map(m) => Some(m.len()),
-                                _ => None,
-                            }
+                            Self::val_len(&guard)
                         } else {
-                            match self.vars.get(&n) {
-                                Some(Val::List(v)) => Some(v.len()),
-                                Some(Val::Str(s)) => Some(s.chars().count()),
-                                Some(Val::Map(m)) => Some(m.len()),
-                                _ => None,
-                            }
+                            self.vars.get(&n).and_then(Self::val_len)
                         };
                         if let Some(len) = len_opt {
                             self.ip += 1;
@@ -1025,14 +1526,15 @@ impl Vm {
                             .ok_or(format!("undefined method '{name}' on {class_name}"))?;
                         let mut call_args = vec![Val::Object(id)];
                         call_args.extend(args);
-                        self.call_def(method, call_args)?
+                        self.invoke_in_execute(method, call_args)?;
+                        return Ok(None);
                     }
                     Val::Map(pairs) => {
                         if let Some((_, member)) =
                             pairs.iter().find(|(k, _)| *k == Val::Str(name.clone()))
                         {
                             if let Ok((_, def)) = self.callable_def(member) {
-                                self.stack.push(self.call_def(def, args)?);
+                                self.invoke_in_execute(def, args)?;
                                 return Ok(None);
                             }
                         }
@@ -1232,33 +1734,33 @@ impl Vm {
             }
             Op::Jump(p) => self.ip = p,
             Op::Call(n, k) => {
-                let mut a = vec![];
+                let mut a = Vec::with_capacity(k);
                 for _ in 0..k {
                     a.push(self.pop()?)
                 }
                 a.reverse();
-                let v = if let Some(v) = self.call_builtin(&n, a.clone())? {
-                    v
+                if let Some(v) = self.call_builtin(&n, a.clone())? {
+                    self.stack.push(v);
                 } else if self.classes.contains_key(&n) {
-                    self.instantiate(&n, a)?
-                } else if let Some(Val::Function(target)) = self.get_var(&n) {
-                    let def = if let Some(def) = self.funcs.get(&target).cloned() {
-                        def
-                    } else if let Some(def) = resolve_function_object(&target)? {
-                        def
-                    } else {
-                        return Err(format!("dangling function reference '{target}'"));
-                    };
-                    self.call_def(def, a)?
+                    let v = self.instantiate(&n, a)?;
+                    self.stack.push(v);
                 } else {
-                    let def = self
-                        .funcs
-                        .get(&n)
-                        .cloned()
-                        .ok_or(format!("unknown function or class '{n}'"))?;
-                    self.call_def(def, a)?
-                };
-                self.stack.push(v);
+                    let def = if let Some(Val::Function(target)) = self.get_var(&n) {
+                        if let Some(def) = self.funcs.get(&target).cloned() {
+                            def
+                        } else if let Some(def) = resolve_function_object(&target)? {
+                            def
+                        } else {
+                            return Err(format!("dangling function reference '{target}'"));
+                        }
+                    } else {
+                        self.funcs
+                            .get(&n)
+                            .cloned()
+                            .ok_or(format!("unknown function or class '{n}'"))?
+                    };
+                    self.invoke_in_execute(def, a)?;
+                }
             }
             Op::FunctionRef(name) => {
                 let def = self
@@ -1272,36 +1774,24 @@ impl Vm {
             Op::Def(name, params, return_type, is_async, code) => {
                 let mut referenced = HashSet::new();
                 collect_referenced_names(&code, &mut referenced);
+                let param_named: Vec<bool> =
+                    params.iter().map(|(p, _)| referenced.contains(p)).collect();
                 for (p, _) in &params {
                     referenced.remove(p);
                 }
-                let mut captured_upvalues = HashMap::new();
-                for k in &referenced {
-                    if let Some(existing_cell) = self.cells.get(k) {
-                        captured_upvalues.insert(k.clone(), existing_cell.clone());
-                    } else if let Some(val) = self.vars.get(k) {
-                        let cell = Arc::new(Mutex::new(val.clone()));
-                        Arc::make_mut(&mut self.cells).insert(k.clone(), cell.clone());
-                        captured_upvalues.insert(k.clone(), cell);
-                    }
-                }
-                let is_generator = code_has_yield(&code);
+                let captured_upvalues = self.capture_upvalues(&referenced);
                 let debug_scope = self.child_debug_scope(self.ip - 1, 0);
-                Arc::make_mut(&mut self.funcs).insert(
+                let def = self.build_function_def(
+                    params,
+                    return_type,
+                    is_async,
+                    code,
                     name.clone(),
-                    FunctionDef {
-                        params: Arc::new(params),
-                        return_type,
-                        is_async,
-                        is_generator,
-                        code: Arc::new(code),
-                        captures: Arc::new(HashMap::new()),
-                        capture_types: self.var_types.clone(),
-                        upvalues: Arc::new(captured_upvalues),
-                        debug_name: name,
-                        debug_scope,
-                    },
+                    debug_scope,
+                    Arc::new(captured_upvalues),
+                    param_named,
                 );
+                Arc::make_mut(&mut self.funcs).insert(name, def);
             }
             Op::DefClass(name, parent, methods) => {
                 if let Some(ref p) = parent {
@@ -1311,42 +1801,35 @@ impl Vm {
                 }
                 self.method_cache.clear();
                 let mut referenced = HashSet::new();
-                for (_, _, _, _, body) in &methods {
-                    collect_referenced_names(body, &mut referenced);
-                }
-                let mut captured_upvalues = HashMap::new();
-                for k in &referenced {
-                    if let Some(existing_cell) = self.cells.get(k) {
-                        captured_upvalues.insert(k.clone(), existing_cell.clone());
-                    } else if let Some(val) = self.vars.get(k) {
-                        let cell = Arc::new(Mutex::new(val.clone()));
-                        Arc::make_mut(&mut self.cells).insert(k.clone(), cell.clone());
-                        captured_upvalues.insert(k.clone(), cell);
+                let mut method_named = Vec::with_capacity(methods.len());
+                for (_, params, _, _, body) in &methods {
+                    let mut m_refs = HashSet::new();
+                    collect_referenced_names(body, &mut m_refs);
+                    let named: Vec<bool> = params.iter().map(|(p, _)| m_refs.contains(p)).collect();
+                    for (p, _) in params {
+                        m_refs.remove(p);
                     }
+                    referenced.extend(m_refs);
+                    method_named.push(named);
                 }
-                let upvalues = Arc::new(captured_upvalues);
+                let upvalues = Arc::new(self.capture_upvalues(&referenced));
                 let mut compiled = HashMap::new();
-                for (sub_idx, (method, params, return_type, is_async, code)) in
-                    methods.into_iter().enumerate()
+                for (sub_idx, ((method, params, return_type, is_async, code), param_named)) in
+                    methods.into_iter().zip(method_named).enumerate()
                 {
-                    let is_generator = code_has_yield(&code);
                     let debug_scope = self.child_debug_scope(self.ip - 1, sub_idx);
                     let debug_name = format!("{name}.{method}");
-                    compiled.insert(
-                        method,
-                        FunctionDef {
-                            params: Arc::new(params),
-                            return_type,
-                            is_async,
-                            is_generator,
-                            code: Arc::new(code),
-                            captures: Arc::new(HashMap::new()),
-                            capture_types: self.var_types.clone(),
-                            upvalues: upvalues.clone(),
-                            debug_name,
-                            debug_scope,
-                        },
+                    let def = self.build_function_def(
+                        params,
+                        return_type,
+                        is_async,
+                        code,
+                        debug_name,
+                        debug_scope,
+                        upvalues.clone(),
+                        param_named,
                     );
+                    compiled.insert(method, def);
                 }
                 Arc::make_mut(&mut self.classes).insert(
                     name,
@@ -1357,8 +1840,8 @@ impl Vm {
                 );
             }
             Op::Return => {
-                self.finished = true;
-                return Ok(Some(self.pop()?));
+                let val = self.pop()?;
+                return self.pop_frame_or_finish(val, "return");
             }
             Op::Yield => return Ok(Some(self.pop()?)),
             Op::PushHandler(target, name) => self.handlers.push((target, name, self.stack.len())),
@@ -1376,8 +1859,7 @@ impl Vm {
                 }
             }
             Op::Halt => {
-                self.finished = true;
-                return Ok(Some(Val::Null));
+                return self.pop_frame_or_finish(Val::Null, "return");
             }
         }
         Ok(None)
