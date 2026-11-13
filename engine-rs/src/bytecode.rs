@@ -40,7 +40,9 @@ pub(crate) enum Op {
     GetMember(String),
     SetMember(String),
     Call(String, usize),
+    CallExpr(usize),
     CallMethod(String, usize),
+    CallExt(u8, String, Vec<(u8, String)>),
     FunctionRef(String),
     Def(
         String,
@@ -106,6 +108,9 @@ pub(crate) fn collect_referenced_names(code: &[Op], out: &mut std::collections::
     for op in code {
         match op {
             Op::Load(n) | Op::Store(n) | Op::Call(n, _) | Op::FunctionRef(n) => {
+                out.insert(n.clone());
+            }
+            Op::CallExt(0, n, _) => {
                 out.insert(n.clone());
             }
             Op::Def(_, _, _, _, body) => {
@@ -243,7 +248,14 @@ fn encode_ops(code: &[Op]) -> JsonValue {
                 Op::GetMember(n) => json!({"op": "GetMember", "name": n}),
                 Op::SetMember(n) => json!({"op": "SetMember", "name": n}),
                 Op::Call(n, k) => json!({"op": "Call", "name": n, "argc": k}),
+                Op::CallExpr(k) => json!({"op": "CallExpr", "argc": k}),
                 Op::CallMethod(n, k) => json!({"op": "CallMethod", "name": n, "argc": k}),
+                Op::CallExt(kind, n, specs) => json!({
+                    "op": "CallExt",
+                    "kind": kind,
+                    "name": n,
+                    "specs": specs.iter().map(|(tag, kw)| json!([tag, kw])).collect::<Vec<_>>()
+                }),
                 Op::FunctionRef(n) => json!({"op": "FunctionRef", "name": n}),
                 Op::Def(name, params, ret, is_async, body) => json!({
                     "op": "Def",
@@ -414,6 +426,11 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
                     .and_then(json_as_usize)
                     .ok_or("vybc: Call missing argc")?,
             ),
+            "CallExpr" => Op::CallExpr(
+                item.get("argc")
+                    .and_then(json_as_usize)
+                    .ok_or("vybc: CallExpr missing argc")?,
+            ),
             "CallMethod" => Op::CallMethod(
                 item.get("name")
                     .and_then(JsonValue::as_str)
@@ -423,6 +440,35 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
                     .and_then(json_as_usize)
                     .ok_or("vybc: CallMethod missing argc")?,
             ),
+            "CallExt" => {
+                let kind = item
+                    .get("kind")
+                    .and_then(json_as_usize)
+                    .ok_or("vybc: CallExt missing kind")? as u8;
+                let name = item
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or("vybc: CallExt missing name")?
+                    .to_string();
+                let specs_arr = item
+                    .get("specs")
+                    .and_then(JsonValue::as_array)
+                    .ok_or("vybc: CallExt missing specs")?;
+                let mut specs = Vec::with_capacity(specs_arr.len());
+                for s in specs_arr {
+                    let pair = s.as_array().ok_or("vybc: CallExt bad spec")?;
+                    if pair.len() != 2 {
+                        return Err("vybc: CallExt spec length != 2".into());
+                    }
+                    let tag = json_as_usize(&pair[0]).ok_or("vybc: CallExt bad tag")? as u8;
+                    let kw = pair[1]
+                        .as_str()
+                        .ok_or("vybc: CallExt bad kw name")?
+                        .to_string();
+                    specs.push((tag, kw));
+                }
+                Op::CallExt(kind, name, specs)
+            }
             "FunctionRef" => Op::FunctionRef(
                 item.get("name")
                     .and_then(JsonValue::as_str)

@@ -155,7 +155,165 @@ impl Vm {
                 if a.len() != 1 {
                     return Err("str expects 1 argument".into());
                 }
-                Val::Str(a[0].show())
+                Val::Str(self.show_val_runtime(&a[0])?)
+            }
+            "repr" => {
+                if a.len() != 1 {
+                    return Err("repr expects 1 argument".into());
+                }
+                Val::Str(self.repr_val_runtime(&a[0])?)
+            }
+            "callable" => {
+                if a.len() != 1 {
+                    return Err("callable expects 1 argument".into());
+                }
+                let ok = match &a[0] {
+                    Val::Function(_) => true,
+                    Val::Map(_) if crate::py_bridge::is_py_handle(&a[0]) => {
+                        let built = crate::py_bridge::py_import("builtins")?;
+                        crate::py_bridge::py_call_method(
+                            &built,
+                            "callable",
+                            std::slice::from_ref(&a[0]),
+                            None,
+                        )?
+                        .truthy()
+                    }
+                    Val::Object(id) => {
+                        let cls = self
+                            .objects
+                            .lock()
+                            .map_err(|_| "object heap poisoned")?
+                            .get(id)
+                            .map(|o| o.class_name.clone());
+                        cls.and_then(|c| self.find_method_cached(&c, "__call__"))
+                            .is_some()
+                    }
+                    _ => false,
+                };
+                Val::Bool(ok)
+            }
+            "divmod" => {
+                if a.len() != 2 {
+                    return Err("divmod expects 2 arguments".into());
+                }
+                let (Val::Num(x), Val::Num(y)) = (&a[0], &a[1]) else {
+                    return Err("divmod expects Numbers".into());
+                };
+                if *y == 0.0 {
+                    return Err("division by zero in divmod".into());
+                }
+                let q = (x / y).floor();
+                let r = x - y * q;
+                Val::List(vec![Val::Num(q), Val::Num(r)])
+            }
+            "getattr" => {
+                if a.len() < 2 || a.len() > 3 {
+                    return Err("getattr expects (obj, name[, default])".into());
+                }
+                let attr = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("getattr attribute name must be String".into()),
+                };
+                if crate::py_bridge::is_py_handle(&a[0]) {
+                    match crate::py_bridge::py_get(&a[0], attr) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if a.len() == 3 {
+                                a[2].clone()
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
+                } else {
+                    match &a[0] {
+                        Val::Object(id) => {
+                            let val = self
+                                .objects
+                                .lock()
+                                .map_err(|_| "object heap poisoned")?
+                                .get(id)
+                                .and_then(|o| o.fields.get(attr).cloned());
+                            match val {
+                                Some(v) => v,
+                                None if a.len() == 3 => a[2].clone(),
+                                None => return Err(format!("undefined field '{attr}'")),
+                            }
+                        }
+                        Val::Map(pairs) => {
+                            if let Some((_, v)) =
+                                pairs.iter().find(|(k, _)| *k == Val::Str(attr.clone()))
+                            {
+                                v.clone()
+                            } else if a.len() == 3 {
+                                a[2].clone()
+                            } else {
+                                return Err(format!("undefined attribute '{attr}'"));
+                            }
+                        }
+                        _ => {
+                            if a.len() == 3 {
+                                a[2].clone()
+                            } else {
+                                return Err("getattr expects Object, Map, or Python object".into());
+                            }
+                        }
+                    }
+                }
+            }
+            "hasattr" => {
+                if a.len() != 2 {
+                    return Err("hasattr expects (obj, name)".into());
+                }
+                let attr = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("hasattr attribute name must be String".into()),
+                };
+                if crate::py_bridge::is_py_handle(&a[0]) {
+                    Val::Bool(crate::py_bridge::py_hasattr(&a[0], attr)?)
+                } else {
+                    let yes = match &a[0] {
+                        Val::Object(id) => {
+                            let (has_field, cls) = {
+                                let objs =
+                                    self.objects.lock().map_err(|_| "object heap poisoned")?;
+                                objs.get(id)
+                                    .map(|o| {
+                                        (o.fields.contains_key(attr), Some(o.class_name.clone()))
+                                    })
+                                    .unwrap_or((false, None))
+                            };
+                            has_field
+                                || cls
+                                    .and_then(|c| self.find_method_cached(&c, attr))
+                                    .is_some()
+                        }
+                        Val::Map(pairs) => pairs.iter().any(|(k, _)| *k == Val::Str(attr.clone())),
+                        _ => false,
+                    };
+                    Val::Bool(yes)
+                }
+            }
+            "setattr" => {
+                if a.len() != 3 {
+                    return Err("setattr expects (obj, name, value)".into());
+                }
+                let attr = match &a[1] {
+                    Val::Str(s) => s.clone(),
+                    _ => return Err("setattr attribute name must be String".into()),
+                };
+                if crate::py_bridge::is_py_handle(&a[0]) {
+                    let _ = crate::py_bridge::py_set(&a[0], &attr, &a[2])?;
+                    Val::Null
+                } else if let Val::Object(id) = a[0] {
+                    let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                    let data = heap.get_mut(&id).ok_or("dangling object")?;
+                    data.fields.insert(attr, a[2].clone());
+                    Val::Null
+                } else {
+                    return Err("setattr expects Object or Python object".into());
+                }
             }
             "type_of" => self.type_of_val(&a)?,
             "is_instance" | "isinstance" => {
@@ -250,50 +408,58 @@ impl Vm {
             }
             "sum" => {
                 if a.len() != 1 {
-                    return Err("sum expects list".into());
+                    return Err("sum expects iterable".into());
                 }
-                Val::Num(as_num_list(&a[0])?.iter().sum())
+                let items = self.iterable_values(&a[0])?;
+                let mut total = 0.0;
+                for x in items {
+                    let Val::Num(n) = x else {
+                        return Err("sum expects numeric items".into());
+                    };
+                    total += n;
+                }
+                Val::Num(total)
             }
             "min" => {
                 if a.len() != 1 {
-                    return Err("min expects list".into());
+                    return Err("min expects iterable".into());
                 }
-                let xs = as_num_list(&a[0])?;
-                Val::Num(
-                    xs.into_iter()
-                        .reduce(f64::min)
-                        .ok_or("min requires non-empty list")?,
-                )
+                let items = self.iterable_values(&a[0])?;
+                let mut best: Option<f64> = None;
+                for x in items {
+                    let Val::Num(n) = x else {
+                        return Err("min expects numeric items".into());
+                    };
+                    best = Some(best.map_or(n, |b| b.min(n)));
+                }
+                Val::Num(best.ok_or("min requires non-empty iterable")?)
             }
             "max" => {
                 if a.len() != 1 {
-                    return Err("max expects list".into());
+                    return Err("max expects iterable".into());
                 }
-                let xs = as_num_list(&a[0])?;
-                Val::Num(
-                    xs.into_iter()
-                        .reduce(f64::max)
-                        .ok_or("max requires non-empty list")?,
-                )
+                let items = self.iterable_values(&a[0])?;
+                let mut best: Option<f64> = None;
+                for x in items {
+                    let Val::Num(n) = x else {
+                        return Err("max expects numeric items".into());
+                    };
+                    best = Some(best.map_or(n, |b| b.max(n)));
+                }
+                Val::Num(best.ok_or("max requires non-empty iterable")?)
             }
             "all" => {
                 if a.len() != 1 {
-                    return Err("all expects list".into());
+                    return Err("all expects iterable".into());
                 }
-                let xs = match &a[0] {
-                    Val::List(v) => v,
-                    _ => return Err("all expects List".into()),
-                };
+                let xs = self.iterable_values(&a[0])?;
                 Val::Bool(xs.iter().all(Val::truthy))
             }
             "any" => {
                 if a.len() != 1 {
-                    return Err("any expects list".into());
+                    return Err("any expects iterable".into());
                 }
-                let xs = match &a[0] {
-                    Val::List(v) => v,
-                    _ => return Err("any expects List".into()),
-                };
+                let xs = self.iterable_values(&a[0])?;
                 Val::Bool(xs.iter().any(Val::truthy))
             }
             "__list" => Val::List(a),
@@ -728,23 +894,11 @@ impl Vm {
             }
             "sort" | "sorted" => {
                 if a.is_empty() || a.len() > 2 {
-                    return Err("sort expects (list[, reverse])".into());
+                    return Err("sort expects (iterable[, reverse])".into());
                 }
-                let mut xs = match &a[0] {
-                    Val::List(v) => v.clone(),
-                    _ => return Err("sort expects List".into()),
-                };
-                xs.sort_by(|x, y| match (x, y) {
-                    (Val::Num(a), Val::Num(b)) => {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    }
-                    (Val::Str(a), Val::Str(b)) => a.cmp(b),
-                    _ => std::cmp::Ordering::Equal,
-                });
-                if a.get(1).map(Val::truthy).unwrap_or(false) {
-                    xs.reverse();
-                }
-                Val::List(xs)
+                let xs = self.iterable_values(&a[0])?;
+                let reverse = a.get(1).map(Val::truthy).unwrap_or(false);
+                Val::List(self.sorted_with_opts(xs, None, reverse)?)
             }
             "chr" => {
                 if a.len() != 1 {
@@ -810,83 +964,70 @@ impl Vm {
                 Val::List(out)
             }
             "enumerate" => {
-                if a.len() != 1 {
-                    return Err("enumerate expects list".into());
+                if a.is_empty() || a.len() > 2 {
+                    return Err("enumerate expects (iterable[, start])".into());
                 }
-                let xs = match &a[0] {
-                    Val::List(v) => v,
-                    _ => return Err("enumerate expects List".into()),
+                let start = match a.get(1) {
+                    Some(Val::Num(n)) => *n as i64,
+                    None => 0,
+                    _ => return Err("enumerate start must be Number".into()),
                 };
+                let xs = self.iterable_values(&a[0])?;
                 Val::List(
-                    xs.iter()
+                    xs.into_iter()
                         .enumerate()
-                        .map(|(i, v)| Val::List(vec![Val::Num(i as f64), v.clone()]))
+                        .map(|(i, v)| Val::List(vec![Val::Num((start + i as i64) as f64), v]))
                         .collect(),
                 )
             }
             "zip" => {
-                if a.len() != 2 {
-                    return Err("zip expects two lists".into());
+                if a.is_empty() {
+                    Val::List(vec![])
+                } else {
+                    let mut cols = Vec::with_capacity(a.len());
+                    for item in &a {
+                        cols.push(self.iterable_values(item)?);
+                    }
+                    let min_len = cols.iter().map(Vec::len).min().unwrap_or(0);
+                    let mut out = Vec::with_capacity(min_len);
+                    for i in 0..min_len {
+                        out.push(Val::List(cols.iter().map(|c| c[i].clone()).collect()));
+                    }
+                    Val::List(out)
                 }
-                let x = match &a[0] {
-                    Val::List(v) => v,
-                    _ => return Err("zip expects Lists".into()),
-                };
-                let y = match &a[1] {
-                    Val::List(v) => v,
-                    _ => return Err("zip expects Lists".into()),
-                };
-                Val::List(
-                    x.iter()
-                        .zip(y.iter())
-                        .map(|(a, b)| Val::List(vec![a.clone(), b.clone()]))
-                        .collect(),
-                )
             }
             "map_call" => {
                 if a.len() != 2 {
-                    return Err("map_call expects callable,list".into());
+                    return Err("map_call expects callable,iterable".into());
                 }
-                let (_, def) = self.callable_def(&a[0])?;
-                let xs = match &a[1] {
-                    Val::List(v) => v,
-                    _ => return Err("map_call expects List".into()),
-                };
+                let xs = self.iterable_values(&a[1])?;
                 let mut out = vec![];
                 for x in xs {
-                    out.push(self.call_def(def.clone(), vec![x.clone()])?);
+                    out.push(self.invoke_callable_sync(&a[0], vec![x])?);
                 }
                 Val::List(out)
             }
             "filter_call" => {
                 if a.len() != 2 {
-                    return Err("filter_call expects callable,list".into());
+                    return Err("filter_call expects callable,iterable".into());
                 }
-                let (_, def) = self.callable_def(&a[0])?;
-                let xs = match &a[1] {
-                    Val::List(v) => v,
-                    _ => return Err("filter_call expects List".into()),
-                };
+                let xs = self.iterable_values(&a[1])?;
                 let mut out = vec![];
                 for x in xs {
-                    if self.call_def(def.clone(), vec![x.clone()])?.truthy() {
-                        out.push(x.clone());
+                    if self.invoke_callable_sync(&a[0], vec![x.clone()])?.truthy() {
+                        out.push(x);
                     }
                 }
                 Val::List(out)
             }
             "reduce_call" => {
                 if a.len() != 3 {
-                    return Err("reduce_call expects callable,list,initial".into());
+                    return Err("reduce_call expects callable,iterable,initial".into());
                 }
-                let (_, def) = self.callable_def(&a[0])?;
-                let xs = match &a[1] {
-                    Val::List(v) => v,
-                    _ => return Err("reduce_call expects List".into()),
-                };
+                let xs = self.iterable_values(&a[1])?;
                 let mut acc = a[2].clone();
                 for x in xs {
-                    acc = self.call_def(def.clone(), vec![acc, x.clone()])?;
+                    acc = self.invoke_callable_sync(&a[0], vec![acc, x])?;
                 }
                 acc
             }

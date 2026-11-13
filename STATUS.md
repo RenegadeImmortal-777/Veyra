@@ -40,7 +40,7 @@ Last full gate run: **2026-11-13**. Every gate passed (**8/8**).
 | Gate | Result |
 |---|---|
 | `cargo fmt --check` | PASS |
-| `cargo test` | PASS — 82 passed, 0 failed |
+| `cargo test` | PASS — 85 passed, 0 failed |
 | `cargo check --no-default-features` | PASS |
 | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | `cargo build --release` | PASS |
@@ -58,7 +58,11 @@ The engine source is modularized under `engine-rs/src/`:
   method cache, and `Arc<Mutex<Val>>` closure upvalue cell management, while built-in
   operations live in `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
 - `aot.rs` implements native AOT compilation (`veyra aot`, `veyra build --native`) via
-  standalone optimized Rust codegen compiled by `rustc`.
+  standalone optimized Rust codegen compiled by `rustc` (supporting `async fn`/`await`/`gather`,
+  `yield` generators + generator expressions, `**kwargs`/chained calls, dunders, and Python interop).
+- `py_bridge.rs` provides a persistent stdio JSON-RPC bridge to Python 3 (`py_available`,
+  `py_import`, `py_call`, `py_get`, `py_set`, `py_dir`, `py_eval`, `py_exec`) with transparent
+  member, method, index, and call handle routing across VM and native AOT binaries.
 - `dap.rs` and `lsp.rs` implement the native DAP debugger and LSP server consumed by
   the VS Code extension (`tooling/vscode/`).
 - See [docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md) and [WAY_FORWARD.md](WAY_FORWARD.md)
@@ -86,14 +90,20 @@ Native, without Python:
   context managers, generators, decorators, list comprehensions, `match`/`case`,
   short-circuit `and`/`or`, right-associative `**`, tuple `(a, b)` and set `{a, b}`
   literals, f-strings, compound assignments (`+=`, `-=`, `*=`, `/=`), list/map index
-  mutation (`xs[i] = v`, `m[k] = v`), 1/2/3-arg `range(...)`, and async functions with
-  `await`/`gather`, tasks, channels, and timeout-aware waits.
+  mutation (`xs[i] = v`, `m[k] = v`), 1/2/3-arg `range(...)`, async functions with
+  `await`/`gather`, tasks, channels, timeout-aware waits, indirect/chained calls (`f(x)(y)`),
+  keyword arguments/`*args`/`**kwargs`, chained comparisons (`0 <= x < 10`), lazy generator
+  expressions (`(x * x for x in xs)`), class dunders (`__add__`, `__sub__`, `__mul__`, `__eq__`,
+  `__getitem__`, `__setitem__`, `__len__`, `__str__`, `__repr__`, `__call__`), expanded Python-parity
+  builtins/methods (`repr`, `callable`, `divmod`, `getattr`, `hasattr`, `setattr`, `sorted`/`min`/`max`
+  with `key=`, variadic `zip`, `enumerate(..., start=...)`, `print(..., sep=..., end=...)`), and live
+  Python 3 library interop (`py_import`, `py_call`, `py_get`, `py_set`, `py_dir`, `py_eval`, `py_exec`).
 - **Bytecode, VM & Native AOT**: portable `veyra-bc-v1` (`.vybc`) bytecode
   serialization with SHA-256 tamper verification, multi-pass bytecode optimizer
   (`ir.rs`), flat `CallFrame` + indexed local slot VM (`vm.rs`), pure-Veyra
   self-hosted compiler (`compiler-vy/src/main.vy`) verified to a 3-stage bootstrap
-  fixpoint (`Stage 2 .vybc == Stage 3 .vybc`), and native AOT compilation (`aot.rs`,
-  `veyra aot`, `veyra build --native`).
+  fixpoint (`Stage 2 .vybc == Stage 3 .vybc`), and full-parity native AOT compilation (`aot.rs`,
+  `veyra aot`, `veyra build --native`) including async, generators, dunders, and Python bridge.
 - **Runtime services**: JSON, TOML, CSV, regex, Base64, UUID, date/time, filesystem,
   paths, processes, environment, platform introspection.
 - **Application**: HTTP client, path-traversal-hardened static/routed/dynamic web
@@ -132,9 +142,9 @@ Native, without Python:
 
 ## Remaining long-horizon directions
 
-- Async/generator support in the native AOT backend (`aot.rs`) and optional LLVM/Cranelift JIT tier.
+- Optional LLVM/Cranelift JIT tier (`aot.rs` now covers async, generators, kwargs, dunders, and Python interop natively via `rustc` AOT).
 - GPU tensor backend (CUDA/Vulkan/wgpu).
-- Publicly hosted, cryptographically signed community package registry at scale.
+- In-process CPython C-API `.pyd`/`.so` ABI loading and a hosted, cryptographically signed community package registry at scale (access to installed Python modules today goes through the out-of-process `py_bridge` Python 3 worker).
 
 ## Repository map
 

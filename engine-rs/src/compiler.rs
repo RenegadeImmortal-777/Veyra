@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Expr, Stmt};
+use crate::ast::{CallArg, Expr, Stmt};
 use crate::bytecode::Op;
 use crate::value::Val;
 
@@ -24,6 +24,40 @@ fn collect_all_ids_expr(e: &Expr, out: &mut HashSet<String>) {
             out.insert(n.clone());
             for a in args {
                 collect_all_ids_expr(a, out);
+            }
+        }
+        Expr::CallExpr(callee, args) => {
+            collect_all_ids_expr(callee, out);
+            for a in args {
+                collect_all_ids_expr(a, out);
+            }
+        }
+        Expr::CallExt {
+            callee,
+            method,
+            args,
+        } => {
+            if method.is_none() {
+                if let Expr::Var(n) = &**callee {
+                    out.insert(n.clone());
+                } else {
+                    collect_all_ids_expr(callee, out);
+                }
+            } else {
+                collect_all_ids_expr(callee, out);
+            }
+            for a in args {
+                match a {
+                    CallArg::Pos(e) | CallArg::Star(e) | CallArg::Kw(_, e) | CallArg::KwStar(e) => {
+                        collect_all_ids_expr(e, out)
+                    }
+                }
+            }
+        }
+        Expr::ChainedCmp(first, links) => {
+            collect_all_ids_expr(first, out);
+            for (_, rhs) in links {
+                collect_all_ids_expr(rhs, out);
             }
         }
         Expr::List(items) => {
@@ -138,6 +172,40 @@ fn collect_unslotted_in_expr(e: &Expr, out: &mut HashSet<String>) {
             out.insert(name.clone());
             for a in args {
                 collect_unslotted_in_expr(a, out);
+            }
+        }
+        Expr::CallExpr(callee, args) => {
+            collect_unslotted_in_expr(callee, out);
+            for a in args {
+                collect_unslotted_in_expr(a, out);
+            }
+        }
+        Expr::CallExt {
+            callee,
+            method,
+            args,
+        } => {
+            if method.is_none() {
+                if let Expr::Var(name) = &**callee {
+                    out.insert(name.clone());
+                } else {
+                    collect_unslotted_in_expr(callee, out);
+                }
+            } else {
+                collect_unslotted_in_expr(callee, out);
+            }
+            for a in args {
+                match a {
+                    CallArg::Pos(e) | CallArg::Star(e) | CallArg::Kw(_, e) | CallArg::KwStar(e) => {
+                        collect_unslotted_in_expr(e, out)
+                    }
+                }
+            }
+        }
+        Expr::ChainedCmp(first, links) => {
+            collect_unslotted_in_expr(first, out);
+            for (_, rhs) in links {
+                collect_unslotted_in_expr(rhs, out);
             }
         }
         Expr::Lambda(_, _, body) => collect_all_ids_stmts(body, out),
@@ -597,11 +665,92 @@ impl Compiler {
                     _ => return Err("bad operator".into()),
                 });
             }
+            Expr::ChainedCmp(first, links) => {
+                let prev_name = self.temp("cmp_prev");
+                let next_name = self.temp("cmp_next");
+                self.emit_expr(first)?;
+                self.emit_define(&prev_name, false, None);
+                let mut false_jumps = Vec::new();
+                for (op, rhs) in links {
+                    self.emit_expr(rhs)?;
+                    self.emit_define(&next_name, false, None);
+                    self.emit_load(&prev_name);
+                    self.emit_load(&next_name);
+                    self.code.push(match op.as_str() {
+                        "<" => Op::Lt,
+                        "<=" => Op::Le,
+                        ">" => Op::Gt,
+                        ">=" => Op::Ge,
+                        _ => return Err("bad comparison operator".into()),
+                    });
+                    let jf = self.code.len();
+                    self.code.push(Op::JumpIfFalse(0));
+                    false_jumps.push(jf);
+                    self.emit_load(&next_name);
+                    self.emit_store(&prev_name);
+                }
+                self.code.push(Op::Const(Val::Bool(true)));
+                let end_jump = self.code.len();
+                self.code.push(Op::Jump(0));
+                let false_pc = self.code.len();
+                self.code.push(Op::Const(Val::Bool(false)));
+                let end_pc = self.code.len();
+                for jf in false_jumps {
+                    self.code[jf] = Op::JumpIfFalse(false_pc);
+                }
+                self.code[end_jump] = Op::Jump(end_pc);
+            }
             Expr::Call(n, args) => {
                 for a in args {
                     self.emit_expr(a)?
                 }
                 self.code.push(Op::Call(n.clone(), args.len()));
+            }
+            Expr::CallExpr(callee, args) => {
+                self.emit_expr(callee)?;
+                for a in args {
+                    self.emit_expr(a)?;
+                }
+                self.code.push(Op::CallExpr(args.len()));
+            }
+            Expr::CallExt {
+                callee,
+                method,
+                args,
+            } => {
+                let (kind, op_name) = match (method, &**callee) {
+                    (None, Expr::Var(name)) => (0u8, name.clone()),
+                    (Some(m), _) => {
+                        self.emit_expr(callee)?;
+                        (1u8, m.clone())
+                    }
+                    (None, _) => {
+                        self.emit_expr(callee)?;
+                        (2u8, String::new())
+                    }
+                };
+                let mut specs = Vec::with_capacity(args.len());
+                for a in args {
+                    match a {
+                        CallArg::Pos(e) => {
+                            self.emit_expr(e)?;
+                            specs.push((0u8, String::new()));
+                        }
+                        CallArg::Star(e) => {
+                            self.emit_expr(e)?;
+                            specs.push((1u8, String::new()));
+                        }
+                        CallArg::Kw(k, e) => {
+                            self.emit_expr(e)?;
+                            specs.push((2u8, k.clone()));
+                        }
+                        CallArg::KwStar(e) => {
+                            self.emit_expr(e)?;
+                            specs.push((3u8, String::new()));
+                        }
+                    }
+                }
+                self.code.push(Op::CallExt(kind, op_name, specs));
             }
         }
         Ok(())

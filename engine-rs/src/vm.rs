@@ -256,7 +256,11 @@ impl Vm {
         }
         None
     }
-    fn find_method_cached(&mut self, class_name: &str, method: &str) -> Option<FunctionDef> {
+    pub(crate) fn find_method_cached(
+        &mut self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<FunctionDef> {
         let key = (class_name.to_string(), method.to_string());
         if let Some(cached) = self.method_cache.get(&key) {
             return Some(cached.clone());
@@ -265,37 +269,104 @@ impl Vm {
         self.method_cache.insert(key, found.clone());
         Some(found)
     }
-    fn prepare_call(&self, def: FunctionDef, mut args: Vec<Val>) -> Result<PreparedCall, String> {
-        let has_varargs = def.params.last().and_then(|(_, ty)| ty.as_deref()) == Some("*");
-        if has_varargs {
-            let fixed = def.params.len().saturating_sub(1);
-            if args.len() < fixed {
-                return Err(format!(
-                    "function expects at least {fixed} arguments, got {}",
-                    args.len()
-                ));
-            }
-            let rest = args.split_off(fixed);
-            args.push(Val::List(rest));
-        } else if args.len() < def.params.len() {
-            let missing_all_optional = def.params[args.len()..]
-                .iter()
-                .all(|(_, ty)| ty.as_deref() == Some("?default"));
-            if missing_all_optional {
-                args.resize(def.params.len(), Val::Null);
-            } else {
+    fn prepare_call(&self, def: FunctionDef, args: Vec<Val>) -> Result<PreparedCall, String> {
+        self.prepare_call_kw(def, args, Vec::new())
+    }
+    fn prepare_call_kw(
+        &self,
+        def: FunctionDef,
+        mut args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+    ) -> Result<PreparedCall, String> {
+        let has_kwargs = def.params.last().and_then(|(_, ty)| ty.as_deref()) == Some("**");
+        let non_kw_len = if has_kwargs {
+            def.params.len().saturating_sub(1)
+        } else {
+            def.params.len()
+        };
+        let has_varargs = non_kw_len > 0 && def.params[non_kw_len - 1].1.as_deref() == Some("*");
+
+        if kwargs.is_empty() && !has_kwargs {
+            if has_varargs {
+                let fixed = def.params.len().saturating_sub(1);
+                if args.len() < fixed {
+                    return Err(format!(
+                        "function expects at least {fixed} arguments, got {}",
+                        args.len()
+                    ));
+                }
+                let rest = args.split_off(fixed);
+                args.push(Val::List(rest));
+            } else if args.len() < def.params.len() {
+                let missing_all_optional = def.params[args.len()..]
+                    .iter()
+                    .all(|(_, ty)| ty.as_deref() == Some("?default"));
+                if missing_all_optional {
+                    args.resize(def.params.len(), Val::Null);
+                } else {
+                    return Err(format!(
+                        "function expects {} arguments, got {}",
+                        def.params.len(),
+                        args.len()
+                    ));
+                }
+            } else if def.params.len() != args.len() {
                 return Err(format!(
                     "function expects {} arguments, got {}",
                     def.params.len(),
                     args.len()
                 ));
             }
-        } else if def.params.len() != args.len() {
-            return Err(format!(
-                "function expects {} arguments, got {}",
-                def.params.len(),
-                args.len()
-            ));
+        } else {
+            let fixed = non_kw_len.saturating_sub(if has_varargs { 1 } else { 0 });
+            let mut slots: Vec<Option<Val>> = vec![None; fixed];
+            let mut rest = Vec::new();
+            for (idx, val) in args.into_iter().enumerate() {
+                if idx < fixed {
+                    slots[idx] = Some(val);
+                } else if has_varargs {
+                    rest.push(val);
+                } else {
+                    return Err(format!(
+                        "function expects at most {fixed} positional arguments"
+                    ));
+                }
+            }
+            let mut kw_map: Vec<(Val, Val)> = Vec::new();
+            for (k, v) in kwargs {
+                if let Some(pos) = def.params[..fixed].iter().position(|(p, _)| p == &k) {
+                    if slots[pos].is_some() {
+                        return Err(format!("multiple values for argument '{k}'"));
+                    }
+                    slots[pos] = Some(v);
+                } else if has_kwargs {
+                    let ks = Val::Str(k);
+                    if let Some((_, existing)) = kw_map.iter_mut().find(|(ek, _)| *ek == ks) {
+                        *existing = v;
+                    } else {
+                        kw_map.push((ks, v));
+                    }
+                } else {
+                    return Err(format!("unexpected keyword argument '{k}'"));
+                }
+            }
+            let mut resolved = Vec::with_capacity(def.params.len());
+            for (idx, (param, ty)) in def.params[..fixed].iter().enumerate() {
+                if let Some(val) = slots[idx].take() {
+                    resolved.push(val);
+                } else if ty.as_deref() == Some("?default") {
+                    resolved.push(Val::Null);
+                } else {
+                    return Err(format!("missing required argument '{param}'"));
+                }
+            }
+            if has_varargs {
+                resolved.push(Val::List(rest));
+            }
+            if has_kwargs {
+                resolved.push(Val::Map(kw_map));
+            }
+            args = resolved;
         }
         if def.is_async && def.is_generator {
             return Err("async generator functions are not yet supported".into());
@@ -312,7 +383,7 @@ impl Vm {
         for (slot, ((param, ty), value)) in def.params.iter().zip(&args).enumerate() {
             let named = def.param_named.get(slot).copied().unwrap_or(true);
             if let Some(expected) = ty {
-                if expected != "*" && expected != "?default" {
+                if expected != "*" && expected != "**" && expected != "?default" {
                     if !self.value_matches(value, expected) {
                         return Err(format!(
                             "argument '{param}' expected {expected}, got {}",
@@ -412,22 +483,40 @@ impl Vm {
         self.debug_scope = caller.debug_scope;
     }
     fn invoke_in_execute(&mut self, def: FunctionDef, args: Vec<Val>) -> Result<(), String> {
+        self.invoke_in_execute_kw(def, args, Vec::new())
+    }
+    fn invoke_in_execute_kw(
+        &mut self,
+        def: FunctionDef,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+    ) -> Result<(), String> {
         if def.is_async || def.is_generator {
-            let v = self.call_def(def, args)?;
+            let v = self.call_def_kw(def, args, kwargs)?;
             self.stack.push(v);
             return Ok(());
         }
-        let prepared = self.prepare_call(def, args)?;
+        let prepared = self.prepare_call_kw(def, args, kwargs)?;
         self.push_prepared_frame(prepared);
         Ok(())
     }
-    pub(crate) fn spawn_task_with_kind(
+    fn call_def_kw(
         &self,
         def: FunctionDef,
         args: Vec<Val>,
-        kind: &str,
+        kwargs: Vec<(String, Val)>,
     ) -> Result<Val, String> {
-        let prepared = self.prepare_call(def, args)?;
+        if def.is_async {
+            if def.is_generator {
+                return Err("async generator functions are not yet supported".into());
+            }
+            let prepared = self.prepare_call_kw(def, args, kwargs)?;
+            return self.spawn_prepared_task(prepared, "async");
+        }
+        let prepared = self.prepare_call_kw(def, args, kwargs)?;
+        self.run_prepared_call(prepared)
+    }
+    fn spawn_prepared_task(&self, prepared: PreparedCall, kind: &str) -> Result<Val, String> {
         let expected_return = prepared.return_type.clone();
         let mut nested = self.nested_from_prepared(prepared);
         let id = TASK_IDS.fetch_add(1, Ordering::Relaxed);
@@ -450,6 +539,15 @@ impl Vm {
             .insert(id, handle);
         Ok(Val::Num(id as f64))
     }
+    pub(crate) fn spawn_task_with_kind(
+        &self,
+        def: FunctionDef,
+        args: Vec<Val>,
+        kind: &str,
+    ) -> Result<Val, String> {
+        let prepared = self.prepare_call(def, args)?;
+        self.spawn_prepared_task(prepared, kind)
+    }
     pub(crate) fn call_def(&self, def: FunctionDef, args: Vec<Val>) -> Result<Val, String> {
         if def.is_async {
             if def.is_generator {
@@ -458,6 +556,9 @@ impl Vm {
             return self.spawn_task_with_kind(def, args, "async");
         }
         let prepared = self.prepare_call(def, args)?;
+        self.run_prepared_call(prepared)
+    }
+    fn run_prepared_call(&self, prepared: PreparedCall) -> Result<Val, String> {
         let is_generator = prepared.is_generator;
         let return_type = prepared.return_type.clone();
         let debug_name = prepared.debug_name.clone();
@@ -513,6 +614,14 @@ impl Vm {
         Ok(result)
     }
     pub(crate) fn instantiate(&self, class_name: &str, args: Vec<Val>) -> Result<Val, String> {
+        self.instantiate_kw(class_name, args, Vec::new())
+    }
+    pub(crate) fn instantiate_kw(
+        &self,
+        class_name: &str,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+    ) -> Result<Val, String> {
         if !self.classes.contains_key(class_name) {
             return Err(format!("unknown class '{class_name}'"));
         }
@@ -530,11 +639,28 @@ impl Vm {
         if let Some(init) = self.find_method(class_name, "init") {
             let mut call_args = vec![Val::Object(id)];
             call_args.extend(args);
-            let _ = self.call_def(init, call_args)?;
-        } else if !args.is_empty() {
+            let _ = self.call_def_kw(init, call_args, kwargs)?;
+        } else if !args.is_empty() || !kwargs.is_empty() {
             return Err(format!("{class_name} has no init method"));
         }
         Ok(Val::Object(id))
+    }
+    pub(crate) fn try_dunder(
+        &mut self,
+        id: u64,
+        method: &str,
+        args: Vec<Val>,
+    ) -> Result<Option<Val>, String> {
+        let class_name = {
+            let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+            heap.get(&id).ok_or("dangling object")?.class_name.clone()
+        };
+        let Some(def) = self.find_method_cached(&class_name, method) else {
+            return Ok(None);
+        };
+        let mut call_args = vec![Val::Object(id)];
+        call_args.extend(args);
+        Ok(Some(self.call_def(def, call_args)?))
     }
     pub(crate) fn callable_def(&self, value: &Val) -> Result<(String, FunctionDef), String> {
         let name = match value {
@@ -562,24 +688,291 @@ impl Vm {
         self.execute().map(|_| ())
     }
     pub(crate) fn print_val(&self, args: &[Val]) -> Result<Val, String> {
-        let rendered = args.iter().map(Val::show).collect::<Vec<_>>().join(" ");
+        self.print_val_opts(args, " ", "\n")
+    }
+    pub(crate) fn print_val_opts(&self, args: &[Val], sep: &str, end: &str) -> Result<Val, String> {
+        let rendered = args.iter().map(Val::show).collect::<Vec<_>>().join(sep);
         if let Some(ref dbg) = self.debugger {
-            dbg.emit_output(&rendered);
-        } else {
+            dbg.emit_output(&format!("{rendered}{}", end.trim_end_matches('\n')));
+        } else if end == "\n" {
             println!("{rendered}");
+        } else {
+            use std::io::Write;
+            print!("{rendered}{end}");
+            let _ = std::io::stdout().flush();
         }
         Ok(Val::Null)
     }
-    pub(crate) fn len_val(&self, args: &[Val]) -> Result<Val, String> {
+    pub(crate) fn len_val(&mut self, args: &[Val]) -> Result<Val, String> {
         if args.len() != 1 {
             return Err("len expects 1 argument".into());
         }
         Ok(match &args[0] {
             Val::Str(s) => Val::Num(s.chars().count() as f64),
             Val::List(v) => Val::Num(v.len() as f64),
+            Val::Map(v) if crate::py_bridge::is_py_handle(&args[0]) => {
+                crate::py_bridge::py_call_method(&args[0], "__len__", &[], None)?
+            }
             Val::Map(v) => Val::Num(v.len() as f64),
+            Val::Object(id) => {
+                if let Some(val) = self.try_dunder(*id, "__len__", vec![])? {
+                    val
+                } else {
+                    return Err("len supports String/List/Map or Object with __len__".into());
+                }
+            }
             _ => return Err("len supports String/List/Map".into()),
         })
+    }
+    pub(crate) fn show_val_runtime(&mut self, val: &Val) -> Result<String, String> {
+        match val {
+            Val::Object(id) => {
+                if let Some(res) = self.try_dunder(*id, "__str__", vec![])? {
+                    return Ok(res.show());
+                }
+                Ok(val.show())
+            }
+            Val::Map(_) if crate::py_bridge::is_py_handle(val) => crate::py_bridge::py_str(val),
+            _ => Ok(val.show()),
+        }
+    }
+    pub(crate) fn iterable_values(&self, val: &Val) -> Result<Vec<Val>, String> {
+        match val {
+            Val::List(v) => Ok(v.clone()),
+            Val::Str(s) => Ok(s.chars().map(|c| Val::Str(c.to_string())).collect()),
+            Val::Map(pairs) => {
+                if crate::py_bridge::is_py_handle(val) {
+                    let built = crate::py_bridge::py_import("builtins")?;
+                    let res = crate::py_bridge::py_call_method(
+                        &built,
+                        "list",
+                        std::slice::from_ref(val),
+                        None,
+                    )?;
+                    return match res {
+                        Val::List(v) => Ok(v),
+                        _ => Ok(vec![res]),
+                    };
+                }
+                Ok(pairs.iter().map(|(k, _)| k.clone()).collect())
+            }
+            Val::Generator(id) => collect_generator(*id),
+            _ => Err("value is not iterable".into()),
+        }
+    }
+    pub(crate) fn invoke_callable_sync(
+        &mut self,
+        callee: &Val,
+        args: Vec<Val>,
+    ) -> Result<Val, String> {
+        if crate::py_bridge::is_py_handle(callee) {
+            return crate::py_bridge::py_call(callee, &args, None);
+        }
+        if let Val::Object(id) = callee {
+            if let Some(res) = self.try_dunder(*id, "__call__", args.clone())? {
+                return Ok(res);
+            }
+            return Err("object has no __call__ method".into());
+        }
+        let (_, def) = self.callable_def(callee)?;
+        self.call_def(def, args)
+    }
+    pub(crate) fn sorted_with_opts(
+        &mut self,
+        mut items: Vec<Val>,
+        key_fn: Option<Val>,
+        reverse: bool,
+    ) -> Result<Vec<Val>, String> {
+        let mut pairs: Vec<(Val, usize)> = Vec::with_capacity(items.len());
+        if let Some(kfn) = key_fn {
+            for (i, item) in items.iter().enumerate() {
+                let k = self.invoke_callable_sync(&kfn, vec![item.clone()])?;
+                pairs.push((k, i));
+            }
+        } else {
+            for (i, item) in items.iter().enumerate() {
+                pairs.push((item.clone(), i));
+            }
+        }
+        pairs.sort_by(|(a, _), (b, _)| {
+            let ord = match (a, b) {
+                (Val::Num(x), Val::Num(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+                (Val::Str(x), Val::Str(y)) => x.cmp(y),
+                _ => a.show().cmp(&b.show()),
+            };
+            if reverse { ord.reverse() } else { ord }
+        });
+        let mut out = Vec::with_capacity(pairs.len());
+        for (_, idx) in pairs {
+            out.push(std::mem::replace(&mut items[idx], Val::Null));
+        }
+        Ok(out)
+    }
+    fn pop_kw(kwargs: &mut Vec<(String, Val)>, key: &str) -> Option<Val> {
+        kwargs
+            .iter()
+            .position(|(k, _)| k == key)
+            .map(|idx| kwargs.remove(idx).1)
+    }
+    pub(crate) fn call_builtin_kw(
+        &mut self,
+        n: &str,
+        pos: Vec<Val>,
+        mut kwargs: Vec<(String, Val)>,
+    ) -> Result<Option<Val>, String> {
+        if kwargs.is_empty() {
+            return self.call_builtin(n, pos);
+        }
+        let out = match n {
+            "print" => {
+                let sep = match Self::pop_kw(&mut kwargs, "sep") {
+                    Some(Val::Str(s)) => s,
+                    Some(Val::Null) | None => " ".into(),
+                    Some(_) => return Err("print sep must be String".into()),
+                };
+                let end = match Self::pop_kw(&mut kwargs, "end") {
+                    Some(Val::Str(s)) => s,
+                    Some(Val::Null) | None => "\n".into(),
+                    Some(_) => return Err("print end must be String".into()),
+                };
+                if let Some((bad, _)) = kwargs.first() {
+                    return Err(format!("print got unexpected keyword argument '{bad}'"));
+                }
+                self.print_val_opts(&pos, &sep, &end)?
+            }
+            "sorted" | "sort" => {
+                if pos.len() != 1 {
+                    return Err("sorted expects iterable as first positional argument".into());
+                }
+                let key_fn = Self::pop_kw(&mut kwargs, "key").filter(|v| !matches!(v, Val::Null));
+                let reverse = match Self::pop_kw(&mut kwargs, "reverse") {
+                    Some(v) => v.truthy(),
+                    None => false,
+                };
+                if let Some((bad, _)) = kwargs.first() {
+                    return Err(format!("sorted got unexpected keyword argument '{bad}'"));
+                }
+                let items = self.iterable_values(&pos[0])?;
+                Val::List(self.sorted_with_opts(items, key_fn, reverse)?)
+            }
+            "enumerate" => {
+                if pos.len() != 1 {
+                    return Err("enumerate expects iterable as first positional argument".into());
+                }
+                let start = match Self::pop_kw(&mut kwargs, "start") {
+                    Some(Val::Num(s)) => s as i64,
+                    None => 0,
+                    _ => return Err("enumerate start must be Number".into()),
+                };
+                if let Some((bad, _)) = kwargs.first() {
+                    return Err(format!("enumerate got unexpected keyword argument '{bad}'"));
+                }
+                let items = self.iterable_values(&pos[0])?;
+                Val::List(
+                    items
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| Val::List(vec![Val::Num((start + i as i64) as f64), v]))
+                        .collect(),
+                )
+            }
+            "round" => {
+                if pos.len() != 1 {
+                    return Err("round expects number as first positional argument".into());
+                }
+                let ndigits = match Self::pop_kw(&mut kwargs, "ndigits") {
+                    Some(Val::Num(d)) => d as i32,
+                    Some(Val::Null) | None => 0,
+                    _ => return Err("round ndigits must be Number".into()),
+                };
+                if let Some((bad, _)) = kwargs.first() {
+                    return Err(format!("round got unexpected keyword argument '{bad}'"));
+                }
+                let Val::Num(x) = pos[0] else {
+                    return Err("round expects Number".into());
+                };
+                if ndigits <= 0 {
+                    let scale = 10f64.powi(-ndigits);
+                    Val::Num((x / scale).round() * scale)
+                } else {
+                    let scale = 10f64.powi(ndigits);
+                    Val::Num((x * scale).round() / scale)
+                }
+            }
+            "pow" => {
+                if pos.len() != 2 {
+                    return Err("pow expects base, exp".into());
+                }
+                let mod_v = Self::pop_kw(&mut kwargs, "mod").filter(|v| !matches!(v, Val::Null));
+                if let Some((bad, _)) = kwargs.first() {
+                    return Err(format!("pow got unexpected keyword argument '{bad}'"));
+                }
+                let (Val::Num(b), Val::Num(e)) = (&pos[0], &pos[1]) else {
+                    return Err("pow expects Numbers".into());
+                };
+                if let Some(Val::Num(m)) = mod_v {
+                    if m == 0.0 {
+                        return Err("pow modulus cannot be zero".into());
+                    }
+                    Val::Num(b.powf(*e) % m)
+                } else {
+                    Val::Num(b.powf(*e))
+                }
+            }
+            "min" | "max" => {
+                if pos.is_empty() {
+                    return Err(format!("{n} expects iterable or items"));
+                }
+                let key_fn = Self::pop_kw(&mut kwargs, "key").filter(|v| !matches!(v, Val::Null));
+                if let Some((bad, _)) = kwargs.first() {
+                    return Err(format!("{n} got unexpected keyword argument '{bad}'"));
+                }
+                let items = if pos.len() == 1 {
+                    self.iterable_values(&pos[0])?
+                } else {
+                    pos
+                };
+                if items.is_empty() {
+                    return Err(format!("{n} arg is an empty sequence"));
+                }
+                let sorted = self.sorted_with_opts(items, key_fn, n == "max")?;
+                sorted.into_iter().next().unwrap()
+            }
+            "py_call" => {
+                if pos.is_empty() {
+                    return Err("py_call expects callable".into());
+                }
+                let fn_val = &pos[0];
+                let call_args = match pos.get(1) {
+                    Some(Val::List(xs)) if pos.len() == 2 && !kwargs.is_empty() => xs.clone(),
+                    _ => pos[1..].to_vec(),
+                };
+                let kw_map = Val::Map(kwargs.into_iter().map(|(k, v)| (Val::Str(k), v)).collect());
+                crate::py_bridge::py_call(fn_val, &call_args, Some(&kw_map))?
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(out))
+    }
+    pub(crate) fn repr_val_runtime(&mut self, val: &Val) -> Result<String, String> {
+        match val {
+            Val::Str(s) => Ok(format!("{s:?}")),
+            Val::Object(id) => {
+                if let Some(res) = self.try_dunder(*id, "__repr__", vec![])? {
+                    return Ok(res.show());
+                }
+                Ok(val.show())
+            }
+            Val::Map(_) if crate::py_bridge::is_py_handle(val) => crate::py_bridge::py_repr(val),
+            Val::List(xs) => {
+                let mut parts = Vec::with_capacity(xs.len());
+                for x in xs {
+                    parts.push(self.repr_val_runtime(x)?);
+                }
+                Ok(format!("[{}]", parts.join(", ")))
+            }
+            _ => Ok(val.show()),
+        }
     }
     pub(crate) fn type_of_val(&self, args: &[Val]) -> Result<Val, String> {
         if args.len() != 1 {
@@ -1344,6 +1737,12 @@ impl Vm {
             Op::Add => {
                 let b = self.pop()?;
                 let a = self.pop()?;
+                if let Val::Object(id) = &a {
+                    if let Some(res) = self.try_dunder(*id, "__add__", vec![b.clone()])? {
+                        self.stack.push(res);
+                        return Ok(None);
+                    }
+                }
                 self.stack.push(match (a, b) {
                     (Val::Num(x), Val::Num(y)) => Val::Num(x + y),
                     (Val::Str(x), Val::Str(y)) => Val::Str(x + &y),
@@ -1354,10 +1753,29 @@ impl Vm {
                     _ => return Err("invalid '+' operands".into()),
                 });
             }
-            Op::Sub => self.bin_num(|a, b| a - b)?,
+            Op::Sub => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                if let Val::Object(id) = &a {
+                    if let Some(res) = self.try_dunder(*id, "__sub__", vec![b.clone()])? {
+                        self.stack.push(res);
+                        return Ok(None);
+                    }
+                }
+                match (a, b) {
+                    (Val::Num(x), Val::Num(y)) => self.stack.push(Val::Num(x - y)),
+                    _ => return Err("numeric operation requires numbers".into()),
+                }
+            }
             Op::Mul => {
                 let b = self.pop()?;
                 let a = self.pop()?;
+                if let Val::Object(id) = &a {
+                    if let Some(res) = self.try_dunder(*id, "__mul__", vec![b.clone()])? {
+                        self.stack.push(res);
+                        return Ok(None);
+                    }
+                }
                 self.stack.push(match (a, b) {
                     (Val::Num(x), Val::Num(y)) => Val::Num(x * y),
                     (Val::Str(s), Val::Num(n)) | (Val::Num(n), Val::Str(s)) => {
@@ -1380,11 +1798,23 @@ impl Vm {
             Op::Eq => {
                 let b = self.pop()?;
                 let a = self.pop()?;
+                if let Val::Object(id) = &a {
+                    if let Some(res) = self.try_dunder(*id, "__eq__", vec![b.clone()])? {
+                        self.stack.push(Val::Bool(res.truthy()));
+                        return Ok(None);
+                    }
+                }
                 self.stack.push(Val::Bool(a == b));
             }
             Op::Ne => {
                 let b = self.pop()?;
                 let a = self.pop()?;
+                if let Val::Object(id) = &a {
+                    if let Some(res) = self.try_dunder(*id, "__eq__", vec![b.clone()])? {
+                        self.stack.push(Val::Bool(!res.truthy()));
+                        return Ok(None);
+                    }
+                }
                 self.stack.push(Val::Bool(a != b));
             }
             Op::Lt | Op::Le | Op::Gt | Op::Ge => {
@@ -1417,6 +1847,17 @@ impl Vm {
             Op::Index => {
                 let key = self.pop()?;
                 let obj = self.pop()?;
+                if crate::py_bridge::is_py_handle(&obj) {
+                    let v = crate::py_bridge::py_getitem(&obj, &key)?;
+                    self.stack.push(v);
+                    return Ok(None);
+                }
+                if let Val::Object(id) = &obj {
+                    if let Some(v) = self.try_dunder(*id, "__getitem__", vec![key.clone()])? {
+                        self.stack.push(v);
+                        return Ok(None);
+                    }
+                }
                 let value = match (obj, key) {
                     (Val::List(v), Val::Num(n)) => {
                         let raw = n as isize;
@@ -1450,6 +1891,20 @@ impl Vm {
                 let value = self.pop()?;
                 let key = self.pop()?;
                 let obj = self.pop()?;
+                if crate::py_bridge::is_py_handle(&obj) {
+                    let _ = crate::py_bridge::py_setitem(&obj, &key, &value)?;
+                    self.stack.push(obj);
+                    return Ok(None);
+                }
+                if let Val::Object(id) = &obj {
+                    if self
+                        .try_dunder(*id, "__setitem__", vec![key.clone(), value.clone()])?
+                        .is_some()
+                    {
+                        self.stack.push(obj);
+                        return Ok(None);
+                    }
+                }
                 let updated = match (obj, key) {
                     (Val::List(mut items), Val::Num(n)) => {
                         if n.fract() != 0.0 {
@@ -1478,6 +1933,11 @@ impl Vm {
             }
             Op::GetMember(name) => {
                 let obj = self.pop()?;
+                if crate::py_bridge::is_py_handle(&obj) {
+                    let v = crate::py_bridge::py_get(&obj, &name)?;
+                    self.stack.push(v);
+                    return Ok(None);
+                }
                 let value = match obj {
                     Val::Object(id) => {
                         let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
@@ -1499,6 +1959,10 @@ impl Vm {
             Op::SetMember(name) => {
                 let value = self.pop()?;
                 let obj = self.pop()?;
+                if crate::py_bridge::is_py_handle(&obj) {
+                    let _ = crate::py_bridge::py_set(&obj, &name, &value)?;
+                    return Ok(None);
+                }
                 match obj {
                     Val::Object(id) => {
                         let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
@@ -1516,6 +1980,9 @@ impl Vm {
                 args.reverse();
                 let receiver = self.pop()?;
                 let value = match receiver {
+                    Val::Map(_) if crate::py_bridge::is_py_handle(&receiver) => {
+                        crate::py_bridge::py_call_method(&receiver, &name, &args, None)?
+                    }
                     Val::Object(id) => {
                         let class_name = {
                             let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
@@ -1529,12 +1996,17 @@ impl Vm {
                         self.invoke_in_execute(method, call_args)?;
                         return Ok(None);
                     }
-                    Val::Map(pairs) => {
+                    Val::Map(mut pairs) => {
                         if let Some((_, member)) =
                             pairs.iter().find(|(k, _)| *k == Val::Str(name.clone()))
                         {
                             if let Ok((_, def)) = self.callable_def(member) {
                                 self.invoke_in_execute(def, args)?;
+                                return Ok(None);
+                            }
+                            if crate::py_bridge::is_py_handle(member) {
+                                let res = crate::py_bridge::py_call(member, &args, None)?;
+                                self.stack.push(res);
                                 return Ok(None);
                             }
                         }
@@ -1557,6 +2029,51 @@ impl Vm {
                                     .map(|(_, v)| v.clone())
                                     .unwrap_or_else(|| args.get(1).cloned().unwrap_or(Val::Null))
                             }
+                            "pop" => {
+                                if args.is_empty() || args.len() > 2 {
+                                    return Err("map.pop expects (key[, default])".into());
+                                }
+                                if let Some(pos) = pairs.iter().position(|(k, _)| *k == args[0]) {
+                                    pairs.remove(pos).1
+                                } else if args.len() == 2 {
+                                    args[1].clone()
+                                } else {
+                                    return Err("map.pop key not found".into());
+                                }
+                            }
+                            "update" => {
+                                if args.len() != 1 {
+                                    return Err("map.update expects Map".into());
+                                }
+                                if let Val::Map(other) = &args[0] {
+                                    for (k, v) in other {
+                                        if let Some((_, ex)) =
+                                            pairs.iter_mut().find(|(ek, _)| ek == k)
+                                        {
+                                            *ex = v.clone();
+                                        } else {
+                                            pairs.push((k.clone(), v.clone()));
+                                        }
+                                    }
+                                    Val::Map(pairs)
+                                } else {
+                                    return Err("map.update expects Map".into());
+                                }
+                            }
+                            "setdefault" => {
+                                if args.is_empty() || args.len() > 2 {
+                                    return Err("map.setdefault expects (key[, default])".into());
+                                }
+                                if let Some((_, existing)) =
+                                    pairs.iter().find(|(k, _)| *k == args[0])
+                                {
+                                    existing.clone()
+                                } else {
+                                    args.get(1).cloned().unwrap_or(Val::Null)
+                                }
+                            }
+                            "clear" => Val::Map(Vec::new()),
+                            "copy" => Val::Map(pairs),
                             "has" | "contains" => {
                                 if args.len() != 1 {
                                     return Err("map.has expects 1 argument".into());
@@ -1609,22 +2126,82 @@ impl Vm {
                             }
                             _ => return Err("str.find expects String".into()),
                         },
+                        "rfind" => match args.first() {
+                            Some(Val::Str(sub)) => {
+                                Val::Num(s.rfind(sub).map(|i| i as f64).unwrap_or(-1.0))
+                            }
+                            _ => return Err("str.rfind expects String".into()),
+                        },
                         "count" => match args.first() {
                             Some(Val::Str(sub)) => Val::Num(s.matches(sub).count() as f64),
                             _ => return Err("str.count expects String".into()),
                         },
                         "join" => match args.first() {
-                            Some(Val::List(items)) => {
+                            Some(val) => {
+                                let items = self.iterable_values(val)?;
                                 Val::Str(items.iter().map(Val::show).collect::<Vec<_>>().join(&s))
                             }
-                            _ => return Err("str.join expects List".into()),
+                            None => return Err("str.join expects iterable".into()),
                         },
                         "chars" => Val::List(s.chars().map(|c| Val::Str(c.to_string())).collect()),
+                        "splitlines" => {
+                            Val::List(s.lines().map(|l| Val::Str(l.to_string())).collect())
+                        }
+                        "capitalize" => {
+                            let mut chars = s.chars();
+                            match chars.next() {
+                                None => Val::Str(String::new()),
+                                Some(first) => {
+                                    let head: String = first.to_uppercase().collect();
+                                    let tail = chars.as_str().to_lowercase();
+                                    Val::Str(format!("{head}{tail}"))
+                                }
+                            }
+                        }
+                        "title" => {
+                            let mut out = String::with_capacity(s.len());
+                            let mut cap_next = true;
+                            for c in s.chars() {
+                                if c.is_alphabetic() {
+                                    if cap_next {
+                                        out.extend(c.to_uppercase());
+                                        cap_next = false;
+                                    } else {
+                                        out.extend(c.to_lowercase());
+                                    }
+                                } else {
+                                    out.push(c);
+                                    cap_next = true;
+                                }
+                            }
+                            Val::Str(out)
+                        }
+                        "zfill" => {
+                            let width = match args.first() {
+                                Some(Val::Num(n)) => (*n).max(0.0) as usize,
+                                _ => return Err("str.zfill expects width Number".into()),
+                            };
+                            let char_len = s.chars().count();
+                            if char_len >= width {
+                                Val::Str(s)
+                            } else if let Some(rest) = s.strip_prefix(['+', '-']) {
+                                let sign = &s[..1];
+                                Val::Str(format!("{sign}{}{rest}", "0".repeat(width - char_len)))
+                            } else {
+                                Val::Str(format!("{}{s}", "0".repeat(width - char_len)))
+                            }
+                        }
                         "isdigit" => {
                             Val::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
                         }
                         "isalpha" => {
                             Val::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
+                        }
+                        "isalnum" => {
+                            Val::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphanumeric()))
+                        }
+                        "isspace" => {
+                            Val::Bool(!s.is_empty() && s.chars().all(|c| c.is_whitespace()))
                         }
                         "len" => Val::Num(s.chars().count() as f64),
                         _ => return Err(format!("unknown String method '{name}'")),
@@ -1745,21 +2322,249 @@ impl Vm {
                     let v = self.instantiate(&n, a)?;
                     self.stack.push(v);
                 } else {
-                    let def = if let Some(Val::Function(target)) = self.get_var(&n) {
-                        if let Some(def) = self.funcs.get(&target).cloned() {
-                            def
-                        } else if let Some(def) = resolve_function_object(&target)? {
-                            def
-                        } else {
-                            return Err(format!("dangling function reference '{target}'"));
+                    match self.get_var(&n) {
+                        Some(Val::Function(target)) => {
+                            let def = if let Some(def) = self.funcs.get(&target).cloned() {
+                                def
+                            } else if let Some(def) = resolve_function_object(&target)? {
+                                def
+                            } else {
+                                return Err(format!("dangling function reference '{target}'"));
+                            };
+                            self.invoke_in_execute(def, a)?;
                         }
-                    } else {
-                        self.funcs
-                            .get(&n)
-                            .cloned()
-                            .ok_or(format!("unknown function or class '{n}'"))?
+                        Some(val) if crate::py_bridge::is_py_handle(&val) => {
+                            let res = crate::py_bridge::py_call(&val, &a, None)?;
+                            self.stack.push(res);
+                        }
+                        Some(Val::Object(id)) => {
+                            let class_name = {
+                                let heap =
+                                    self.objects.lock().map_err(|_| "object heap poisoned")?;
+                                heap.get(&id).ok_or("dangling object")?.class_name.clone()
+                            };
+                            let method = self
+                                .find_method_cached(&class_name, "__call__")
+                                .ok_or(format!("'{class_name}' object is not callable"))?;
+                            let mut call_args = vec![Val::Object(id)];
+                            call_args.extend(a);
+                            self.invoke_in_execute(method, call_args)?;
+                        }
+                        _ => {
+                            let def = self
+                                .funcs
+                                .get(&n)
+                                .cloned()
+                                .ok_or(format!("unknown function or class '{n}'"))?;
+                            self.invoke_in_execute(def, a)?;
+                        }
+                    }
+                }
+            }
+            Op::CallExpr(k) => {
+                let mut a = Vec::with_capacity(k);
+                for _ in 0..k {
+                    a.push(self.pop()?);
+                }
+                a.reverse();
+                let callee = self.pop()?;
+                if crate::py_bridge::is_py_handle(&callee) {
+                    let res = crate::py_bridge::py_call(&callee, &a, None)?;
+                    self.stack.push(res);
+                } else if let Val::Object(id) = callee {
+                    let class_name = {
+                        let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                        heap.get(&id).ok_or("dangling object")?.class_name.clone()
                     };
+                    let method = self
+                        .find_method_cached(&class_name, "__call__")
+                        .ok_or(format!("'{class_name}' object is not callable"))?;
+                    let mut call_args = vec![Val::Object(id)];
+                    call_args.extend(a);
+                    self.invoke_in_execute(method, call_args)?;
+                } else {
+                    let (_, def) = self.callable_def(&callee)?;
                     self.invoke_in_execute(def, a)?;
+                }
+            }
+            Op::CallExt(kind, name, specs) => {
+                let mut raw_vals = Vec::with_capacity(specs.len());
+                for _ in 0..specs.len() {
+                    raw_vals.push(self.pop()?);
+                }
+                raw_vals.reverse();
+                let mut pos_args = Vec::new();
+                let mut kwargs: Vec<(String, Val)> = Vec::new();
+                for ((tag, kw_name), val) in specs.into_iter().zip(raw_vals) {
+                    match tag {
+                        0 => pos_args.push(val),
+                        1 => pos_args.extend(self.iterable_values(&val)?),
+                        2 => kwargs.push((kw_name, val)),
+                        3 => {
+                            let Val::Map(pairs) = val else {
+                                return Err("** mapping argument must be Map".into());
+                            };
+                            for (k, v) in pairs {
+                                kwargs.push((k.show(), v));
+                            }
+                        }
+                        _ => return Err("bad CallExt argument spec".into()),
+                    }
+                }
+                match kind {
+                    0 => {
+                        if let Some(v) =
+                            self.call_builtin_kw(&name, pos_args.clone(), kwargs.clone())?
+                        {
+                            self.stack.push(v);
+                        } else if self.classes.contains_key(&name) {
+                            let v = self.instantiate_kw(&name, pos_args, kwargs)?;
+                            self.stack.push(v);
+                        } else {
+                            match self.get_var(&name) {
+                                Some(Val::Function(target)) => {
+                                    let def = if let Some(def) = self.funcs.get(&target).cloned() {
+                                        def
+                                    } else if let Some(def) = resolve_function_object(&target)? {
+                                        def
+                                    } else {
+                                        return Err(format!(
+                                            "dangling function reference '{target}'"
+                                        ));
+                                    };
+                                    self.invoke_in_execute_kw(def, pos_args, kwargs)?;
+                                }
+                                Some(val) if crate::py_bridge::is_py_handle(&val) => {
+                                    let kw_map = Val::Map(
+                                        kwargs.into_iter().map(|(k, v)| (Val::Str(k), v)).collect(),
+                                    );
+                                    let res =
+                                        crate::py_bridge::py_call(&val, &pos_args, Some(&kw_map))?;
+                                    self.stack.push(res);
+                                }
+                                Some(Val::Object(id)) => {
+                                    let class_name = {
+                                        let heap = self
+                                            .objects
+                                            .lock()
+                                            .map_err(|_| "object heap poisoned")?;
+                                        heap.get(&id).ok_or("dangling object")?.class_name.clone()
+                                    };
+                                    let method =
+                                        self.find_method_cached(&class_name, "__call__").ok_or(
+                                            format!("'{class_name}' object is not callable"),
+                                        )?;
+                                    let mut call_args = vec![Val::Object(id)];
+                                    call_args.extend(pos_args);
+                                    self.invoke_in_execute_kw(method, call_args, kwargs)?;
+                                }
+                                _ => {
+                                    let def = self
+                                        .funcs
+                                        .get(&name)
+                                        .cloned()
+                                        .ok_or(format!("unknown function or class '{name}'"))?;
+                                    self.invoke_in_execute_kw(def, pos_args, kwargs)?;
+                                }
+                            }
+                        }
+                    }
+                    1 => {
+                        let receiver = self.pop()?;
+                        if crate::py_bridge::is_py_handle(&receiver) {
+                            let kw_map = Val::Map(
+                                kwargs.into_iter().map(|(k, v)| (Val::Str(k), v)).collect(),
+                            );
+                            let res = crate::py_bridge::py_call_method(
+                                &receiver,
+                                &name,
+                                &pos_args,
+                                Some(&kw_map),
+                            )?;
+                            self.stack.push(res);
+                        } else if let Val::Object(id) = receiver {
+                            let class_name = {
+                                let heap =
+                                    self.objects.lock().map_err(|_| "object heap poisoned")?;
+                                heap.get(&id).ok_or("dangling object")?.class_name.clone()
+                            };
+                            let method = self
+                                .find_method_cached(&class_name, &name)
+                                .ok_or(format!("undefined method '{name}' on {class_name}"))?;
+                            let mut call_args = vec![Val::Object(id)];
+                            call_args.extend(pos_args);
+                            self.invoke_in_execute_kw(method, call_args, kwargs)?;
+                        } else if let Val::List(items) = receiver {
+                            if name == "sort" && pos_args.is_empty() {
+                                let mut kw = kwargs;
+                                let key_fn = Self::pop_kw(&mut kw, "key")
+                                    .filter(|v| !matches!(v, Val::Null));
+                                let reverse = match Self::pop_kw(&mut kw, "reverse") {
+                                    Some(v) => v.truthy(),
+                                    None => false,
+                                };
+                                if let Some((bad, _)) = kw.first() {
+                                    return Err(format!(
+                                        "list.sort got unexpected keyword argument '{bad}'"
+                                    ));
+                                }
+                                let sorted = self.sorted_with_opts(items, key_fn, reverse)?;
+                                self.stack.push(Val::List(sorted));
+                            } else {
+                                return Err(format!(
+                                    "List method '{name}' does not support keyword arguments"
+                                ));
+                            }
+                        } else if let Val::Map(pairs) = receiver {
+                            if let Some((_, member)) =
+                                pairs.iter().find(|(k, _)| *k == Val::Str(name.clone()))
+                            {
+                                if crate::py_bridge::is_py_handle(member) {
+                                    let kw_map = Val::Map(
+                                        kwargs.into_iter().map(|(k, v)| (Val::Str(k), v)).collect(),
+                                    );
+                                    let res = crate::py_bridge::py_call(
+                                        member,
+                                        &pos_args,
+                                        Some(&kw_map),
+                                    )?;
+                                    self.stack.push(res);
+                                } else {
+                                    let (_, def) = self.callable_def(member)?;
+                                    self.invoke_in_execute_kw(def, pos_args, kwargs)?;
+                                }
+                            } else {
+                                return Err(format!("undefined module member '{name}'"));
+                            }
+                        } else {
+                            return Err("keyword method call requires object/module/list".into());
+                        }
+                    }
+                    _ => {
+                        let callee = self.pop()?;
+                        if crate::py_bridge::is_py_handle(&callee) {
+                            let kw_map = Val::Map(
+                                kwargs.into_iter().map(|(k, v)| (Val::Str(k), v)).collect(),
+                            );
+                            let res = crate::py_bridge::py_call(&callee, &pos_args, Some(&kw_map))?;
+                            self.stack.push(res);
+                        } else if let Val::Object(id) = callee {
+                            let class_name = {
+                                let heap =
+                                    self.objects.lock().map_err(|_| "object heap poisoned")?;
+                                heap.get(&id).ok_or("dangling object")?.class_name.clone()
+                            };
+                            let method = self
+                                .find_method_cached(&class_name, "__call__")
+                                .ok_or(format!("'{class_name}' object is not callable"))?;
+                            let mut call_args = vec![Val::Object(id)];
+                            call_args.extend(pos_args);
+                            self.invoke_in_execute_kw(method, call_args, kwargs)?;
+                        } else {
+                            let (_, def) = self.callable_def(&callee)?;
+                            self.invoke_in_execute_kw(def, pos_args, kwargs)?;
+                        }
+                    }
                 }
             }
             Op::FunctionRef(name) => {

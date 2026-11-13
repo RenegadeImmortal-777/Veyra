@@ -3,6 +3,15 @@
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
 #[derive(Clone, Debug)]
+pub(crate) enum CallArg {
+    Pos(Expr),
+    Star(Expr),
+    Kw(String, Expr),
+    KwStar(Expr),
+}
+
+#[derive(Clone, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum Expr {
     Num(f64),
     Str(String),
@@ -18,9 +27,16 @@ pub(crate) enum Expr {
     Lambda(Vec<(String, Option<String>)>, Option<String>, Vec<Stmt>),
     ListComp(Box<Expr>, String, Box<Expr>, Option<Box<Expr>>),
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
+    ChainedCmp(Box<Expr>, Vec<(String, Expr)>),
     Unary(String, Box<Expr>),
     Bin(Box<Expr>, String, Box<Expr>),
     Call(String, Vec<Expr>),
+    CallExpr(Box<Expr>, Vec<Expr>),
+    CallExt {
+        callee: Box<Expr>,
+        method: Option<String>,
+        args: Vec<CallArg>,
+    },
 }
 #[derive(Clone, Debug)]
 pub(crate) enum Stmt {

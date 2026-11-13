@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 
-use crate::ast::{Expr, Stmt};
+use crate::ast::{CallArg, Expr, Stmt};
 use crate::bytecode::{Op, decode_bytecode, encode_bytecode};
 use crate::compiler::{CompiledDebug, Compiler};
 use crate::dap::DebugMap;
@@ -186,6 +186,35 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
             Expr::Call(_, args) => {
                 for a in args {
                     check_expr(a, scopes, errors)
+                }
+            }
+            Expr::CallExpr(callee, args) => {
+                check_expr(callee, scopes, errors);
+                for a in args {
+                    check_expr(a, scopes, errors);
+                }
+            }
+            Expr::CallExt {
+                callee,
+                method,
+                args,
+            } => {
+                if !(method.is_none() && matches!(&**callee, Expr::Var(_))) {
+                    check_expr(callee, scopes, errors);
+                }
+                for a in args {
+                    match a {
+                        CallArg::Pos(e)
+                        | CallArg::Star(e)
+                        | CallArg::Kw(_, e)
+                        | CallArg::KwStar(e) => check_expr(e, scopes, errors),
+                    }
+                }
+            }
+            Expr::ChainedCmp(first, links) => {
+                check_expr(first, scopes, errors);
+                for (_, rhs) in links {
+                    check_expr(rhs, scopes, errors);
                 }
             }
         }

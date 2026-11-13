@@ -205,21 +205,41 @@ impl Vm {
                 }
             }
             "pow" => {
-                if a.len() != 2 {
-                    return Err("pow expects base,exponent".into());
+                if a.len() < 2 || a.len() > 3 {
+                    return Err("pow expects base,exponent[,modulus]".into());
                 }
-                match (a[0].clone(), a[1].clone()) {
-                    (Val::Num(x), Val::Num(y)) => Val::Num(x.powf(y)),
+                match (a[0].clone(), a[1].clone(), a.get(2).cloned()) {
+                    (Val::Num(x), Val::Num(y), None) => Val::Num(x.powf(y)),
+                    (Val::Num(x), Val::Num(y), Some(Val::Num(m))) => {
+                        if m == 0.0 {
+                            return Err("pow modulus cannot be zero".into());
+                        }
+                        Val::Num(x.powf(y) % m)
+                    }
                     _ => return Err("pow expects Numbers".into()),
                 }
             }
             "round" => {
-                if a.len() != 1 {
-                    return Err("round expects number".into());
+                if a.is_empty() || a.len() > 2 {
+                    return Err("round expects number[, ndigits]".into());
                 }
-                match a[0] {
-                    Val::Num(n) => Val::Num(n.round()),
+                let n = match a[0] {
+                    Val::Num(n) => n,
                     _ => return Err("round expects Number".into()),
+                };
+                match a.get(1) {
+                    None => Val::Num(n.round()),
+                    Some(Val::Num(d)) => {
+                        let nd = *d as i32;
+                        if nd <= 0 {
+                            let scale = 10f64.powi(-nd);
+                            Val::Num((n / scale).round() * scale)
+                        } else {
+                            let scale = 10f64.powi(nd);
+                            Val::Num((n * scale).round() / scale)
+                        }
+                    }
+                    _ => return Err("round ndigits must be Number".into()),
                 }
             }
             "sqrt" => {

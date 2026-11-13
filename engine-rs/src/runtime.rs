@@ -41,7 +41,7 @@ pub(crate) fn function_objects() -> &'static Mutex<HashMap<String, FunctionDef>>
 pub(crate) fn namespace_module_ops(code: &mut [Op], local_names: &HashSet<String>, prefix: &str) {
     for op in code {
         match op {
-            Op::Call(name, _) | Op::FunctionRef(name) => {
+            Op::Call(name, _) | Op::FunctionRef(name) | Op::CallExt(0, name, _) => {
                 if local_names.contains(name) {
                     *name = format!("{prefix}{name}");
                 }

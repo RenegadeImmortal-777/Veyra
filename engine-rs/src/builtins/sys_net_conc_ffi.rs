@@ -757,6 +757,74 @@ impl Vm {
                 };
                 Val::Num(result)
             }
+            "py_available" => {
+                if !a.is_empty() {
+                    return Err("py_available expects 0 arguments".into());
+                }
+                Val::Bool(crate::py_bridge::py_available())
+            }
+            "py_import" => {
+                if a.len() != 1 {
+                    return Err("py_import expects module name String".into());
+                }
+                let Val::Str(name) = &a[0] else {
+                    return Err("py_import module name must be String".into());
+                };
+                crate::py_bridge::py_import(name)?
+            }
+            "py_call" => {
+                if a.is_empty() || a.len() > 3 {
+                    return Err("py_call expects (callable[, args[, kwargs]])".into());
+                }
+                let args = match a.get(1) {
+                    None | Some(Val::Null) => Vec::new(),
+                    Some(Val::List(xs)) => xs.clone(),
+                    _ => return Err("py_call args must be List".into()),
+                };
+                crate::py_bridge::py_call(&a[0], &args, a.get(2))?
+            }
+            "py_get" => {
+                if a.len() != 2 {
+                    return Err("py_get expects (py_obj, attr)".into());
+                }
+                let Val::Str(attr) = &a[1] else {
+                    return Err("py_get attr must be String".into());
+                };
+                crate::py_bridge::py_get(&a[0], attr)?
+            }
+            "py_set" => {
+                if a.len() != 3 {
+                    return Err("py_set expects (py_obj, attr, value)".into());
+                }
+                let Val::Str(attr) = &a[1] else {
+                    return Err("py_set attr must be String".into());
+                };
+                crate::py_bridge::py_set(&a[0], attr, &a[2])?
+            }
+            "py_dir" => {
+                if a.len() != 1 {
+                    return Err("py_dir expects py_obj".into());
+                }
+                crate::py_bridge::py_dir(&a[0])?
+            }
+            "py_eval" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("py_eval expects (expr[, locals])".into());
+                }
+                let Val::Str(expr) = &a[0] else {
+                    return Err("py_eval expr must be String".into());
+                };
+                crate::py_bridge::py_eval(expr, a.get(1))?
+            }
+            "py_exec" => {
+                if a.len() != 1 {
+                    return Err("py_exec expects Python source String".into());
+                }
+                let Val::Str(code) = &a[0] else {
+                    return Err("py_exec source must be String".into());
+                };
+                crate::py_bridge::py_exec(code)?
+            }
             _ => return Ok(None),
         };
         Ok(Some(v))

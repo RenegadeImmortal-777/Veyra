@@ -34,6 +34,7 @@ mod lsp;
 mod parser;
 mod pipeline;
 mod project;
+mod py_bridge;
 mod registry;
 mod runtime;
 mod server;
@@ -1873,9 +1874,8 @@ print("AOT_OUT", res);
             "unexpected native stdout: {stdout}"
         );
 
-        let async_err =
-            crate::aot::compile_source_to_rust("async fn f() { return 1; }").unwrap_err();
-        assert!(async_err.contains("async"));
+        let async_rust = crate::aot::compile_source_to_rust("async fn f() { return 1; }").unwrap();
+        assert!(async_rust.contains("store_task"));
 
         let proj_dir = dir.join("proj");
         fs::create_dir_all(proj_dir.join("src")).unwrap();
@@ -1904,6 +1904,262 @@ print("AOT_OUT", res);
         assert!(proj_out.status.success());
         assert_eq!(String::from_utf8_lossy(&proj_out.stdout).trim(), "PROJ 81");
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn python_parity_calls_kwargs_generators_and_dunders() {
+        let src = r#"
+fn make_adder(n) {
+    return lambda x: x + n;
+}
+let add5 = make_adder(5);
+let funcs = [make_adder(10), lambda z: z * 2];
+assert(make_adder(5)(3) == 8);
+assert(add5(7) == 12);
+assert(funcs[0](4) == 14);
+assert((lambda x: x * 3)(7) == 21);
+
+let evals = 0;
+fn bump(v) {
+    evals = evals + 1;
+    return v;
+}
+assert(0 <= bump(5) < 10);
+assert(evals == 1);
+assert(!(10 < bump(20) < 15));
+assert(evals == 2);
+
+fn cfg(a, b=10, *rest, **kw) {
+    return [a, b, len(rest), kw["tag"], kw["extra"]];
+}
+let res = cfg(1, 20, 30, 40, tag="v1", extra=99);
+assert(res == [1, 20, 2, "v1", 99]);
+let extra_kw = {"tag": "spread", "extra": 77};
+assert(cfg(2, *[8, 9], **extra_kw) == [2, 8, 1, "spread", 77]);
+
+let ev_sum = sum(x * x for x in range(6) if x % 2 == 0);
+assert(ev_sum == 20);
+let lazy = (x + 10 for x in range(4));
+assert(next(lazy) == 10);
+assert(collect(lazy) == [11, 12, 13]);
+
+class Vec2 {
+    fn init(self, x, y) {
+        self.x = x;
+        self.y = y;
+    }
+    fn __add__(self, o) {
+        return Vec2(self.x + o.x, self.y + o.y);
+    }
+    fn __sub__(self, o) {
+        return Vec2(self.x - o.x, self.y - o.y);
+    }
+    fn __mul__(self, k) {
+        return Vec2(self.x * k, self.y * k);
+    }
+    fn __eq__(self, o) {
+        return self.x == o.x and self.y == o.y;
+    }
+    fn __str__(self) {
+        return f"V({self.x},{self.y})";
+    }
+    fn __repr__(self) {
+        return f"Vec2({self.x}, {self.y})";
+    }
+    fn __len__(self) {
+        return 2;
+    }
+    fn __call__(self, dx, dy=0) {
+        return Vec2(self.x + dx, self.y + dy);
+    }
+    fn __getitem__(self, i) {
+        return self.x if i == 0 else self.y;
+    }
+    fn __setitem__(self, i, val) {
+        if i == 0 { self.x = val; } else { self.y = val; }
+    }
+}
+
+let a = Vec2(1, 2);
+let b = Vec2(3, 4);
+let c = a + b;
+assert(c == Vec2(4, 6));
+assert((b - a) == Vec2(2, 2));
+assert((a * 3) == Vec2(3, 6));
+assert(str(c) == "V(4,6)");
+assert(repr(c) == "Vec2(4, 6)");
+assert(len(c) == 2);
+assert(c(5, dy=1) == Vec2(9, 7));
+assert(c[0] == 4 and c[1] == 6);
+c[0] = 42;
+assert(c[0] == 42);
+assert(callable(c) and callable(make_adder) and !callable(42));
+assert(hasattr(a, "x") and getattr(a, "x") == 1);
+setattr(a, "z", 99);
+assert(getattr(a, "z") == 99 and getattr(a, "missing", "fallback") == "fallback");
+
+assert(divmod(17, 5) == [3, 2]);
+assert(divmod(-7, 3) == [-3, 2]);
+assert(round(3.14159, 2) == 3.14);
+assert(pow(2, 10, 100) == 24);
+let words = ["pear", "a", "kiwi", "banana"];
+assert(sorted(words, key=lambda s: len(s), reverse=true) == ["banana", "pear", "kiwi", "a"]);
+assert(min(words, key=lambda s: len(s)) == "a");
+assert(max(words, key=lambda s: len(s)) == "banana");
+assert(enumerate(["a", "b"], start=1) == [[1, "a"], [2, "b"]]);
+assert(zip([1, 2], ["x", "y"], [true, false]) == [[1, "x", true], [2, "y", false]]);
+assert("-".join(str(n) for n in range(3)) == "0-1-2");
+assert("hello world".title() == "Hello World");
+assert("42".zfill(5) == "00042");
+assert("banana".rfind("a") == 5);
+assert("abc123".isalnum() and "   ".isspace());
+
+let m = {"a": 1, "b": 2};
+m.update({"b": 20, "c": 30});
+assert(m.pop("a") == 1);
+assert(m.setdefault("d", 40) == 40);
+assert(m.copy()["c"] == 30);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+    }
+
+    #[test]
+    fn python_bridge_vm_interop() {
+        let src = r#"
+assert(py_available());
+let m = py_import("math");
+assert(m.sqrt(144) == 12);
+assert(round(m.pi, 4) == 3.1416);
+assert(py_call(m.pow, [2, 6]) == 64);
+
+let builtins = py_import("builtins");
+assert(callable(m.sqrt));
+
+let collections = py_import("collections");
+let cnt = collections.Counter(["x", "y", "x", "z", "x"]);
+assert(cnt["x"] == 3);
+cnt["w"] = 7;
+assert(cnt["w"] == 7);
+assert(cnt.most_common(1)[0][0] == "w" or cnt.most_common(1)[0][0] == "x");
+
+py_exec("class VyTestBox:\n    def __init__(self, v):\n        self.v = v\n    def bump(self, delta=1):\n        return self.v + delta\n");
+let box = py_eval("VyTestBox(10)");
+assert(box.v == 10);
+box.v = 25;
+assert(box.v == 25);
+assert(box.bump(delta=7) == 32);
+assert(hasattr(box, "v") and getattr(box, "v") == 25);
+setattr(box, "label", "py");
+assert(box.label == "py");
+assert(contains(py_dir(box), "bump"));
+assert(repr(box) != "");
+"#;
+        assert_eq!(run_source(src), Ok(()));
+    }
+
+    #[test]
+    fn aot_full_python_parity_async_generators_dunders_and_py_bridge() {
+        let src = r#"
+fn make_mul(k) {
+    return lambda x: x * k;
+}
+
+async fn square_async(n: Int) -> Int {
+    return n * n;
+}
+
+class AsyncWorker {
+    async fn plus(self, x: Int) -> Int {
+        return x + 10;
+    }
+}
+
+fn gen_up(n) {
+    let i = 0;
+    while i < n {
+        yield i * 2;
+        i = i + 1;
+    }
+}
+
+class Box {
+    fn init(self, n) {
+        self.n = n;
+    }
+    fn __add__(self, o) {
+        return Box(self.n + o.n);
+    }
+    fn __str__(self) {
+        return f"Box({self.n})";
+    }
+    fn __len__(self) {
+        return self.n;
+    }
+    fn __call__(self, offset=0, **kw) {
+        return self.n + offset + kw["bonus"];
+    }
+}
+
+let t1 = square_async(3);
+let t2 = square_async(4);
+let async_vals = gather([t1, t2]);
+let aw = AsyncWorker();
+let aw_res = await aw.plus(5);
+
+let g = gen_up(4);
+let g_first = next(g);
+let g_rest = collect(g);
+let g_sum = sum(x * x for x in range(6) if x % 2 == 0);
+
+let hits = 0;
+fn touch(x) {
+    hits = hits + 1;
+    return x;
+}
+let chain_ok = (1 < touch(3) < 5) and hits == 1;
+
+let bx = Box(5) + Box(7);
+let bx_called = bx(3, bonus=2);
+let words = ["bb", "a", "cccc"];
+let sorted_words = sorted(words, key=lambda s: len(s), reverse=true);
+let dm = divmod(-7, 3);
+
+let m = py_import("math");
+let py_root = m.sqrt(81);
+let py_val = py_eval("sum([10, 20, 30])");
+
+print("PARITY_OUT", async_vals, aw_res, make_mul(4)(5), (lambda z: z + 1)(41), g_first, g_rest, g_sum, chain_ok, str(bx), len(bx), bx_called, sorted_words, dm, py_root, py_val);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("veyra_parity_aot_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let exe_path = dir.join(if cfg!(target_os = "windows") {
+            "parity.exe"
+        } else {
+            "parity"
+        });
+        let src_path = dir.join("parity.vy");
+        fs::write(&src_path, src).unwrap();
+
+        let built = crate::aot::compile_file_to_native(&src_path, Some(&exe_path)).unwrap();
+        let out = std::process::Command::new(&built).output().unwrap();
+        assert!(
+            out.status.success(),
+            "native parity stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let expected = "PARITY_OUT [9, 16] 15 20 42 0 [2, 4, 6] 20 true Box(12) 12 17 [cccc, bb, a] [-3, 2] 9 60";
+        assert!(
+            stdout.lines().any(|l| l.trim() == expected),
+            "unexpected parity stdout: {stdout}"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }

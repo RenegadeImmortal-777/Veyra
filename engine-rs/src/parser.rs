@@ -2,7 +2,7 @@
 //
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
-use crate::ast::{Expr, Stmt};
+use crate::ast::{CallArg, Expr, Stmt};
 use crate::lexer::Tok;
 
 pub(crate) struct Parser {
@@ -473,7 +473,13 @@ impl Parser {
             };
         }
         self.eat(&Tok::Semi);
-        if let Expr::MethodCall(ref recv, ref mname, _) = e {
+        if let Expr::MethodCall(ref recv, ref mname, _)
+        | Expr::CallExt {
+            callee: ref recv,
+            method: Some(ref mname),
+            ..
+        } = e
+        {
             if let Expr::Var(var_name) = &**recv {
                 if matches!(
                     mname.as_str(),
@@ -485,6 +491,7 @@ impl Parser {
                         | "clear"
                         | "insert"
                         | "remove"
+                        | "update"
                 ) {
                     return Ok(Stmt::Assign(var_name.clone(), e));
                 }
@@ -497,7 +504,8 @@ impl Parser {
         let mut default_inits = vec![];
         if !self.eat(&Tok::Rp) {
             loop {
-                let is_vararg = self.eat(&Tok::Star);
+                let is_kwarg = self.eat(&Tok::StarStar);
+                let is_vararg = !is_kwarg && self.eat(&Tok::Star);
                 let param = match self.bump() {
                     Tok::Id(s) => s,
                     x => return Err(format!("expected parameter name, got {x:?}")),
@@ -510,7 +518,9 @@ impl Parser {
                 } else {
                     None
                 };
-                if self.eat(&Tok::Eq) {
+                if is_kwarg {
+                    param_type = Some("**".into());
+                } else if self.eat(&Tok::Eq) {
                     let def_expr = self.expr()?;
                     param_type = Some("?default".into());
                     default_inits.push(Stmt::If(
@@ -536,6 +546,121 @@ impl Parser {
             }
         }
         Ok((params, default_inits))
+    }
+    fn parse_generator_after_expr(&mut self, value_expr: Expr, close: Tok) -> Result<Expr, String> {
+        let name = match self.bump() {
+            Tok::Id(s) => s,
+            x => return Err(format!("expected comprehension variable, got {x:?}")),
+        };
+        let mut unpack_names = None;
+        if self.eat(&Tok::Comma) {
+            let mut names = vec![name.clone()];
+            loop {
+                match self.bump() {
+                    Tok::Id(s) => names.push(s),
+                    x => return Err(format!("expected comprehension variable, got {x:?}")),
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            unpack_names = Some(names);
+        }
+        self.need(&Tok::In, "expected 'in' in generator expression")?;
+        let iterable = self.logic_or()?;
+        let condition = if self.eat(&Tok::If) {
+            Some(self.logic_or()?)
+        } else {
+            None
+        };
+        self.need(&close, "expected ')' after generator expression")?;
+        let yield_stmt = Stmt::Yield(value_expr);
+        let inner = match condition {
+            Some(cond) => vec![Stmt::If(cond, vec![yield_stmt], vec![])],
+            None => vec![yield_stmt],
+        };
+        let for_stmt = if let Some(names) = unpack_names {
+            let tmp = format!("__gen_item_{}", self.i);
+            let mut prefix = Vec::with_capacity(names.len() + inner.len());
+            for (idx, n) in names.into_iter().enumerate() {
+                prefix.push(Stmt::Let(
+                    n,
+                    None,
+                    Expr::Index(
+                        Box::new(Expr::Var(tmp.clone())),
+                        Box::new(Expr::Num(idx as f64)),
+                    ),
+                    false,
+                ));
+            }
+            prefix.extend(inner);
+            Stmt::ForEach(tmp, iterable, prefix)
+        } else {
+            Stmt::ForEach(name, iterable, inner)
+        };
+        Ok(Expr::CallExpr(
+            Box::new(Expr::Lambda(vec![], None, vec![for_stmt])),
+            vec![],
+        ))
+    }
+    fn parse_call_args(&mut self) -> Result<(Vec<Expr>, Option<Vec<CallArg>>), String> {
+        if self.eat(&Tok::Rp) {
+            return Ok((vec![], None));
+        }
+        let mut args = vec![];
+        let mut has_ext = false;
+        let mut saw_kw = false;
+        loop {
+            if self.eat(&Tok::StarStar) {
+                has_ext = true;
+                saw_kw = true;
+                args.push(CallArg::KwStar(self.expr()?));
+            } else if self.eat(&Tok::Star) {
+                if saw_kw {
+                    return Err("iterable unpacking cannot follow keyword argument".into());
+                }
+                has_ext = true;
+                args.push(CallArg::Star(self.expr()?));
+            } else if matches!(self.cur(), Tok::Id(_)) && self.t.get(self.i + 1) == Some(&Tok::Eq) {
+                let kw = match self.bump() {
+                    Tok::Id(s) => s,
+                    _ => unreachable!(),
+                };
+                self.i += 1;
+                has_ext = true;
+                saw_kw = true;
+                args.push(CallArg::Kw(kw, self.expr()?));
+            } else {
+                if saw_kw {
+                    return Err("positional argument follows keyword argument".into());
+                }
+                let val = self.expr()?;
+                if args.is_empty() && self.eat(&Tok::For) {
+                    let gen_expr = self.parse_generator_after_expr(val, Tok::Rp)?;
+                    return Ok((vec![gen_expr], None));
+                }
+                args.push(CallArg::Pos(val));
+            }
+            if self.eat(&Tok::Rp) {
+                break;
+            }
+            self.need(&Tok::Comma, "expected ',' between arguments")?;
+            if self.eat(&Tok::Rp) {
+                break;
+            }
+        }
+        if !has_ext {
+            let pos = args
+                .into_iter()
+                .map(|a| match a {
+                    CallArg::Pos(e) => e,
+                    _ => unreachable!(),
+                })
+                .collect();
+            Ok((pos, None))
+        } else {
+            Ok((vec![], Some(args)))
+        }
     }
     fn expr(&mut self) -> Result<Expr, String> {
         let then_branch = self.logic_or()?;
@@ -605,16 +730,26 @@ impl Parser {
                 );
                 continue;
             }
-            let op = match self.cur() {
-                Tok::Lt => "<",
-                Tok::Le => "<=",
-                Tok::Gt => ">",
-                Tok::Ge => ">=",
-                _ => break,
+            let mut links = Vec::new();
+            while let Some(op) = match self.cur() {
+                Tok::Lt => Some("<"),
+                Tok::Le => Some("<="),
+                Tok::Gt => Some(">"),
+                Tok::Ge => Some(">="),
+                _ => None,
+            } {
+                self.i += 1;
+                let rhs = self.term()?;
+                links.push((op.to_string(), rhs));
             }
-            .to_string();
-            self.i += 1;
-            e = Expr::Bin(Box::new(e), op, Box::new(self.term()?));
+            if links.is_empty() {
+                break;
+            } else if links.len() == 1 {
+                let (op, rhs) = links.pop().unwrap();
+                e = Expr::Bin(Box::new(e), op, Box::new(rhs));
+            } else {
+                e = Expr::ChainedCmp(Box::new(e), links);
+            }
         }
         Ok(e)
     }
@@ -706,20 +841,32 @@ impl Parser {
                     x => return Err(format!("expected member name, got {x:?}")),
                 };
                 if self.eat(&Tok::Lp) {
-                    let mut args = vec![];
-                    if !self.eat(&Tok::Rp) {
-                        loop {
-                            args.push(self.expr()?);
-                            if self.eat(&Tok::Rp) {
-                                break;
-                            }
-                            self.need(&Tok::Comma, "expected ',' between arguments")?;
+                    let (pos, ext) = self.parse_call_args()?;
+                    e = if let Some(args) = ext {
+                        Expr::CallExt {
+                            callee: Box::new(e),
+                            method: Some(name),
+                            args,
                         }
-                    }
-                    e = Expr::MethodCall(Box::new(e), name, args);
+                    } else {
+                        Expr::MethodCall(Box::new(e), name, pos)
+                    };
                 } else {
                     e = Expr::Member(Box::new(e), name);
                 }
+                continue;
+            }
+            if self.eat(&Tok::Lp) {
+                let (pos, ext) = self.parse_call_args()?;
+                e = if let Some(args) = ext {
+                    Expr::CallExt {
+                        callee: Box::new(e),
+                        method: None,
+                        args,
+                    }
+                } else {
+                    Expr::CallExpr(Box::new(e), pos)
+                };
                 continue;
             }
             break;
@@ -775,17 +922,16 @@ impl Parser {
                     ));
                 }
                 if self.eat(&Tok::Lp) {
-                    let mut a = vec![];
-                    if !self.eat(&Tok::Rp) {
-                        loop {
-                            a.push(self.expr()?);
-                            if self.eat(&Tok::Rp) {
-                                break;
-                            }
-                            self.need(&Tok::Comma, "expected ','")?;
-                        }
+                    let (pos, ext) = self.parse_call_args()?;
+                    if let Some(args) = ext {
+                        Ok(Expr::CallExt {
+                            callee: Box::new(Expr::Var(n)),
+                            method: None,
+                            args,
+                        })
+                    } else {
+                        Ok(Expr::Call(n, pos))
                     }
-                    Ok(Expr::Call(n, a))
                 } else {
                     Ok(Expr::Var(n))
                 }
@@ -795,6 +941,9 @@ impl Parser {
                     return Ok(Expr::List(vec![]));
                 }
                 let first = self.expr()?;
+                if self.eat(&Tok::For) {
+                    return self.parse_generator_after_expr(first, Tok::Rp);
+                }
                 if self.eat(&Tok::Comma) {
                     let mut items = vec![first];
                     if !self.eat(&Tok::Rp) {
