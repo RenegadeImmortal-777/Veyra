@@ -170,8 +170,12 @@ pub(crate) fn test_project() -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn build_project() -> Result<(), String> {
+pub(crate) fn build_project(native: bool) -> Result<(), String> {
     let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    build_project_at(&root, native)
+}
+
+pub(crate) fn build_project_at(root: &Path, native: bool) -> Result<(), String> {
     let manifest_path = root.join("veyra.json");
     let manifest: JsonValue =
         serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
@@ -203,6 +207,16 @@ pub(crate) fn build_project() -> Result<(), String> {
         let bundled = load_source(entry_path.to_string_lossy().as_ref())?;
         let vybc = compile_to_vybc(&bundled)?;
         fs::write(dist.join("app.vybc"), vybc).map_err(|e| e.to_string())?;
+        if native {
+            let bin_name = if cfg!(target_os = "windows") {
+                format!("{name}.exe")
+            } else {
+                name.to_string()
+            };
+            crate::aot::compile_file_to_native(&entry_path, Some(&dist.join(bin_name)))?;
+        }
+    } else if native {
+        return Err(format!("missing entry file {}", entry_path.display()));
     }
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     fs::copy(

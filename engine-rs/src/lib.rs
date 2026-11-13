@@ -21,6 +21,7 @@ use serde_json::Value as JsonValue;
 
 pub const VERSION: &str = "12.0.0-sovereign";
 
+mod aot;
 mod ast;
 mod builtins;
 mod bytecode;
@@ -281,7 +282,32 @@ pub fn run_cli() -> ExitCode {
             };
             path.and_then(|p| doc_file(&p))
         }
-        Some("build") => build_project(),
+        Some("aot") => (|| -> Result<(), String> {
+            let mut input_arg: Option<PathBuf> = None;
+            let mut output_arg: Option<PathBuf> = None;
+            let mut idx = 2usize;
+            while idx < a.len() {
+                if a[idx] == "-o" || a[idx] == "--out" {
+                    let out = a.get(idx + 1).ok_or("missing output path after -o")?;
+                    output_arg = Some(PathBuf::from(out));
+                    idx += 2;
+                } else if input_arg.is_none() {
+                    input_arg = Some(PathBuf::from(&a[idx]));
+                    idx += 1;
+                } else if output_arg.is_none() {
+                    output_arg = Some(PathBuf::from(&a[idx]));
+                    idx += 1;
+                } else {
+                    return Err("usage: veyra aot [file.vy] [out_exe]".into());
+                }
+            }
+            let input = match input_arg {
+                Some(p) => p,
+                None => project_entry()?,
+            };
+            crate::aot::compile_file_to_native(&input, output_arg.as_deref()).map(|_| ())
+        })(),
+        Some("build") => build_project(a.iter().skip(2).any(|x| x == "--native")),
         Some("audit") => pkg_audit(),
         Some("serve") => {
             let dir = a
@@ -1674,5 +1700,210 @@ assert(sum_loop(100) == 4950);
         }
         assert!(saw_local_op);
         assert_eq!(run_vybc(&vybc), Ok(()));
+    }
+
+    #[test]
+    fn aot_compiles_and_matches_vm_semantics() {
+        let src = r#"
+const SCALE = 2;
+
+fn fib(n: Int) -> Int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn calc_def(base: Int, bonus = 5) -> Int {
+    return (base + bonus) * SCALE;
+}
+
+fn calc_var(base: Int, *rest) -> Int {
+    let total = base * SCALE;
+    for r in rest {
+        total = total + r;
+    }
+    return total;
+}
+
+fn make_counter(start: Int) {
+    let count = start;
+    fn bump(delta: Int) -> Int {
+        count = count + delta;
+        return count;
+    }
+    fn inner_shadow() -> Int {
+        let count = 99;
+        return count;
+    }
+    return [bump(2), inner_shadow(), bump(3)];
+}
+
+class Animal {
+    fn init(self, name: String) {
+        self.name = name;
+    }
+    fn label(self) -> String {
+        return f"animal:{self.name}";
+    }
+}
+
+class Dog: Animal {
+    fn speak(self) -> String {
+        return self.label() + "!";
+    }
+}
+
+class Ctx {
+    fn init(self) {
+        self.closed = false;
+    }
+    fn enter(self) {
+        return self;
+    }
+    fn exit(self) {
+        self.closed = true;
+    }
+}
+
+fn add_tag(f) {
+    return fn(x) { return f(x) + 100; };
+}
+
+@add_tag
+fn triple(x: Int) -> Int {
+    return x * 3;
+}
+
+fn fail_inner() {
+    throw "boom";
+}
+
+let c_res = make_counter(10);
+let d = Dog("Rex");
+let xs = [1, 2, 3];
+xs[1] = 20;
+let evens = [x * SCALE for x in [1, 2, 3, 4] if x % 2 == 0];
+
+let caught = "";
+let fin = false;
+try {
+    fail_inner();
+} catch e {
+    caught = e;
+} finally {
+    fin = true;
+}
+
+let m_out = "";
+match 2 {
+    case 1 { m_out = "one"; }
+    case 2 { m_out = "two"; }
+    case _ { m_out = "other"; }
+}
+
+let ctx = Ctx();
+with ctx as c {
+    assert(c.closed == false);
+}
+
+let loop_sum = 0;
+for i in range(0, 6) {
+    if i == 2 { continue; }
+    if i == 5 { break; }
+    loop_sum = loop_sum + i;
+}
+let each_out = "";
+for ch in ["a", "b", "c"] {
+    each_out = each_out + ch;
+}
+
+let parity = "big" if fib(10) > 50 else "small";
+let res = [
+    fib(10),
+    calc_def(3),
+    calc_var(3, 1, 4, 5),
+    c_res,
+    d.speak(),
+    is_instance(d, "Animal"),
+    xs,
+    xs[-1],
+    evens,
+    triple(4),
+    caught,
+    fin,
+    m_out,
+    ctx.closed,
+    loop_sum,
+    each_out,
+    parity
+];
+print("AOT_OUT", res);
+"#;
+
+        assert_eq!(run_source(src), Ok(()));
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("veyra_aot_test_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("prog.vy");
+        let exe_path = dir.join(if cfg!(target_os = "windows") {
+            "prog.exe"
+        } else {
+            "prog"
+        });
+        fs::write(&src_path, src).unwrap();
+
+        let built = crate::aot::compile_file_to_native(&src_path, Some(&exe_path)).unwrap();
+        assert!(built.exists());
+
+        let native_out = std::process::Command::new(&built).output().unwrap();
+        assert!(
+            native_out.status.success(),
+            "native stderr: {}",
+            String::from_utf8_lossy(&native_out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&native_out.stdout);
+        let expected = "AOT_OUT [55, 16, 16, [12, 99, 15], animal:Rex!, true, [1, 20, 3], 3, [4, 8], 112, boom, true, two, true, 8, abc, big]";
+        assert!(
+            stdout.lines().any(|l| l.trim() == expected),
+            "unexpected native stdout: {stdout}"
+        );
+
+        let async_err =
+            crate::aot::compile_source_to_rust("async fn f() { return 1; }").unwrap_err();
+        assert!(async_err.contains("async"));
+
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("src")).unwrap();
+        fs::write(
+            proj_dir.join("veyra.json"),
+            r#"{"name":"sample","version":"0.1.0","entry":"src/main.vy"}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("src/main.vy"),
+            "fn sq(x: Int) -> Int { return x * x; }\nprint(\"PROJ\", sq(9));\n",
+        )
+        .unwrap();
+        crate::project::build_project_at(&proj_dir, true).unwrap();
+        let proj_bin =
+            proj_dir
+                .join("dist")
+                .join("sample-0.1.0")
+                .join(if cfg!(target_os = "windows") {
+                    "sample.exe"
+                } else {
+                    "sample"
+                });
+        assert!(proj_bin.exists());
+        let proj_out = std::process::Command::new(&proj_bin).output().unwrap();
+        assert!(proj_out.status.success());
+        assert_eq!(String::from_utf8_lossy(&proj_out.stdout).trim(), "PROJ 81");
+
+        let _ = fs::remove_dir_all(dir);
     }
 }
