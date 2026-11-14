@@ -6549,6 +6549,33 @@ impl Rt {
                     Val::Str(line)
                 }
             }
+            "powershell" | "ps_exec" | "bash_exec" => {
+                let cmd_str = match args.first() {
+                    Some(Val::Str(s)) => s.clone(),
+                    _ => return Err(Flow::Err(format!("{name} expects String command"))),
+                };
+                let (prog, flag) = if name == "bash_exec" {
+                    (
+                        if cfg!(windows) && std::path::Path::new(r"C:\Program Files\Git\bin\bash.exe").is_file() {
+                            r"C:\Program Files\Git\bin\bash.exe"
+                        } else {
+                            "bash"
+                        },
+                        "-c",
+                    )
+                } else {
+                    ("powershell", "-Command")
+                };
+                let out = std::process::Command::new(prog)
+                    .args([flag, &cmd_str])
+                    .output()
+                    .map_err(|e| Flow::Err(e.to_string()))?;
+                Val::Map(vec![
+                    (Val::Str("code".into()), Val::Num(out.status.code().unwrap_or(-1) as f64)),
+                    (Val::Str("out".into()), Val::Str(String::from_utf8_lossy(&out.stdout).into())),
+                    (Val::Str("err".into()), Val::Str(String::from_utf8_lossy(&out.stderr).into())),
+                ])
+            }
             _ => return Ok(None),
         };
         Ok(Some(out))

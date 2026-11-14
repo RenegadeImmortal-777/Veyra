@@ -7,3 +7,4 @@ fn open_file(title: String) -> Any { return gui_open_file(title); }
 fn save_file(title: String) -> Any { return gui_save_file(title); }
 fn choose_folder(title: String) -> Any { return gui_folder(title); }
 fn choose_color(title: String) -> Any { return gui_color(title); }
+fn app(spec: Map, handler: Any) -> Void { gui_app(spec, handler); }

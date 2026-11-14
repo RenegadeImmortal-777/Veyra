@@ -167,11 +167,33 @@ fn unclosed_delimiters(src: &str) -> i32 {
 
 fn print_terminal_help() {
     println!(
-        "Kovrek Terminal commands:\n  .help                     Show this help\n  .run <file.kvr|.kvbc>     Run a Kovrek file\n  .check <file.kvr>         Compile/type-check a file\n  .verify <file.kvr>        Run formal contract verification\n  .bundle <file.kvr> [out]  Bundle standalone executable\n  .vars                     List session variables\n  .clear                    Reset session state\n  .version                  Show Kovrek version\n  .exit                     Exit Kovrek Terminal"
+        "Kovrek Super-Terminal — Kovrek + PowerShell + Git Bash + CMD\n\
+         \n\
+         Shell & Navigation:\n\
+         \x20 cd [dir | ~ | -]        Change folder      pwd                 Current folder\n\
+         \x20 ls [-a] [path]          List files (color) cat <file>          View file with lines\n\
+         \x20 mkdir / touch / rm      File ops           cp / mv / which     Copy, move, locate\n\
+         \x20 clear / cls             Clear screen       env / export K=V    Environment vars\n\
+         \n\
+         Multi-Shell Superpowers:\n\
+         \x20 ! <cmd>                 Run CMD command    ps <cmd>            Run PowerShell command\n\
+         \x20 bash <cmd>              Run Git Bash cmd   <git/cargo/py...>   Auto-runs OS commands\n\
+         \x20 let x = !cmd            Capture CMD/ps/bash stdout directly into Kovrek var x!\n\
+         \n\
+         Kovrek Tooling:\n\
+         \x20 .run <file.kvr|.kvbc>   Execute file       .watch <file.kvr>   Auto-run on save\n\
+         \x20 .check <file.kvr>       Type/compile check .verify <file.kvr>  Formal verification\n\
+         \x20 .bundle [--gui] f [out] Build standalone .exe (--gui hides console on launch)\n\
+         \x20 .vars                   Show Kovrek vars   .clear              Reset Kovrek state\n\
+         \x20 .history                Command history    .exit               Quit terminal"
     );
 }
 
-fn handle_terminal_command(line: &str, session: &mut NotebookSession) -> Result<bool, String> {
+fn handle_terminal_command(
+    line: &str,
+    session: &mut NotebookSession,
+    term_state: &crate::term_ui::TerminalState,
+) -> Result<bool, String> {
     let args = split_cli_args(line);
     let Some(cmd) = args.first().map(String::as_str) else {
         return Ok(true);
@@ -183,6 +205,11 @@ fn handle_terminal_command(line: &str, session: &mut NotebookSession) -> Result<
         ".clear" => {
             session.reset();
             println!("Session cleared.");
+        }
+        ".history" => {
+            for (i, h) in term_state.history.iter().enumerate() {
+                println!("  {:>3}  {}", i + 1, h);
+            }
         }
         ".vars" => {
             let vars = session.session_vars();
@@ -197,6 +224,10 @@ fn handle_terminal_command(line: &str, session: &mut NotebookSession) -> Result<
         ".run" => {
             let p = args.get(1).ok_or("usage: .run <file.kvr|.kvbc>")?;
             exec_file_path(Path::new(p))?;
+        }
+        ".watch" => {
+            let p = args.get(1).ok_or("usage: .watch <file.kvr>")?;
+            crate::term_ui::watch_file(Path::new(p))?;
         }
         ".check" => {
             let p = args.get(1).ok_or("usage: .check <file.kvr>")?;
@@ -214,9 +245,20 @@ fn handle_terminal_command(line: &str, session: &mut NotebookSession) -> Result<
             );
         }
         ".bundle" => {
-            let p = args.get(1).ok_or("usage: .bundle <file.kvr> [out]")?;
-            let out = args.get(2).map(Path::new);
-            let built = crate::bundle_executable(Path::new(p), out)?;
+            let mut gui = false;
+            let mut pos = Vec::new();
+            for a in args.iter().skip(1) {
+                if a == "--gui" {
+                    gui = true;
+                } else {
+                    pos.push(a.as_str());
+                }
+            }
+            let p = pos
+                .first()
+                .ok_or("usage: .bundle [--gui] <file.kvr> [out]")?;
+            let out = pos.get(1).map(Path::new);
+            let built = crate::bundle_executable_with_options(Path::new(p), out, gui)?;
             println!("Bundled standalone executable: {}", built.display());
         }
         _ => return Err(format!("unknown command '{cmd}' (try .help)")),
@@ -225,21 +267,23 @@ fn handle_terminal_command(line: &str, session: &mut NotebookSession) -> Result<
 }
 
 pub(crate) fn repl() -> Result<(), String> {
-    print!("\x1b]0;Kovrek Terminal\x07");
-    println!("Kovrek {VERSION} Terminal — type Kovrek code or .help (.exit to quit)");
+    crate::term_ui::enable_virtual_terminal();
+    print!("\x1b]0;Kovrek Super-Terminal\x07");
+    let mut term_state = crate::term_ui::TerminalState::new();
     let mut session = NotebookSession::new(None);
+    if io::stdin().is_terminal() {
+        crate::term_ui::print_banner(&term_state);
+    } else {
+        println!("Kovrek {VERSION} Terminal — type Kovrek code or .help (.exit to quit)");
+    }
+
     let mut buffer = String::new();
-    let mut line = String::new();
     loop {
-        let prompt = if buffer.is_empty() { "kvr> " } else { "...  " };
-        print!("{prompt}");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-        line.clear();
-        if io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?
-            == 0
-        {
+        let (prompt, vis_len) =
+            crate::term_ui::render_prompt(&term_state, &session, !buffer.is_empty());
+        let Some(raw_line) =
+            crate::term_ui::read_interactive_line(&prompt, vis_len, &term_state, &session)?
+        else {
             if !buffer.trim().is_empty() {
                 match session.eval_repl(&buffer) {
                     Ok(Some(v)) => println!("{v}"),
@@ -248,31 +292,58 @@ pub(crate) fn repl() -> Result<(), String> {
                 }
             }
             break;
-        }
+        };
+
         if buffer.is_empty() {
-            let trimmed = line.trim();
+            let trimmed = raw_line.trim();
             if trimmed.is_empty() {
                 continue;
             }
+            term_state.push_history(trimmed);
             if trimmed.starts_with('.') || trimmed.starts_with(':') {
-                match handle_terminal_command(trimmed, &mut session) {
+                match handle_terminal_command(trimmed, &mut session, &term_state) {
                     Ok(true) => continue,
                     Ok(false) => break,
                     Err(e) => {
                         eprintln!("error: {e}");
+                        term_state.last_exit = 1;
                         continue;
                     }
                 }
             }
+            let split = split_cli_args(trimmed);
+            match crate::term_ui::try_dispatch_shell(trimmed, &split, &mut term_state, &mut session)
+            {
+                Ok(crate::term_ui::DispatchOutcome::Continue) => continue,
+                Ok(crate::term_ui::DispatchOutcome::Exit) => break,
+                Ok(crate::term_ui::DispatchOutcome::PassToKovrek) => {}
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    term_state.last_exit = 1;
+                    continue;
+                }
+            }
+        } else {
+            term_state.push_history(raw_line.trim());
         }
-        buffer.push_str(&line);
+
+        buffer.push_str(&raw_line);
+        buffer.push('\n');
         if unclosed_delimiters(&buffer) > 0 {
             continue;
         }
         match session.eval_repl(&buffer) {
-            Ok(Some(v)) => println!("{v}"),
-            Ok(None) => {}
-            Err(e) => eprintln!("error: {e}"),
+            Ok(Some(v)) => {
+                println!("{v}");
+                term_state.last_exit = 0;
+            }
+            Ok(None) => {
+                term_state.last_exit = 0;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                term_state.last_exit = 1;
+            }
         }
         buffer.clear();
     }
@@ -281,6 +352,6 @@ pub(crate) fn repl() -> Result<(), String> {
 
 pub(crate) fn usage() {
     println!(
-        "Kovrek {VERSION}\n\nUsage:\n  kovrek run [--caps c1,c2] [file.kvr]\n  kovrek launch <file.kvr|.kvbc>\n  kovrek bundle <script.kvr> [output]\n  kovrek check [file.kvr]\n  kovrek verify [file.kvr]\n  kovrek lint [file.kvr]\n  kovrek debug [file.kvr]\n  kovrek dap\n  kovrek ast [file.kvr]\n  kovrek symbols [file.kvr]\n  kovrek lsp\n  kovrek test\n  kovrek bench [file.kvr] [iterations]\n  kovrek profile [file.kvr]\n  kovrek doc [file.kvr]\n  kovrek aot [--direct] [--elf|--pe] [file.kvr] [out_exe]\n  kovrek wasm [--wasi] [file.kvr] [-o out.wasm] [--disasm] [--run <fn> [args...]]\n  kovrek ffi bindgen <header.h> <lib_path> [-o out.kvr]\n  kovrek notebook [dir] [port]\n  kovrek build [--native]\n  kovrek audit\n  kovrek serve [dir] [port]\n  kovrek web <routes.json> [port]\n  kovrek app <app.kvr> <routes.json> [port]\n  kovrek disasm [file.kvr]\n  kovrek fmt <file.kvr>\n  kovrek new <name>\n  kovrek pkg list\n  kovrek pkg search <term>\n  kovrek pkg info <name>\n  kovrek pkg tree\n  kovrek pkg add <name[@semver]>\n  kovrek pkg remove <name>\n  kovrek pkg update [name]\n  kovrek pkg installed\n  kovrek pkg install\n  kovrek pkg publish\n  kovrek pkg keygen [name]\n  kovrek pkg sign [dir] [key]\n  kovrek pkg verify [target]\n  kovrek pkg pack [dir] [out.kvpkg.json]\n  kovrek pkg unpack <bundle.kvpkg.json> [dest]\n  kovrek pkg build-plugin [dir]\n  kovrek pkg py-bridge <pypi_pkg> [out_dir] [--pip-install]\n  kovrek pkg serve [dir] [port]\n  kovrek doctor\n  kovrek terminal | term | repl\n  kovrek --version"
+        "Kovrek {VERSION}\n\nUsage:\n  kovrek run [--caps c1,c2] [file.kvr]\n  kovrek launch <file.kvr|.kvbc>\n  kovrek bundle [--gui] <script.kvr> [output]\n  kovrek check [file.kvr]\n  kovrek verify [file.kvr]\n  kovrek lint [file.kvr]\n  kovrek debug [file.kvr]\n  kovrek dap\n  kovrek ast [file.kvr]\n  kovrek symbols [file.kvr]\n  kovrek lsp\n  kovrek test\n  kovrek bench [file.kvr] [iterations]\n  kovrek profile [file.kvr]\n  kovrek doc [file.kvr]\n  kovrek aot [--direct] [--elf|--pe] [file.kvr] [out_exe]\n  kovrek wasm [--wasi] [file.kvr] [-o out.wasm] [--disasm] [--run <fn> [args...]]\n  kovrek ffi bindgen <header.h> <lib_path> [-o out.kvr]\n  kovrek notebook [dir] [port]\n  kovrek build [--native]\n  kovrek audit\n  kovrek serve [dir] [port]\n  kovrek web <routes.json> [port]\n  kovrek app <app.kvr> <routes.json> [port]\n  kovrek disasm [file.kvr]\n  kovrek fmt <file.kvr>\n  kovrek new <name>\n  kovrek pkg list\n  kovrek pkg search <term>\n  kovrek pkg info <name>\n  kovrek pkg tree\n  kovrek pkg add <name[@semver]>\n  kovrek pkg remove <name>\n  kovrek pkg update [name]\n  kovrek pkg installed\n  kovrek pkg install\n  kovrek pkg publish\n  kovrek pkg keygen [name]\n  kovrek pkg sign [dir] [key]\n  kovrek pkg verify [target]\n  kovrek pkg pack [dir] [out.kvpkg.json]\n  kovrek pkg unpack <bundle.kvpkg.json> [dest]\n  kovrek pkg build-plugin [dir]\n  kovrek pkg py-bridge <pypi_pkg> [out_dir] [--pip-install]\n  kovrek pkg serve [dir] [port]\n  kovrek doctor\n  kovrek terminal | term | repl\n  kovrek --version"
     );
 }

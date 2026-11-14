@@ -160,6 +160,26 @@ impl Vm {
                     ),
                 ])
             }
+            "powershell" | "ps_exec" => {
+                crate::runtime::require_cap("process")?;
+                if a.len() != 1 {
+                    return Err(format!("{n} expects command"));
+                }
+                let Val::Str(cmd) = &a[0] else {
+                    return Err("command must be String".into());
+                };
+                crate::term_ui::builtin_shell_val(crate::term_ui::ShellKind::PowerShell, cmd)?
+            }
+            "bash_exec" => {
+                crate::runtime::require_cap("process")?;
+                if a.len() != 1 {
+                    return Err("bash_exec expects command".into());
+                }
+                let Val::Str(cmd) = &a[0] else {
+                    return Err("command must be String".into());
+                };
+                crate::term_ui::builtin_shell_val(crate::term_ui::ShellKind::GitBash, cmd)?
+            }
             #[cfg(feature = "native-services")]
             "http_request" => {
                 crate::runtime::require_cap("net")?;

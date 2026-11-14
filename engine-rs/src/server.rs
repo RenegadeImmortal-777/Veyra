@@ -749,6 +749,16 @@ impl NotebookSession {
         out
     }
 
+    pub(crate) fn set_var(&mut self, name: String, val: Val) {
+        self.vars.insert(name, val);
+    }
+
+    pub(crate) fn has_symbol(&self, name: &str) -> bool {
+        self.vars.contains_key(name)
+            || self.funcs.contains_key(name)
+            || self.classes.contains_key(name)
+    }
+
     pub(crate) fn eval_cell(&mut self, cell_id: &str, source: &str) -> NotebookCellResult {
         self.exec_counter += 1;
         let exec_count = self.exec_counter;

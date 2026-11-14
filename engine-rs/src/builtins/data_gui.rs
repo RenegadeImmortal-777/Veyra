@@ -964,6 +964,13 @@ impl Vm {
                 }
                 Val::Map(out)
             }
+            "gui_app" => {
+                crate::runtime::require_cap("io")?;
+                if a.len() != 2 {
+                    return Err("gui_app expects (layout_map, on_event_fn)".into());
+                }
+                return crate::gui_native::run_gui_app(self, &a[0], &a[1]).map(Some);
+            }
             _ => return Ok(None),
         };
         Ok(Some(v))

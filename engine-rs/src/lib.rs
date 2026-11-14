@@ -30,6 +30,7 @@ mod cli;
 mod compiler;
 mod dap;
 mod gpu;
+mod gui_native;
 mod ir;
 mod jit;
 mod lexer;
@@ -46,6 +47,7 @@ mod server;
 mod sim_actor;
 mod spirv;
 mod tensor;
+mod term_ui;
 mod tooling;
 mod value;
 mod vm;
@@ -99,7 +101,33 @@ pub fn extract_embedded_kvbc(bytes: &[u8]) -> Option<String> {
     String::from_utf8(bytes[payload_start..footer_start - 8].to_vec()).ok()
 }
 
+pub(crate) fn patch_pe_gui_subsystem(bytes: &mut [u8]) -> Result<(), String> {
+    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+        return Err("--gui subsystem patching requires a Windows PE executable".into());
+    }
+    let lfanew = u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
+    if lfanew + 0x60 > bytes.len() || &bytes[lfanew..lfanew + 4] != b"PE\0\0" {
+        return Err("invalid PE header in executable".into());
+    }
+    let magic = u16::from_le_bytes([bytes[lfanew + 0x18], bytes[lfanew + 0x19]]);
+    if magic != 0x020B && magic != 0x010B {
+        return Err("unsupported PE optional header magic".into());
+    }
+    // Zero PE checksum and switch IMAGE_SUBSYSTEM_WINDOWS_CUI (3) -> WINDOWS_GUI (2).
+    bytes[lfanew + 0x58..lfanew + 0x5C].copy_from_slice(&0u32.to_le_bytes());
+    bytes[lfanew + 0x5C..lfanew + 0x5E].copy_from_slice(&2u16.to_le_bytes());
+    Ok(())
+}
+
 pub fn bundle_executable(script_path: &Path, out_path: Option<&Path>) -> Result<PathBuf, String> {
+    bundle_executable_with_options(script_path, out_path, false)
+}
+
+pub fn bundle_executable_with_options(
+    script_path: &Path,
+    out_path: Option<&Path>,
+    gui_subsystem: bool,
+) -> Result<PathBuf, String> {
     let source = load_source(script_path.to_string_lossy().as_ref())?;
     let kvbc = compile_to_kvbc(&source)?;
     let exe_path = env::current_exe().map_err(|e| e.to_string())?;
@@ -112,6 +140,9 @@ pub fn bundle_executable(script_path: &Path, out_path: Option<&Path>) -> Result<
                 base_bytes.truncate(f - 8 - plen);
             }
         }
+    }
+    if gui_subsystem {
+        patch_pe_gui_subsystem(&mut base_bytes)?;
     }
     let payload = kvbc.as_bytes();
     base_bytes.extend_from_slice(payload);
@@ -164,17 +195,24 @@ pub fn run_cli() -> ExitCode {
             println!("Kovrek {VERSION}");
             Ok(())
         }
-        Some("bundle") => {
-            let script = a
-                .get(2)
-                .ok_or("usage: kovrek bundle <script.kvr> [output]".to_string());
-            script.and_then(|s| {
-                let out = a.get(3).map(Path::new);
-                let built = bundle_executable(Path::new(s), out)?;
-                println!("Bundled standalone executable: {}", built.display());
-                Ok(())
-            })
-        }
+        Some("bundle") => (|| -> Result<(), String> {
+            let mut gui = false;
+            let mut pos = Vec::new();
+            for arg in a.iter().skip(2) {
+                if arg == "--gui" {
+                    gui = true;
+                } else {
+                    pos.push(arg.as_str());
+                }
+            }
+            let s = pos
+                .first()
+                .ok_or("usage: kovrek bundle [--gui] <script.kvr> [output]")?;
+            let out = pos.get(1).map(Path::new);
+            let built = bundle_executable_with_options(Path::new(s), out, gui)?;
+            println!("Bundled standalone executable: {}", built.display());
+            Ok(())
+        })(),
         Some("doctor") => {
             doctor();
             Ok(())
@@ -6572,5 +6610,89 @@ assert(denied);
         assert!(vars.iter().any(|(k, v)| k == "base" && v == "40"));
         term.reset();
         assert!(term.session_vars().is_empty());
+
+        // Super-Terminal unified shell capture & navigation + GUI layout/PE patch verification.
+        let mut st = crate::term_ui::TerminalState::new();
+        assert!(matches!(
+            crate::term_ui::try_dispatch_shell(
+                "let greeting = !echo hello-kovrek",
+                &[
+                    "let".into(),
+                    "greeting".into(),
+                    "=".into(),
+                    "!echo".into(),
+                    "hello-kovrek".into()
+                ],
+                &mut st,
+                &mut term
+            ),
+            Ok(crate::term_ui::DispatchOutcome::Continue)
+        ));
+        assert_eq!(term.eval_repl("greeting"), Ok(Some("hello-kovrek".into())));
+        assert!(matches!(
+            crate::term_ui::try_dispatch_shell(
+                "let flag = !true",
+                &["let".into(), "flag".into(), "=".into(), "!true".into()],
+                &mut st,
+                &mut term
+            ),
+            Ok(crate::term_ui::DispatchOutcome::PassToKovrek)
+        ));
+
+        let spec = Val::Map(vec![
+            (Val::Str("title".into()), Val::Str("Calc".into())),
+            (Val::Str("width".into()), Val::Num(420.0)),
+            (Val::Str("height".into()), Val::Num(580.0)),
+            (
+                Val::Str("rows".into()),
+                Val::List(vec![
+                    Val::Map(vec![
+                        (Val::Str("type".into()), Val::Str("display".into())),
+                        (Val::Str("id".into()), Val::Str("disp".into())),
+                        (Val::Str("text".into()), Val::Str("0".into())),
+                    ]),
+                    Val::Map(vec![
+                        (Val::Str("type".into()), Val::Str("row".into())),
+                        (
+                            Val::Str("items".into()),
+                            Val::List(vec![
+                                Val::Map(vec![
+                                    (Val::Str("type".into()), Val::Str("button".into())),
+                                    (Val::Str("id".into()), Val::Str("btn1".into())),
+                                    (Val::Str("text".into()), Val::Str("1".into())),
+                                ]),
+                                Val::Map(vec![
+                                    (Val::Str("type".into()), Val::Str("button".into())),
+                                    (Val::Str("id".into()), Val::Str("eq".into())),
+                                    (Val::Str("text".into()), Val::Str("=".into())),
+                                    (Val::Str("flex".into()), Val::Num(2.0)),
+                                ]),
+                            ]),
+                        ),
+                    ]),
+                ]),
+            ),
+        ]);
+        let mut layout = crate::gui_native::parse_gui_layout(&spec).expect("layout");
+        let rects = crate::gui_native::compute_hit_rects(&layout, 420, 580);
+        assert_eq!(rects.len(), 3);
+        let patch = Val::Map(vec![(Val::Str("disp".into()), Val::Str("42".into()))]);
+        let (close_req, changed) = crate::gui_native::apply_layout_updates(&mut layout, &patch);
+        assert!(!close_req && changed);
+        if let crate::gui_native::LayoutEntry::Single(w) = &layout.entries[0] {
+            assert_eq!(w.text, "42");
+        } else {
+            panic!("expected display widget");
+        }
+
+        // Minimal synthetic PE32+ buffer verifies Windows GUI subsystem patching cleanly.
+        let mut pe = vec![0u8; 0x100];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x98..0x9A].copy_from_slice(&0x020Bu16.to_le_bytes());
+        pe[0xDC..0xDE].copy_from_slice(&3u16.to_le_bytes());
+        patch_pe_gui_subsystem(&mut pe).expect("pe gui patch");
+        assert_eq!(u16::from_le_bytes([pe[0xDC], pe[0xDD]]), 2);
     }
 }

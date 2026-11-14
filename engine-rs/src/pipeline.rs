@@ -345,7 +345,7 @@ fn const_eval_bool(e: &Expr) -> Option<bool> {
 
 fn builtin_effect_tag(name: &str) -> Option<&'static str> {
     match name {
-        "print" | "println" | "input" => Some("io"),
+        "print" | "println" | "input" | "gui_app" => Some("io"),
         "read_file" | "write_file" | "append_file" | "remove_file" | "path_exists" | "is_file"
         | "is_dir" | "list_dir" | "mkdir" | "sqlite_open" | "sqlite_exec" | "sqlite_query" => {
             Some("fs")
@@ -354,7 +354,9 @@ fn builtin_effect_tag(name: &str) -> Option<&'static str> {
         | "actor_node_listen" | "actor_node_stop" | "actor_remote_send" | "actor_remote_ask" => {
             Some("net")
         }
-        "shell" | "spawn_process" | "exit" => Some("process"),
+        "shell" | "powershell" | "ps_exec" | "bash_exec" | "spawn_process" | "exit" => {
+            Some("process")
+        }
         "env_get" | "env_set" | "now_ms" | "time_ms" | "rand" | "rand_int" | "uuid_v4" | "cwd" => {
             Some("env")
         }
@@ -787,6 +789,9 @@ fn is_taint_sink(name: &str) -> bool {
             | "write_file"
             | "append_file"
             | "shell"
+            | "powershell"
+            | "ps_exec"
+            | "bash_exec"
             | "spawn_process"
             | "ffi_call"
             | "py_exec"
