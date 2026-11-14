@@ -6523,6 +6523,32 @@ impl Rt {
                 (Val::Str("os".into()), Val::Str(std::env::consts::OS.into())),
             ]),
             "gpu_available" => Val::Bool(false),
+            "input" => {
+                if args.len() > 1 {
+                    return Err(Flow::Err("input expects at most 1 argument (prompt)".into()));
+                }
+                if let Some(arg) = args.first() {
+                    if !matches!(arg, Val::Null) {
+                        let prompt = self.show_val_runtime(arg)?;
+                        print!("{prompt}");
+                        std::io::stdout()
+                            .flush()
+                            .map_err(|e| Flow::Err(e.to_string()))?;
+                    }
+                }
+                let mut line = String::new();
+                let n = std::io::stdin()
+                    .read_line(&mut line)
+                    .map_err(|e| Flow::Err(e.to_string()))?;
+                if n == 0 {
+                    Val::Null
+                } else {
+                    while line.ends_with('\n') || line.ends_with('\r') {
+                        line.pop();
+                    }
+                    Val::Str(line)
+                }
+            }
             _ => return Ok(None),
         };
         Ok(Some(out))

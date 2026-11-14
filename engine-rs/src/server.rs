@@ -639,6 +639,16 @@ impl NotebookSession {
         _cell_id: &str,
         source: &str,
     ) -> (String, Option<String>, Option<String>) {
+        self.eval_snippet(source, true)
+    }
+
+    /// Evaluates a stateful Kovrek snippet against persistent session globals,
+    /// functions, classes, and live object instances.
+    fn eval_snippet(
+        &mut self,
+        source: &str,
+        capture_stdout: bool,
+    ) -> (String, Option<String>, Option<String>) {
         let trimmed = source.trim();
         let mut is_expr_fallback = false;
         let predeclared: Vec<String> = self
@@ -684,7 +694,11 @@ impl NotebookSession {
                         }
                     }
 
-                    let (res, captured) = crate::runtime::with_print_capture(|| vm.execute());
+                    let (res, captured) = if capture_stdout {
+                        crate::runtime::with_print_capture(|| vm.execute())
+                    } else {
+                        (vm.execute(), String::new())
+                    };
                     for (slot, name) in local_names.iter().enumerate() {
                         if !name.starts_with("__")
                             && vm.local_defined.get(slot).copied().unwrap_or(false)
@@ -696,6 +710,8 @@ impl NotebookSession {
                     self.vars = vm.vars;
                     self.funcs = vm.funcs;
                     self.classes = vm.classes;
+                    self.objects = vm.objects;
+                    self.class_objects = vm.class_objects;
                     match res {
                         Ok(v) => {
                             let val_str = if is_expr_fallback || !matches!(v, Val::Null) {
@@ -710,6 +726,27 @@ impl NotebookSession {
                 }
             }
         }
+    }
+
+    /// Evaluates one interactive REPL/terminal input against persistent session state.
+    pub(crate) fn eval_repl(&mut self, source: &str) -> Result<Option<String>, String> {
+        let (_out, val, err) = self.eval_snippet(source, false);
+        match err {
+            Some(e) => Err(e),
+            None => Ok(val),
+        }
+    }
+
+    /// Lists user-visible session globals sorted by identifier name.
+    pub(crate) fn session_vars(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .vars
+            .iter()
+            .filter(|(k, _)| !k.starts_with("__"))
+            .map(|(k, v)| (k.clone(), v.show()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     pub(crate) fn eval_cell(&mut self, cell_id: &str, source: &str) -> NotebookCellResult {

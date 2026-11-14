@@ -52,7 +52,7 @@ mod vm;
 
 #[cfg(test)]
 use crate::bytecode::Op;
-use crate::cli::{doctor, new_project, repl, usage};
+use crate::cli::{doctor, exec_file_path, launch_file, new_project, repl, usage};
 use crate::dap::dap_server;
 #[cfg(test)]
 use crate::lexer::lex;
@@ -179,7 +179,11 @@ pub fn run_cli() -> ExitCode {
             doctor();
             Ok(())
         }
-        Some("repl") | None => repl(),
+        Some("repl") | Some("terminal") | Some("term") | None => repl(),
+        Some("launch") => a
+            .get(2)
+            .ok_or_else(|| "usage: kovrek launch <file.kvr|.kvbc>".to_string())
+            .and_then(|p| launch_file(Path::new(p))),
         Some("new") => a
             .get(2)
             .ok_or("missing project name".into())
@@ -343,14 +347,7 @@ pub fn run_cli() -> ExitCode {
                         .collect(),
                 )
             });
-            let exec = || {
-                if p.extension().and_then(|e| e.to_str()) == Some("kvbc") {
-                    let bc = fs::read_to_string(&p).map_err(|e| e.to_string())?;
-                    run_kvbc(&bc)
-                } else {
-                    load_source(p.to_string_lossy().as_ref()).and_then(|s| run_source(&s))
-                }
-            };
+            let exec = || exec_file_path(&p);
             if let Some(caps) = manifest_caps {
                 crate::runtime::run_with_caps(caps, exec)
             } else {
@@ -608,12 +605,7 @@ pub fn run_cli() -> ExitCode {
             let s = fs::read_to_string(p).map_err(|e| e.to_string())?;
             fs::write(p, fmt_source(&s)).map_err(|e| e.to_string())
         }),
-        Some(x) if x.ends_with(".kvr") => fs::read_to_string(x)
-            .map_err(|e| e.to_string())
-            .and_then(|s| run_source(&s)),
-        Some(x) if x.ends_with(".kvbc") => fs::read_to_string(x)
-            .map_err(|e| e.to_string())
-            .and_then(|s| run_kvbc(&s)),
+        Some(x) if x.ends_with(".kvr") || x.ends_with(".kvbc") => exec_file_path(Path::new(x)),
         _ => {
             usage();
             Ok(())
@@ -6541,5 +6533,44 @@ sim_stop();
         )
         .expect("direct ELF64");
         assert!(elf.starts_with(b"\x7FELF"));
+    }
+
+    #[test]
+    fn input_builtin_and_terminal_session() {
+        // Compiling input with and without prompt succeeds; restricted cap blocks input.
+        assert!(compile_source("let line = input();\n").is_ok());
+        assert!(compile_source("let line = input(\"kvr> \");\n").is_ok());
+        let cap_src = r#"
+let denied = false;
+try {
+    cap_restrict(["math"], fn() { input("blocked> "); });
+} catch e {
+    denied = contains(str(e), "CapabilityError");
+}
+assert(denied);
+"#;
+        assert_eq!(run_source(cap_src), Ok(()));
+
+        // Stateful Kovrek Terminal session retains variables, functions, classes, and objects.
+        let mut term = crate::server::NotebookSession::new(None);
+        assert_eq!(term.eval_repl("let base = 40;"), Ok(None));
+        assert_eq!(
+            term.eval_repl("fn add_base(x: Int) -> Int { return base + x; }"),
+            Ok(None)
+        );
+        assert_eq!(term.eval_repl("add_base(2)"), Ok(Some("42".into())));
+        assert_eq!(
+            term.eval_repl(
+                "class Counter { fn __init__(self, start: Int) { self.v = start; } fn inc(self, d: Int) -> Int { self.v = self.v + d; return self.v; } }"
+            ),
+            Ok(None)
+        );
+        assert_eq!(term.eval_repl("let c = Counter(5);"), Ok(None));
+        assert_eq!(term.eval_repl("c.inc(3)"), Ok(Some("8".into())));
+        assert_eq!(term.eval_repl("c.inc(4)"), Ok(Some("12".into())));
+        let vars = term.session_vars();
+        assert!(vars.iter().any(|(k, v)| k == "base" && v == "40"));
+        term.reset();
+        assert!(term.session_vars().is_empty());
     }
 }

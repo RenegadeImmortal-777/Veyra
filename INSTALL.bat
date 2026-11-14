@@ -24,8 +24,26 @@ copy /Y "%~dp0kovrek.py" "%KOVREK_HOME%\kovrek.py" >nul
  echo @echo off
  echo python "%%LOCALAPPDATA%%\Kovrek\kovrek.py" %%*
 ) > "%KOVREK_HOME%\kovrek-py.bat"
+(
+ echo @echo off
+ echo set "KOVREK_HOME=%%LOCALAPPDATA%%\Kovrek"
+ echo title Kovrek Terminal
+ echo "%%LOCALAPPDATA%%\Kovrek\kovrek.exe" terminal
+) > "%KOVREK_HOME%\kovrek-terminal.bat"
+reg add "HKCU\Software\Classes\.kvr" /ve /d "Kovrek.SourceFile" /f >nul
+reg add "HKCU\Software\Classes\.kvr" /v "PerceivedType" /d "text" /f >nul
+reg add "HKCU\Software\Classes\Kovrek.SourceFile" /ve /d "Kovrek Source File" /f >nul
+reg add "HKCU\Software\Classes\Kovrek.SourceFile\DefaultIcon" /ve /d "\"%KOVREK_HOME%\kovrek.exe\",0" /f >nul
+reg add "HKCU\Software\Classes\Kovrek.SourceFile\shell\open" /ve /d "Run with Kovrek" /f >nul
+reg add "HKCU\Software\Classes\Kovrek.SourceFile\shell\open\command" /ve /d "\"%KOVREK_HOME%\kovrek.exe\" launch \"%%1\"" /f >nul
+reg add "HKCU\Software\Classes\.kvbc" /ve /d "Kovrek.BytecodeFile" /f >nul
+reg add "HKCU\Software\Classes\Kovrek.BytecodeFile" /ve /d "Kovrek Bytecode File" /f >nul
+reg add "HKCU\Software\Classes\Kovrek.BytecodeFile\DefaultIcon" /ve /d "\"%KOVREK_HOME%\kovrek.exe\",0" /f >nul
+reg add "HKCU\Software\Classes\Kovrek.BytecodeFile\shell\open" /ve /d "Run with Kovrek" /f >nul
+reg add "HKCU\Software\Classes\Kovrek.BytecodeFile\shell\open\command" /ve /d "\"%KOVREK_HOME%\kovrek.exe\" launch \"%%1\"" /f >nul
 powershell -NoProfile -Command "$p=[Environment]::GetEnvironmentVariable('Path','User'); $v=$env:LOCALAPPDATA+'\Kovrek'; if (($p -split ';') -notcontains $v) {[Environment]::SetEnvironmentVariable('Path', (($p.TrimEnd(';')+';'+$v).Trim(';')), 'User')}"
 echo.
-echo Kovrek native engine installed for this Windows user.
-echo Open a NEW terminal and run: kovrek --version
+echo Kovrek native engine, file associations (.kvr, .kvbc), and Kovrek Terminal installed for this Windows user.
+echo Open a NEW terminal and run: kovrek --version  or  kovrek terminal
+if /i "%~1"=="--quiet" goto :eof
 pause

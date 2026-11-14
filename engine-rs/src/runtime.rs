@@ -233,3 +233,28 @@ pub(crate) fn with_print_capture<T>(f: impl FnOnce() -> T) -> (T, String) {
         .unwrap_or_default();
     (out, captured)
 }
+
+/// Displays an optional prompt without a trailing newline and reads one line
+/// from stdin. Returns `Ok(None)` cleanly at EOF.
+pub(crate) fn read_console_input(prompt: Option<&str>) -> Result<Option<String>, String> {
+    use std::io::{self, BufRead, Write};
+    if let Some(p) = prompt
+        && !p.is_empty()
+        && !try_capture_print(p)
+    {
+        print!("{p}");
+        io::stdout().flush().map_err(|e| e.to_string())?;
+    }
+    let mut line = String::new();
+    let read = io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    if read == 0 {
+        return Ok(None);
+    }
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(Some(line))
+}

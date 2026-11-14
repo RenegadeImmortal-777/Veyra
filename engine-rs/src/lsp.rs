@@ -64,6 +64,7 @@ pub(crate) fn lsp_completion_items() -> JsonValue {
         "or",
         "not",
         "print",
+        "input",
         "len",
         "str",
         "int",

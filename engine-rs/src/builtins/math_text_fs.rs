@@ -759,6 +759,20 @@ impl Vm {
                 };
                 Val::Num(rand::thread_rng().gen_range(lo..=hi) as f64)
             }
+            "input" => {
+                crate::runtime::require_cap("io")?;
+                if a.len() > 1 {
+                    return Err("input expects at most 1 argument (prompt)".into());
+                }
+                let prompt = match a.first() {
+                    Some(Val::Null) | None => None,
+                    Some(v) => Some(v.show()),
+                };
+                match crate::runtime::read_console_input(prompt.as_deref())? {
+                    Some(s) => Val::Str(s),
+                    None => Val::Null,
+                }
+            }
             _ => return Ok(None),
         };
         Ok(Some(v))
