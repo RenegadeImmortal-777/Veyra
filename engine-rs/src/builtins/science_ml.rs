@@ -39,10 +39,10 @@ use crate::runtime::{
     resolve_function_object, tasks,
 };
 use crate::tensor::{
-    AdamState, Conv2dDims, TensorOp, adam_states, broadcast_index, broadcast_shape, conv2d_forward,
-    layer_norm_stats, softmax_rows, tensor_backward, tensor_default_device, tensor_from_value,
-    tensor_id, tensor_move_device, tensor_set_default_device, tensor_snapshot, tensor_store,
-    tensor_store_on_device, tensors,
+    AdamState, Conv2dDims, TensorOp, adam_states, broadcast_index, broadcast_shape,
+    cast_f64_slice_dtype, conv2d_forward, layer_norm_stats, softmax_rows, tensor_backward,
+    tensor_default_device, tensor_from_value, tensor_id, tensor_move_device,
+    tensor_set_default_device, tensor_snapshot, tensor_store, tensor_store_on_device, tensors,
 };
 use crate::value::{
     Val, as_matrix, as_num_list, constant_time_strings_equal, distance_sq, hmac_sha256_hex,
@@ -2004,34 +2004,11 @@ impl Vm {
                     Some(Val::Str(s)) => s.as_str(),
                     Some(_) => return Err("gpu_fused_linear activation must be String".into()),
                 };
-                let is_tensor_io = tensor_id(&a[0]).is_ok() || tensor_id(&a[1]).is_ok();
-                let (x_data, m, k) = if let Ok(tid) = tensor_id(&a[0]) {
-                    let snap = tensor_snapshot(tid)?;
-                    if snap.shape.len() == 2 {
-                        (snap.data, snap.shape[0], snap.shape[1])
-                    } else if snap.shape.len() == 1 {
-                        (snap.data, 1, snap.shape[0])
-                    } else {
-                        return Err("gpu_fused_linear expects 1D or 2D x tensor".into());
-                    }
-                } else {
-                    let mat = as_matrix(&a[0])?;
-                    let mr = mat.len();
-                    let mc = mat[0].len();
-                    (mat.into_iter().flatten().collect(), mr, mc)
-                };
-                let (w_data, wk, ncols) = if let Ok(tid) = tensor_id(&a[1]) {
-                    let snap = tensor_snapshot(tid)?;
-                    if snap.shape.len() != 2 {
-                        return Err("gpu_fused_linear expects 2D w tensor".into());
-                    }
-                    (snap.data, snap.shape[0], snap.shape[1])
-                } else {
-                    let mat = as_matrix(&a[1])?;
-                    let wr = mat.len();
-                    let wc = mat[0].len();
-                    (mat.into_iter().flatten().collect(), wr, wc)
-                };
+                let (x_data, m, k, tx) =
+                    extract_mat_or_tensor2d(&a[0], "gpu_fused_linear x", true)?;
+                let (w_data, wk, ncols, tw) =
+                    extract_mat_or_tensor2d(&a[1], "gpu_fused_linear w", false)?;
+                let is_tensor_io = tx || tw;
                 if k != wk {
                     return Err(format!(
                         "gpu_fused_linear shape mismatch: x col {k} != w row {wk}"
@@ -2064,15 +2041,217 @@ impl Vm {
                     ncols,
                     act,
                 )?;
-                if is_tensor_io {
-                    tensor_store_on_device(out, vec![m, ncols], false, TensorOp::Leaf, "gpu")?
+                return_2d_gpu_result(out, m, ncols, is_tensor_io)?
+            }
+            "gpu_tiled_matmul" => {
+                crate::runtime::require_cap("gpu")?;
+                if a.len() != 2 {
+                    return Err("gpu_tiled_matmul expects (a, b)".into());
+                }
+                let (a_data, m, k, ta) =
+                    extract_mat_or_tensor2d(&a[0], "gpu_tiled_matmul a", false)?;
+                let (b_data, bk, n, tb) =
+                    extract_mat_or_tensor2d(&a[1], "gpu_tiled_matmul b", false)?;
+                if k != bk {
+                    return Err(format!("gpu_tiled_matmul shape mismatch: {k} != {bk}"));
+                }
+                let out = crate::gpu::gpu_tiled_matmul_f64(&a_data, &b_data, m, k, n);
+                return_2d_gpu_result(out, m, n, ta || tb)?
+            }
+            "gpu_attention" => {
+                crate::runtime::require_cap("gpu")?;
+                if a.len() < 3 || a.len() > 4 {
+                    return Err("gpu_attention expects (q, k, v[, causal])".into());
+                }
+                let causal = matches!(a.get(3), Some(Val::Bool(true)));
+                let (q_data, seq_q, dq, tq) =
+                    extract_mat_or_tensor2d(&a[0], "gpu_attention q", false)?;
+                let (k_data, seq_k, dk, tk) =
+                    extract_mat_or_tensor2d(&a[1], "gpu_attention k", false)?;
+                let (v_data, seq_v, dv, tv) =
+                    extract_mat_or_tensor2d(&a[2], "gpu_attention v", false)?;
+                if dq != dk || dk != dv || seq_k != seq_v {
+                    return Err(format!(
+                        "gpu_attention shape mismatch: Q[{seq_q},{dq}] K[{seq_k},{dk}] V[{seq_v},{dv}]"
+                    ));
+                }
+                let out = crate::gpu::gpu_attention_f64(
+                    &q_data, &k_data, &v_data, seq_q, seq_k, dq, causal,
+                );
+                return_2d_gpu_result(out, seq_q, dq, tq || tk || tv)?
+            }
+            "gpu_fused_layernorm" => {
+                crate::runtime::require_cap("gpu")?;
+                if a.len() < 2 || a.len() > 6 {
+                    return Err(
+                        "gpu_fused_layernorm expects (x, residual[, gamma, beta[, eps[, act]]])"
+                            .into(),
+                    );
+                }
+                let (x_data, rows, cols, tx) =
+                    extract_mat_or_tensor2d(&a[0], "gpu_fused_layernorm x", false)?;
+                let (res_data, rr, rc, tr) =
+                    extract_mat_or_tensor2d(&a[1], "gpu_fused_layernorm residual", false)?;
+                if rows != rr || cols != rc {
+                    return Err(format!(
+                        "gpu_fused_layernorm shape mismatch: x[{rows},{cols}] != residual[{rr},{rc}]"
+                    ));
+                }
+                let gamma = match a.get(2) {
+                    None | Some(Val::Null) => None,
+                    Some(v) => Some(extract_1d_vec(v, cols, "gpu_fused_layernorm gamma")?),
+                };
+                let beta = match a.get(3) {
+                    None | Some(Val::Null) => None,
+                    Some(v) => Some(extract_1d_vec(v, cols, "gpu_fused_layernorm beta")?),
+                };
+                let eps = match a.get(4) {
+                    None | Some(Val::Null) => 1e-5,
+                    Some(Val::Num(n)) => *n,
+                    Some(_) => return Err("gpu_fused_layernorm eps must be Number".into()),
+                };
+                let act = match a.get(5) {
+                    None | Some(Val::Null) => "none",
+                    Some(Val::Str(s)) => s.as_str(),
+                    Some(_) => return Err("gpu_fused_layernorm act must be String".into()),
+                };
+                let out = crate::gpu::gpu_fused_layernorm_f64(
+                    &x_data,
+                    &res_data,
+                    gamma.as_deref(),
+                    beta.as_deref(),
+                    rows,
+                    cols,
+                    eps,
+                    act,
+                )?;
+                return_2d_gpu_result(out, rows, cols, tx || tr)?
+            }
+            "gpu_kernel_inspect" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("gpu_kernel_inspect expects (kind[, opts])".into());
+                }
+                let kind = match &a[0] {
+                    Val::Str(s) => s.as_str(),
+                    _ => return Err("gpu_kernel_inspect kind must be String".into()),
+                };
+                let act = match a.get(1) {
+                    Some(Val::Str(s)) => s.as_str(),
+                    _ => "none",
+                };
+                let act_code = crate::gpu::parse_fused_act_code(act)?;
+                let (spv, hlsl, has_wg) = match kind {
+                    "tiled_matmul" => (
+                        crate::spirv::spirv_tiled_matmul(),
+                        crate::gpu::hlsl_tiled_matmul(),
+                        true,
+                    ),
+                    "attention" => (
+                        crate::spirv::spirv_attention(false),
+                        crate::gpu::hlsl_attention(false),
+                        false,
+                    ),
+                    "attention_causal" => (
+                        crate::spirv::spirv_attention(true),
+                        crate::gpu::hlsl_attention(true),
+                        false,
+                    ),
+                    "fused_layernorm" => (
+                        crate::spirv::spirv_fused_layernorm_residual(act_code, true),
+                        crate::gpu::hlsl_fused_layernorm_residual(act_code, true),
+                        false,
+                    ),
+                    other => {
+                        return Err(format!(
+                            "gpu_kernel_inspect unknown kernel '{other}'; expected tiled_matmul, attention, attention_causal, or fused_layernorm"
+                        ));
+                    }
+                };
+                Val::Map(vec![
+                    (
+                        Val::Str("spirv_words".into()),
+                        Val::List(spv.into_iter().map(|w| Val::Num(w as f64)).collect()),
+                    ),
+                    (Val::Str("hlsl".into()), Val::Str(hlsl)),
+                    (Val::Str("uses_workgroup_shared".into()), Val::Bool(has_wg)),
+                ])
+            }
+            "tensor_cast_dtype" => {
+                if a.len() != 2 {
+                    return Err("tensor_cast_dtype expects (tensor_or_list, dtype)".into());
+                }
+                let dtype = match &a[1] {
+                    Val::Str(s) => s.as_str(),
+                    _ => return Err("tensor_cast_dtype dtype must be String".into()),
+                };
+                if let Ok(tid) = tensor_id(&a[0]) {
+                    let snap = tensor_snapshot(tid)?;
+                    let cast = cast_f64_slice_dtype(&snap.data, dtype)?;
+                    tensor_store_on_device(
+                        cast,
+                        snap.shape,
+                        snap.requires_grad,
+                        TensorOp::Leaf,
+                        &snap.device,
+                    )?
                 } else {
-                    let rows = out.chunks(ncols).map(|r| r.to_vec()).collect::<Vec<_>>();
-                    matrix_to_val(rows)
+                    let raw = as_num_list(&a[0])?;
+                    nums_to_val(cast_f64_slice_dtype(&raw, dtype)?)
                 }
             }
             _ => return Ok(None),
         };
         Ok(Some(v))
+    }
+}
+
+fn extract_mat_or_tensor2d(
+    val: &Val,
+    label: &str,
+    allow_1d_row: bool,
+) -> Result<(Vec<f64>, usize, usize, bool), String> {
+    if let Ok(tid) = tensor_id(val) {
+        let snap = tensor_snapshot(tid)?;
+        if snap.shape.len() == 2 {
+            Ok((snap.data, snap.shape[0], snap.shape[1], true))
+        } else if allow_1d_row && snap.shape.len() == 1 {
+            Ok((snap.data, 1, snap.shape[0], true))
+        } else {
+            Err(format!("{label} expects a 2D tensor"))
+        }
+    } else {
+        let mat = as_matrix(val)?;
+        let rows = mat.len();
+        let cols = mat[0].len();
+        Ok((mat.into_iter().flatten().collect(), rows, cols, false))
+    }
+}
+
+fn extract_1d_vec(val: &Val, expected_len: usize, label: &str) -> Result<Vec<f64>, String> {
+    let v = if let Ok(tid) = tensor_id(val) {
+        tensor_snapshot(tid)?.data
+    } else {
+        as_num_list(val)?
+    };
+    if v.len() != expected_len {
+        return Err(format!(
+            "{label} len {} != expected {expected_len}",
+            v.len()
+        ));
+    }
+    Ok(v)
+}
+
+fn return_2d_gpu_result(
+    out: Vec<f64>,
+    rows: usize,
+    cols: usize,
+    as_tensor: bool,
+) -> Result<Val, String> {
+    if as_tensor {
+        tensor_store_on_device(out, vec![rows, cols], false, TensorOp::Leaf, "gpu")
+    } else {
+        let mat = out.chunks(cols).map(|r| r.to_vec()).collect::<Vec<_>>();
+        Ok(matrix_to_val(mat))
     }
 }

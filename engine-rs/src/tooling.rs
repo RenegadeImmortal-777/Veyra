@@ -11,6 +11,7 @@ use crate::ast::Stmt;
 use crate::lexer::lex;
 use crate::parser::Parser;
 use crate::pipeline::{compile_source, load_source};
+use crate::value::Val;
 use crate::vm::Vm;
 
 pub(crate) fn debug_file(path: &Path) -> Result<(), String> {
@@ -165,13 +166,44 @@ pub(crate) fn profile_file(path: &Path) -> Result<(), String> {
     let code = compile_source(&src)?;
     let compile_ms = start_compile.elapsed().as_secs_f64() * 1000.0;
     let start_run = Instant::now();
-    Vm::new(code.clone()).run()?;
+    let mut vm = Vm::new(code.clone());
+    vm.profile_start();
+    vm.run()?;
+    let _ = vm.profile_stop()?;
     let run_ms = start_run.elapsed().as_secs_f64() * 1000.0;
+    let rows = vm.profile_report_rows();
+    let gc = vm.gc_stats()?;
     println!("profile {}", path.display());
     println!("  source_bytes: {}", src.len());
     println!("  bytecode_ops: {}", code.len());
     println!("  compile_ms: {compile_ms:.3}");
     println!("  run_ms: {run_ms:.3}");
+    if let Val::Map(pairs) = gc {
+        let mut collections = 0.0;
+        let mut auto_arenas = 0.0;
+        for (k, v) in pairs {
+            if let (Val::Str(ks), Val::Num(n)) = (k, v) {
+                match ks.as_str() {
+                    "collections" => collections = n,
+                    "auto_arena_scopes" => auto_arenas = n,
+                    _ => {}
+                }
+            }
+        }
+        println!("  gc_collections: {collections:.0}");
+        println!("  auto_arena_scopes: {auto_arenas:.0}");
+    }
+    if !rows.is_empty() {
+        println!("  hot_functions:");
+        for (name, st) in rows.into_iter().take(10) {
+            let total_ms = st.total_ns as f64 / 1_000_000.0;
+            let self_ms = st.self_ns as f64 / 1_000_000.0;
+            println!(
+                "    {name}: calls={} total_ms={total_ms:.4} self_ms={self_ms:.4}",
+                st.calls
+            );
+        }
+    }
     Ok(())
 }
 

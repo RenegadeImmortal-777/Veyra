@@ -66,6 +66,52 @@ fn op_tag(tag: String) -> Map {
     return {"op": tag};
 }
 
+fn is_const_num(op_obj: Map) -> Bool {
+    if op_obj["op"] != "Const" {
+        return false;
+    }
+    return op_obj["val"]["t"] == "num";
+}
+
+fn fold_binary_tail(ops: List, tag: String) -> List {
+    let n = len(ops);
+    if n >= 2 {
+        let a = ops[n - 2];
+        let b = ops[n - 1];
+        if is_const_num(a) and is_const_num(b) {
+            let av = a["val"]["v"];
+            let bv = b["val"]["v"];
+            if tag == "Add" {
+                return append(slice(ops, 0, n - 2), op_const_num(av + bv));
+            }
+            if tag == "Sub" {
+                return append(slice(ops, 0, n - 2), op_const_num(av - bv));
+            }
+            if tag == "Mul" {
+                return append(slice(ops, 0, n - 2), op_const_num(av * bv));
+            }
+            if tag == "Div" and bv != 0 {
+                return append(slice(ops, 0, n - 2), op_const_num(av / bv));
+            }
+            if tag == "Mod" and bv != 0 {
+                return append(slice(ops, 0, n - 2), op_const_num(av % bv));
+            }
+        }
+    }
+    return append(ops, op_tag(tag));
+}
+
+fn fold_neg_tail(ops: List) -> List {
+    let n = len(ops);
+    if n >= 1 {
+        let a = ops[n - 1];
+        if is_const_num(a) {
+            return append(slice(ops, 0, n - 1), op_const_num(0 - a["val"]["v"]));
+        }
+    }
+    return append(ops, op_tag("Neg"));
+}
+
 fn unescape_str(raw_tok: String) -> String {
     let inner = slice(raw_tok, 1, len(raw_tok) - 1);
     let chunks = regex_findall("\\\\.|[^\\\\]+", inner);
@@ -197,9 +243,9 @@ fn emit_add(ops: List) -> List {
         let op = advance();
         ops = emit_mul(ops);
         if op == "+" {
-            ops = append(ops, op_tag("Add"));
+            ops = fold_binary_tail(ops, "Add");
         } else {
-            ops = append(ops, op_tag("Sub"));
+            ops = fold_binary_tail(ops, "Sub");
         }
     }
     return ops;
@@ -211,11 +257,11 @@ fn emit_mul(ops: List) -> List {
         let op = advance();
         ops = emit_unary(ops);
         if op == "*" {
-            ops = append(ops, op_tag("Mul"));
+            ops = fold_binary_tail(ops, "Mul");
         } else if op == "/" {
-            ops = append(ops, op_tag("Div"));
+            ops = fold_binary_tail(ops, "Div");
         } else {
-            ops = append(ops, op_tag("Mod"));
+            ops = fold_binary_tail(ops, "Mod");
         }
     }
     return ops;
@@ -230,7 +276,7 @@ fn emit_unary(ops: List) -> List {
     if peek() == "-" {
         advance();
         ops = emit_unary(ops);
-        return append(ops, op_tag("Neg"));
+        return fold_neg_tail(ops);
     }
     return emit_postfix(ops);
 }

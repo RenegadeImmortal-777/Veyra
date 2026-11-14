@@ -4663,19 +4663,18 @@ let live_b = Node("liveB");
 live_a.next = live_b;
 live_b.next = live_a;
 
-fn build_garbage_cycles() -> Null {
-    let i = 0;
-    while i < 12 {
-        let x = Node("dead" + str(i));
-        let y = Node("deadPair" + str(i));
-        x.next = y;
-        y.next = x;
-        i = i + 1;
-    }
-    return null;
+let ci = 0;
+let gx = null;
+let gy = null;
+while ci < 12 {
+    gx = Node("dead" + str(ci));
+    gy = Node("deadPair" + str(ci));
+    gx.next = gy;
+    gy.next = gx;
+    ci = ci + 1;
 }
-
-build_garbage_cycles();
+gx = null;
+gy = null;
 let rep1 = gc_collect();
 assert(rep1["collected"] >= 24, "expected dead cycles swept, got " + str(rep1));
 assert(live_a.label == "liveA" and live_a.next.label == "liveB" and live_a.next.next.label == "liveA");
@@ -5547,15 +5546,13 @@ let young_child = BoxNode("young_live");
 old_holder.child = young_child;
 young_child = null; // only reachable via old_holder -> remembered_set!
 
-fn alloc_nursery_garbage() -> Null {
-    let i = 0;
-    while i < 10 {
-        let g = BoxNode("dead_" + str(i));
-        i = i + 1;
-    }
-    return null;
+// Top-level loop places unreferenced objects directly in nursery so minor GC sweeps them
+let ni = 0;
+while ni < 10 {
+    let tmp_n = BoxNode("dead_" + str(ni));
+    tmp_n = null;
+    ni = ni + 1;
 }
-alloc_nursery_garbage();
 
 let st_wb = gc_stats();
 assert(st_wb["write_barriers"] >= 1, "expected write barrier on old->nursery store");
@@ -6019,5 +6016,517 @@ if has_np {
         recv_resp(&mut reader, &mut events, "disconnect");
         srv_handle.join().unwrap().unwrap();
         let _ = fs::remove_file(&prog);
+    }
+
+    #[test]
+    fn gpu_tiled_flash_attention_fused_ln_and_mixed_precision() {
+        let vy_src = r#"
+// 1. Inspect Workgroup shared-memory tiled GEMM & Flash-style online attention kernels
+let tm = gpu_kernel_inspect("tiled_matmul");
+assert(int(tm["spirv_words"][0]) == 119734787);
+assert(tm["uses_workgroup_shared"] == true);
+assert(contains(tm["hlsl"], "groupshared") and contains(tm["hlsl"], "GroupMemoryBarrierWithGroupSync"));
+
+let ak = gpu_kernel_inspect("attention_causal");
+assert(int(ak["spirv_words"][0]) == 119734787);
+assert(contains(ak["hlsl"], "exp(") and contains(ak["hlsl"], "min(SeqK, qRow + 1)"));
+
+// 2. Non-tile-aligned matrix multiply via gpu_tiled_matmul (19 x 21 @ 21 x 17)
+let A = [];
+let i = 0;
+while i < 19 {
+    let row = [];
+    let j = 0;
+    while j < 21 {
+        row = append(row, ((i + 1) * 0.25) + (j * 0.1));
+        j = j + 1;
+    }
+    A = append(A, row);
+    i = i + 1;
+}
+let B = [];
+let r = 0;
+while r < 21 {
+    let row = [];
+    let c = 0;
+    while c < 17 {
+        row = append(row, ((r % 5) - 2) * 0.5 + (c * 0.05));
+        c = c + 1;
+    }
+    B = append(B, row);
+    r = r + 1;
+}
+let C_tiled = gpu_tiled_matmul(A, B);
+let C_ref = gpu_matmul(A, B);
+assert(len(C_tiled) == 19 and len(C_tiled[0]) == 17);
+let ri = 0;
+while ri < 19 {
+    let ci = 0;
+    while ci < 17 {
+        assert(abs(C_tiled[ri][ci] - C_ref[ri][ci]) < 0.001, "tiled gemm mismatch");
+        ci = ci + 1;
+    }
+    ri = ri + 1;
+}
+
+// 3. Causal vs non-causal online-softmax scaled dot-product attention
+let Q = [[1.0, 0.0], [0.0, 1.0]];
+let K = [[1.0, 0.0], [0.0, 1.0]];
+let V = [[10.0, 1.0], [2.0, 20.0]];
+let att_causal = gpu_attention(Q, K, V, true);
+// Query 0 attends strictly to key 0 in causal mode -> [10.0, 1.0]
+assert(abs(att_causal[0][0] - 10.0) < 0.0001 and abs(att_causal[0][1] - 1.0) < 0.0001);
+// Query 1 attends to keys 0 & 1 with scores [0, 1/sqrt(2)]: key 1 dominates over [0]
+assert(att_causal[1][1] > att_causal[1][0]);
+
+let att_full = gpu_attention(Q, K, V, false);
+// In full mode, query 0 sees key 1 as well, so att_full[0][1] > 1.0
+assert(att_full[0][1] > 2.0 and att_full[0][0] < 10.0);
+
+// 4. Single-pass fused Residual + LayerNorm + affine + SiLU activation
+let X = [[1.0, 3.0], [2.0, 2.0]];
+let R = [[1.0, -1.0], [0.0, 0.0]];
+let gamma = [2.0, 2.0];
+let beta = [0.0, 0.0];
+let fln = gpu_fused_layernorm(X, R, gamma, beta, 0.00001, "none");
+// Row 0 sum X+R = [2, 2] -> mean=2, centered=[0,0] -> [0, 0]
+assert(abs(fln[0][0]) < 0.0001 and abs(fln[0][1]) < 0.0001);
+
+// Row with distinct elements + SiLU
+let fln2 = gpu_fused_layernorm([[0.0, 2.0]], [[0.0, 0.0]], [1.0, 1.0], [0.0, 0.0], 0.000001, "silu");
+// centered=[-1, 1], std=1 -> [-1, 1] -> silu(1) ~= 0.731058, silu(-1) ~= -0.268941
+assert(abs(fln2[0][1] - (1.0 / (1.0 + exp(-1.0)))) < 0.001);
+assert(abs(fln2[0][0] - (-1.0 / (1.0 + exp(1.0)))) < 0.001);
+
+// 5. Mixed-precision IEEE-754 f16 and bf16 quantization round-trip
+let t_orig = tensor([1.234567, -0.333333, 42.5], false);
+let t_f16 = tensor_cast_dtype(t_orig, "f16");
+let t_bf16 = tensor_cast_dtype(t_orig, "bf16");
+let v16 = tensor_values(t_f16);
+let vbf = tensor_values(t_bf16);
+assert(abs(v16[0] - 1.234375) < 0.002);
+assert(abs(vbf[0] - 1.234375) < 0.01);
+assert(abs(vbf[2] - 42.5) < 0.0001);
+
+// Also check gpu_attention and gpu_tiled_matmul directly with Tensor handles
+let qt = tensor([[1.0, 0.0], [0.0, 1.0]], false);
+let kt = tensor([[1.0, 0.0], [0.0, 1.0]], false);
+let vt = tensor([[10.0, 1.0], [2.0, 20.0]], false);
+let out_t = gpu_attention(qt, kt, vt, true);
+assert(tensor_shape(out_t) == [2, 2]);
+assert(abs(tensor_values(out_t)[0] - 10.0) < 0.0001);
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn formal_relational_loop_counterexample_and_auto_arena() {
+        // 1. Relational bounds, branch join, loop invariants, and callee postcondition propagation
+        let proven_src = r#"
+@verify
+fn rel_diff(a: Int, b: Int) -> Int {
+    requires(b > a, "strict order");
+    return 100 / (b - a);
+}
+
+@verify
+fn branch_join(flag: Int) -> Int {
+    let y = 0;
+    if flag > 0 {
+        y = 2;
+    } else {
+        y = 4;
+    }
+    return 20 / y;
+}
+
+@verify
+fn loop_inv_and_exit() -> Int {
+    let k = 5;
+    let i = 0;
+    while i < 4 {
+        i = i + 1;
+    }
+    return 20 / k + 20 / i;
+}
+
+@verify
+fn positive_denom() -> Int {
+    let res = 5;
+    ensures(res >= 2, "at least 2");
+    return res;
+}
+
+@verify
+fn use_callee_ensures() -> Int {
+    let d = positive_denom();
+    return 100 / d;
+}
+
+assert(rel_diff(2, 7) == 20);
+assert(branch_join(1) == 10 and branch_join(0) == 5);
+assert(loop_inv_and_exit() == 9);
+assert(use_callee_ensures() == 20);
+"#;
+        assert_eq!(run_source(proven_src), Ok(()));
+        let report_ok = crate::pipeline::verify_source_strict(proven_src).unwrap();
+        assert_eq!(report_ok["ok"], serde_json::json!(true), "{report_ok}");
+
+        // 2. Concrete counterexample synthesis when safety fails
+        let unsafe_src = r#"
+@verify
+fn unsafe_div(a: Int, b: Int) -> Int {
+    requires(a >= 1, "a>=1");
+    return a / b;
+}
+"#;
+        let report_bad = crate::pipeline::verify_source_strict(unsafe_src).unwrap();
+        assert_eq!(report_bad["ok"], serde_json::json!(false));
+        let cxs = report_bad["counterexamples"].as_array().unwrap();
+        assert!(
+            !cxs.is_empty(),
+            "expected counterexample witness in {report_bad}"
+        );
+        assert_eq!(cxs[0]["b"], serde_json::json!(0.0));
+
+        // 3. Linear move semantics via actor_send
+        let lin_actor_ok = r#"
+@linear
+fn alloc_token() -> String { return "tok-linear"; }
+fn worker(msg, state) { return [msg, state]; }
+let aid = actor_spawn(worker, 0);
+let t = alloc_token();
+actor_send(aid, t);
+actor_stop(aid);
+"#;
+        assert!(compile_source(lin_actor_ok).is_ok());
+
+        let lin_uaf = r#"
+@linear
+fn alloc_token() -> String { return "tok-linear"; }
+let t = alloc_token();
+actor_send(1, t);
+print(t);
+"#;
+        let err_uaf = compile_source(lin_uaf).unwrap_err();
+        assert!(err_uaf.contains("ownership error"), "got: {err_uaf}");
+
+        // 4. Automatic compile-time escape-analysis arena lowering reclaims dead temporaries automatically
+        let auto_arena_src = r#"
+class ScratchNode {
+    fn init(self, v: Int) -> Null {
+        self.v = v;
+        return null;
+    }
+}
+
+fn process_batch(n: Int) -> ScratchNode {
+    let a = ScratchNode(n);
+    let b = ScratchNode(n + 1);
+    let c = ScratchNode(n + 2);
+    return ScratchNode(a.v + b.v + c.v);
+}
+
+let before = gc_stats();
+let last_out = null;
+let step = 0;
+while step < 5 {
+    last_out = process_batch(step);
+    step = step + 1;
+}
+let after = gc_stats();
+assert(last_out.v == 15);
+assert(after["auto_arena_scopes"] >= before["auto_arena_scopes"] + 5);
+assert(after["arena_freed"] >= before["arena_freed"] + 15);
+"#;
+        assert_eq!(run_source(auto_arena_src), Ok(()));
+    }
+
+    #[test]
+    fn distributed_tcp_actor_and_location_transparency() {
+        let src = r#"
+fn acc_actor(state: Int, msg: Int) -> Map {
+    let next = state + msg;
+    return {"state": next, "reply": next};
+}
+
+let wid = actor_spawn(acc_actor, {"init": 0});
+let node = actor_node_listen(wid, 0);
+assert(node["actor_id"] == wid);
+assert(node["port"] > 0);
+
+assert(actor_remote_send(node["addr"], 10) == true);
+let r1 = actor_remote_ask(node, 5, 5000);
+assert(r1 == 15);
+
+let r2 = actor_remote_ask(wid, 7, 5000);
+assert(r2 == 22);
+
+let r3 = actor_remote_ask("local:" + str(wid), 3, 5000);
+assert(r3 == 25);
+
+assert(actor_node_stop(node) == true);
+assert(actor_stop(wid) == true);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+
+        let bad_linear = r#"
+@linear
+fn alloc_cap() -> String { return "tx_cap"; }
+let token = alloc_cap();
+actor_remote_send("127.0.0.1:9", token);
+let _again = token;
+"#;
+        let rep = crate::pipeline::verify_source_strict(bad_linear).expect("report");
+        let errs = rep
+            .get("diagnostics")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert!(
+            rep.get("ok").and_then(|v| v.as_bool()) == Some(false) && errs > 0,
+            "expected linear move error on actor_remote_send: {rep}"
+        );
+    }
+
+    #[test]
+    fn sim_virtual_fs_crash_fault_and_deterministic_replay() {
+        let src = r#"
+fn run_vfs_episode(seed: Int) -> Map {
+    sim_start(seed);
+    assert(sim_fs_write("/wal/seg1.log", "committed_v1") == 12);
+    assert(sim_fs_sync() == 1);
+    assert(sim_fs_write("/wal/dirty.tmp", "unflushed") == 9);
+    assert(sim_fs_delete("/wal/seg1.log") == true);
+
+    let crash_info = sim_fs_crash();
+    assert(crash_info["lost_dirty"] == 2);
+    assert(sim_fs_read("/wal/seg1.log") == "committed_v1");
+
+    let missing_ok = false;
+    try {
+        let _ = sim_fs_read("/wal/dirty.tmp");
+    } catch e {
+        missing_ok = true;
+    }
+    assert(missing_ok);
+
+    sim_fault("fs.write", 0.5);
+    let ops = [];
+    let i = 0;
+    while i < 6 {
+        try {
+            let n = sim_fs_write("/wal/batch_" + str(i) + ".dat", "payload_" + str(i));
+            ops.push("ok:" + str(n));
+        } catch err {
+            ops.push("fault");
+        }
+        i = i + 1;
+    }
+    let _ = sim_fs_sync();
+    let files = sim_fs_list("/wal");
+    let snap = sim_fs_snapshot();
+    sim_stop();
+    return {"ops": ops, "files": files, "snap": snap};
+}
+
+let a = run_vfs_episode(4242);
+let b = run_vfs_episode(4242);
+assert(a["ops"] == b["ops"]);
+assert(a["files"] == b["files"]);
+assert(a["snap"]["synced"] == b["snap"]["synced"]);
+assert(len(a["files"]) >= 1);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+    }
+
+    #[test]
+    fn profile_flight_recorder_and_tooling_report() {
+        let src = r#"
+fn leaf(x: Int) -> Int {
+    return x * 2 + 1;
+}
+
+fn work(n: Int) -> Int {
+    let acc = 0;
+    let i = 0;
+    while i < n {
+        acc = acc + leaf(i);
+        i = i + 1;
+    }
+    return acc;
+}
+
+profile_start();
+let total = work(8);
+let scoped = arena_scope(fn() { return leaf(1) + leaf(2) + leaf(3); });
+let rep = profile_stop();
+
+assert(total == 64);
+assert(scoped == 15);
+assert(rep["active"] == false);
+assert(rep["total_calls"] >= 12);
+
+let fns = rep["functions"];
+let work_calls = 0;
+let leaf_calls = 0;
+for item in fns {
+    if item["name"] == "work" {
+        work_calls = item["calls"];
+    }
+    if item["name"] == "leaf" {
+        leaf_calls = item["calls"];
+    }
+}
+assert(work_calls == 1);
+assert(leaf_calls == 11);
+assert(rep["gc"]["live_objects"] >= 0);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("veyra_sprint8_profile_test.vy");
+        std::fs::write(
+            &file_path,
+            "fn helper(n) { return n + 1; }\nlet total = 0;\nfor i in range(0, 5) { total = total + helper(i); }\n",
+        )
+        .expect("write temp profile test");
+        let prof_res = tooling::profile_file(&file_path);
+        let _ = std::fs::remove_file(&file_path);
+        assert_eq!(prof_res, Ok(()));
+    }
+
+    #[test]
+    fn self_hosted_compiler_peephole_const_fold() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let compiler_src = fs::read_to_string(root.join("compiler-vy").join("src").join("main.vy"))
+            .expect("read compiler-vy/src/main.vy");
+        let check_src = format!(
+            "{compiler_src}\n\
+            let bc = compile_veyra_to_vybc(\"return (2 + 3 * 4) - 1 + (-2);\");\n\
+            let parsed = json_parse(bc);\n\
+            let ops = parsed[\"ops\"];\n\
+            assert(len(ops) == 3);\n\
+            assert(ops[0][\"op\"] == \"Const\");\n\
+            assert(ops[0][\"val\"][\"v\"] == 11);\n\
+            assert(ops[1][\"op\"] == \"Return\");\n\
+            assert(ops[2][\"op\"] == \"Halt\");\n\
+            vybc_run(bc);\n\
+            let check_bc = compile_veyra_to_vybc(\"let v = (2 + 3 * 4) - 1 + (-2); assert(v == 11);\");\n\
+            vybc_run(check_bc);\n"
+        );
+        assert_eq!(run_source(&check_src), Ok(()));
+    }
+
+    #[test]
+    fn century_apex_all_pillars_end_to_end() {
+        // 1. Formal relational + loop proof & counterexample witness synthesis
+        let formal_src = r#"
+@verify
+fn bounded_dot_idx(n: Int) -> Int {
+    requires(n >= 1, "n >= 1");
+    let i = 0;
+    while i < 4 {
+        i = i + 1;
+    }
+    let out = n + i;
+    ensures(out >= 5, "out >= 5");
+    return out;
+}
+
+@verify
+fn risky_div(x: Int) -> Int {
+    requires(x >= 0, "x >= 0");
+    return 100 / x;
+}
+"#;
+        let vrep = crate::pipeline::verify_source_strict(formal_src).expect("verify report");
+        assert_eq!(vrep["contracts_proven"].as_u64(), Some(1), "vrep={vrep}");
+        assert!(
+            vrep["counterexamples"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "expected concrete counterexample witness for risky_div: {vrep}"
+        );
+
+        // 2. Runtime multi-pillar integration: GPU + Auto-Arena + Profiler + Dist TCP + VFS Sim
+        let multi_src = r#"
+let ir_m = gpu_kernel_inspect("tiled_matmul");
+let ir_a = gpu_kernel_inspect("attention_causal");
+assert(ir_m["uses_workgroup_shared"] == true);
+assert(len(ir_a["spirv_words"]) > 20);
+assert(contains(ir_m["hlsl"], "groupshared"));
+
+let a = [[1.0, 2.0], [3.0, 4.0]];
+let b = [[2.0, 0.0], [1.0, 2.0]];
+let c = gpu_tiled_matmul(a, b);
+assert(c[0][0] == 4.0 and c[1][1] == 8.0);
+
+let attn = gpu_attention([[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], [[10.0, 0.0], [0.0, 20.0]], true);
+assert(abs(attn[0][0] - 10.0) < 0.0001 and abs(attn[0][1]) < 0.0001);
+
+let fnorm = gpu_fused_layernorm([[1.0, 3.0]], [[0.0, 0.0]], [1.0, 1.0], [0.0, 0.0], 0.00001, "gelu");
+assert(len(fnorm) == 1 and fnorm[0][1] > 0.0);
+
+let bf = tensor_cast_dtype(tensor([[1.5, -2.25]], false), "bf16");
+assert(abs(tensor_values(bf)[0] - 1.5) < 0.02);
+
+class Ephemeral { fn __init__(self, v) { self.v = v; } }
+fn hot_step(x: Int) -> Ephemeral {
+    let tmp = Ephemeral(x + 1);
+    return Ephemeral(tmp.v * 2);
+}
+
+profile_start();
+let acc = 0;
+for k in range(0, 6) {
+    let obj = hot_step(k);
+    acc = acc + obj.v;
+}
+let prof = profile_stop();
+assert(acc == 42);
+assert(prof["gc"]["auto_arena_scopes"] >= 6);
+assert(prof["total_calls"] >= 6);
+
+fn svc(st: Int, msg: Int) -> Map {
+    return {"state": st + msg, "reply": st + msg};
+}
+let aid = actor_spawn(svc, {"init": 100});
+let node = actor_node_listen(aid, 0);
+assert(actor_remote_ask(node["addr"], 23, 5000) == 123);
+assert(actor_node_stop(node) == true);
+assert(actor_stop(aid) == true);
+
+sim_start(99);
+assert(sim_fs_write("/ckpt/meta.json", "{\"step\":1}") == 10);
+assert(sim_fs_sync() == 1);
+assert(sim_fs_write("/ckpt/tmp.json", "dirty") == 5);
+let crash = sim_fs_crash();
+assert(crash["lost_dirty"] == 1);
+assert(sim_fs_read("/ckpt/meta.json") == "{\"step\":1}");
+sim_stop();
+"#;
+        assert_eq!(run_source(multi_src), Ok(()));
+
+        // 3. Standalone WASM + Direct PE32+ / ELF64 native emission (zero external linker)
+        let poly_src = "fn calc(n: Int) -> Int { return n * n + 7; }\ncalc(6);\n";
+        let wasm = crate::native_codegen::compile_source_to_wasm(poly_src).expect("wasm bytes");
+        assert!(wasm.starts_with(b"\0asm\x01\0\0\0"));
+        let (res, _) = crate::native_codegen::wasm_run(&wasm, "calc", &[6.0]).expect("wasm run");
+        assert!((res - 43.0).abs() < 1e-9);
+
+        let pe = crate::native_codegen::compile_source_to_direct_binary(
+            poly_src,
+            crate::native_codegen::DirectNativeFormat::Pe64,
+        )
+        .expect("direct PE64");
+        assert!(pe.starts_with(b"MZ"));
+
+        let elf = crate::native_codegen::compile_source_to_direct_binary(
+            poly_src,
+            crate::native_codegen::DirectNativeFormat::Elf64,
+        )
+        .expect("direct ELF64");
+        assert!(elf.starts_with(b"\x7FELF"));
     }
 }

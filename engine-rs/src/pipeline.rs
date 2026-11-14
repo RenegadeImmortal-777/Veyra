@@ -3,7 +3,7 @@
 //
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -350,18 +350,29 @@ fn builtin_effect_tag(name: &str) -> Option<&'static str> {
         | "is_dir" | "list_dir" | "mkdir" | "sqlite_open" | "sqlite_exec" | "sqlite_query" => {
             Some("fs")
         }
-        "http_request" | "http_get" | "http_post" | "http_serve" | "ws_connect" => Some("net"),
+        "http_request" | "http_get" | "http_post" | "http_serve" | "ws_connect"
+        | "actor_node_listen" | "actor_node_stop" | "actor_remote_send" | "actor_remote_ask" => {
+            Some("net")
+        }
         "shell" | "spawn_process" | "exit" => Some("process"),
         "env_get" | "env_set" | "now_ms" | "time_ms" | "rand" | "rand_int" | "uuid_v4" | "cwd" => {
             Some("env")
         }
         "plugin_load" | "plugin_call" | "plugin_build" | "py_import" | "py_call" | "py_eval"
         | "py_exec" | "wasm_run" => Some("ffi"),
-        "gpu_map" | "gpu_reduce" | "gpu_matmul" | "gpu_fuse" | "gpu_fused_linear" => Some("gpu"),
+        "gpu_map"
+        | "gpu_reduce"
+        | "gpu_matmul"
+        | "gpu_tiled_matmul"
+        | "gpu_fuse"
+        | "gpu_fused_linear"
+        | "gpu_attention"
+        | "gpu_fused_layernorm" => Some("gpu"),
         "actor_spawn" | "actor_send" | "actor_ask" | "actor_stop" | "supervisor_spawn"
         | "sim_start" | "sim_stop" | "sim_actor_spawn" | "sim_actor_send" | "sim_step"
-        | "sim_run_until" | "sim_partition" | "cap_restrict" | "gc_collect" | "gc_pause"
-        | "gc_resume" | "arena_scope" => Some("state"),
+        | "sim_run_until" | "sim_partition" | "sim_fs_write" | "sim_fs_delete" | "sim_fs_sync"
+        | "sim_fs_crash" | "profile_start" | "profile_stop" | "cap_restrict" | "gc_collect"
+        | "gc_pause" | "gc_resume" | "arena_scope" => Some("state"),
         _ => None,
     }
 }
@@ -1154,6 +1165,34 @@ fn verify_linear_resources(ast: &[Stmt], errors: &mut Vec<String>) {
                 }
                 return false;
             }
+            if matches!(
+                name,
+                "actor_send"
+                    | "actor_ask"
+                    | "actor_remote_send"
+                    | "actor_remote_ask"
+                    | "sim_actor_send"
+                    | "chan_send"
+                    | "channel_send"
+            ) {
+                for (i, a) in args.iter().enumerate() {
+                    if i >= 1
+                        && let Expr::Var(v) = a
+                        && state.contains_key(v)
+                    {
+                        consume_var(v, state, errors);
+                    } else {
+                        let _ = check_linear_expr(
+                            a,
+                            state,
+                            linear_constructors,
+                            linear_fn_params,
+                            errors,
+                        );
+                    }
+                }
+                return false;
+            }
             let moves_args =
                 linear_constructors.contains(name) || linear_fn_params.contains_key(name);
             for a in args {
@@ -1452,13 +1491,88 @@ impl AbsInterval {
     fn definitely_nonzero(&self) -> bool {
         self.non_zero || self.lo > 0.0 || self.hi < 0.0
     }
+    fn join(&self, other: &Self) -> Self {
+        let lo = if self.lo.is_nan() || other.lo.is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            self.lo.min(other.lo)
+        };
+        let hi = if self.hi.is_nan() || other.hi.is_nan() {
+            f64::INFINITY
+        } else {
+            self.hi.max(other.hi)
+        };
+        let list_len = if self.list_len == other.list_len {
+            self.list_len
+        } else {
+            None
+        };
+        Self {
+            lo,
+            hi,
+            non_zero: self.definitely_nonzero() && other.definitely_nonzero(),
+            list_len,
+        }
+    }
 }
 
-#[derive(Default)]
+/// Relational difference bounds `(x, y) -> (strict, k)` representing `x - y > k` (strict) or `x - y >= k`.
+type RelMap = BTreeMap<(String, String), (bool, f64)>;
+
+fn insert_rel_bound(rels: &mut RelMap, x: String, y: String, strict: bool, k: f64) {
+    if x == y {
+        return;
+    }
+    let replace = match rels.get(&(x.clone(), y.clone())) {
+        None => true,
+        Some(&(old_s, old_k)) => k > old_k || (k == old_k && strict && !old_s),
+    };
+    if replace {
+        rels.insert((x, y), (strict, k));
+    }
+}
+
+fn intersect_rels(a: &RelMap, b: &RelMap) -> RelMap {
+    let mut out = RelMap::new();
+    for (k, &(sa, va)) in a {
+        if let Some(&(sb, vb)) = b.get(k) {
+            if va < vb {
+                out.insert(k.clone(), (sa, va));
+            } else if vb < va {
+                out.insert(k.clone(), (sb, vb));
+            } else {
+                out.insert(k.clone(), (sa && sb, va));
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug, Default)]
 struct VerifySummary {
     functions_checked: usize,
     contracts_proven: usize,
     invariants_checked: usize,
+    counterexamples: Vec<JsonValue>,
+}
+
+fn interval_from_bounds(raw_lo: f64, raw_hi: f64) -> AbsInterval {
+    let lo = if raw_lo.is_nan() {
+        f64::NEG_INFINITY
+    } else {
+        raw_lo
+    };
+    let hi = if raw_hi.is_nan() {
+        f64::INFINITY
+    } else {
+        raw_hi
+    };
+    AbsInterval {
+        lo,
+        hi,
+        non_zero: lo > 0.0 || hi < 0.0,
+        list_len: None,
+    }
 }
 
 fn eval_interval(expr: &Expr, env: &HashMap<String, AbsInterval>) -> AbsInterval {
@@ -1484,34 +1598,8 @@ fn eval_interval(expr: &Expr, env: &HashMap<String, AbsInterval>) -> AbsInterval
             let a = eval_interval(l, env);
             let b = eval_interval(r, env);
             match op.as_str() {
-                "+" if a.lo.is_finite()
-                    && a.hi.is_finite()
-                    && b.lo.is_finite()
-                    && b.hi.is_finite() =>
-                {
-                    let lo = a.lo + b.lo;
-                    let hi = a.hi + b.hi;
-                    AbsInterval {
-                        lo,
-                        hi,
-                        non_zero: lo > 0.0 || hi < 0.0,
-                        list_len: None,
-                    }
-                }
-                "-" if a.lo.is_finite()
-                    && a.hi.is_finite()
-                    && b.lo.is_finite()
-                    && b.hi.is_finite() =>
-                {
-                    let lo = a.lo - b.hi;
-                    let hi = a.hi - b.lo;
-                    AbsInterval {
-                        lo,
-                        hi,
-                        non_zero: lo > 0.0 || hi < 0.0,
-                        list_len: None,
-                    }
-                }
+                "+" => interval_from_bounds(a.lo + b.lo, a.hi + b.hi),
+                "-" => interval_from_bounds(a.lo - b.hi, a.hi - b.lo),
                 "*" if a.lo.is_finite()
                     && a.hi.is_finite()
                     && b.lo.is_finite()
@@ -1673,6 +1761,327 @@ fn eval_cond_static(cond: &Expr, env: &HashMap<String, AbsInterval>) -> Option<b
     }
 }
 
+fn eval_cond_static_rel(
+    cond: &Expr,
+    env: &HashMap<String, AbsInterval>,
+    rels: &RelMap,
+) -> Option<bool> {
+    if let Expr::Bin(l, op, r) = cond
+        && let (Expr::Var(vx), Expr::Var(vy)) = (l.as_ref(), r.as_ref())
+    {
+        if let Some(&(strict, c)) = rels.get(&(vx.clone(), vy.clone())) {
+            match op.as_str() {
+                ">" if c >= 0.0 && (strict || c > 0.0) => return Some(true),
+                ">=" if c >= 0.0 => return Some(true),
+                "<" if c >= 0.0 => return Some(false),
+                "<=" if (strict && c >= 0.0) || c > 0.0 => return Some(false),
+                "==" | "!=" if (strict && c >= 0.0) || c > 0.0 => {
+                    return Some(op == "!=");
+                }
+                _ => {}
+            }
+        }
+        if let Some(&(strict, c)) = rels.get(&(vy.clone(), vx.clone())) {
+            match op.as_str() {
+                "<" if c >= 0.0 && (strict || c > 0.0) => return Some(true),
+                "<=" if c >= 0.0 => return Some(true),
+                ">" if c >= 0.0 => return Some(false),
+                ">=" if (strict && c >= 0.0) || c > 0.0 => return Some(false),
+                "==" | "!=" if (strict && c >= 0.0) || c > 0.0 => {
+                    return Some(op == "!=");
+                }
+                _ => {}
+            }
+        }
+    }
+    eval_cond_static(cond, env)
+}
+
+fn refine_env_and_rels(
+    env: &mut HashMap<String, AbsInterval>,
+    rels: &mut RelMap,
+    cond: &Expr,
+    truth: bool,
+) {
+    match cond {
+        Expr::Bin(l, op, r) if truth && op == "and" => {
+            refine_env_and_rels(env, rels, l, true);
+            refine_env_and_rels(env, rels, r, true);
+        }
+        Expr::Bin(l, op, r) if !truth && op == "or" => {
+            refine_env_and_rels(env, rels, l, false);
+            refine_env_and_rels(env, rels, r, false);
+        }
+        Expr::Bin(l, op, r) => {
+            let effective_op = if truth {
+                op.as_str()
+            } else {
+                match op.as_str() {
+                    "==" => "!=",
+                    "!=" => "==",
+                    ">" => "<=",
+                    ">=" => "<",
+                    "<" => ">=",
+                    "<=" => ">",
+                    _ => return,
+                }
+            };
+            if let (Expr::Var(vx), Expr::Var(vy)) = (l.as_ref(), r.as_ref()) {
+                match effective_op {
+                    ">" => insert_rel_bound(rels, vx.clone(), vy.clone(), true, 0.0),
+                    ">=" => insert_rel_bound(rels, vx.clone(), vy.clone(), false, 0.0),
+                    "<" => insert_rel_bound(rels, vy.clone(), vx.clone(), true, 0.0),
+                    "<=" => insert_rel_bound(rels, vy.clone(), vx.clone(), false, 0.0),
+                    _ => {}
+                }
+            }
+            refine_env_from_cond(env, cond, truth);
+        }
+        _ => {}
+    }
+}
+
+fn eval_interval_rel(
+    expr: &Expr,
+    env: &HashMap<String, AbsInterval>,
+    rels: &RelMap,
+) -> AbsInterval {
+    if let Expr::Bin(l, op, r) = expr
+        && op == "-"
+        && let (Expr::Var(vx), Expr::Var(vy)) = (l.as_ref(), r.as_ref())
+    {
+        if let Some(&(strict, c)) = rels.get(&(vx.clone(), vy.clone())) {
+            let lo = if strict { c + 1e-9 } else { c };
+            let non_zero = (strict && c >= 0.0) || c > 0.0;
+            return AbsInterval {
+                lo,
+                hi: f64::INFINITY,
+                non_zero,
+                list_len: None,
+            };
+        }
+        if let Some(&(strict, c)) = rels.get(&(vy.clone(), vx.clone())) {
+            let hi = if strict { -c - 1e-9 } else { -c };
+            let non_zero = (strict && c >= 0.0) || c > 0.0;
+            return AbsInterval {
+                lo: f64::NEG_INFINITY,
+                hi,
+                non_zero,
+                list_len: None,
+            };
+        }
+    }
+    eval_interval(expr, env)
+}
+
+fn collect_expr_vars(e: &Expr, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Var(n) => {
+            out.insert(n.clone());
+        }
+        Expr::Bin(l, _, r) | Expr::Index(l, r) => {
+            collect_expr_vars(l, out);
+            collect_expr_vars(r, out);
+        }
+        Expr::Unary(_, x) | Expr::Await(x) | Expr::Member(x, _) => collect_expr_vars(x, out),
+        Expr::Ternary(c, a, b) => {
+            collect_expr_vars(c, out);
+            collect_expr_vars(a, out);
+            collect_expr_vars(b, out);
+        }
+        Expr::Call(f, xs) => {
+            out.insert(f.clone());
+            for x in xs {
+                collect_expr_vars(x, out);
+            }
+        }
+        Expr::CallExpr(f, xs) => {
+            collect_expr_vars(f, out);
+            for x in xs {
+                collect_expr_vars(x, out);
+            }
+        }
+        Expr::MethodCall(o, _, xs) => {
+            collect_expr_vars(o, out);
+            for x in xs {
+                collect_expr_vars(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn eval_concrete_num(e: &Expr, assign: &BTreeMap<String, f64>) -> Option<f64> {
+    match e {
+        Expr::Num(n) => Some(*n),
+        Expr::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        Expr::Var(n) => assign.get(n).copied(),
+        Expr::Unary(op, x) if op == "-" => eval_concrete_num(x, assign).map(|v| -v),
+        Expr::Unary(op, x) if op == "+" => eval_concrete_num(x, assign),
+        Expr::Bin(l, op, r) => {
+            let a = eval_concrete_num(l, assign)?;
+            let b = eval_concrete_num(r, assign)?;
+            match op.as_str() {
+                "+" => Some(a + b),
+                "-" => Some(a - b),
+                "*" => Some(a * b),
+                "/" if b != 0.0 => Some(a / b),
+                "%" if b != 0.0 => Some(a % b),
+                "==" => Some(if (a - b).abs() < 1e-12 { 1.0 } else { 0.0 }),
+                "!=" => Some(if (a - b).abs() >= 1e-12 { 1.0 } else { 0.0 }),
+                "<" => Some(if a < b { 1.0 } else { 0.0 }),
+                "<=" => Some(if a <= b { 1.0 } else { 0.0 }),
+                ">" => Some(if a > b { 1.0 } else { 0.0 }),
+                ">=" => Some(if a >= b { 1.0 } else { 0.0 }),
+                "and" => Some(if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 }),
+                "or" => Some(if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn candidate_values_for_interval(iv: &AbsInterval) -> Vec<f64> {
+    let mut cands = Vec::new();
+    for base in [0.0, 1.0, -1.0, 2.0, -2.0] {
+        if base >= iv.lo && base <= iv.hi && !(iv.non_zero && base == 0.0) {
+            cands.push(base);
+        }
+    }
+    if iv.lo.is_finite() {
+        let v = iv.lo.ceil();
+        if v >= iv.lo && v <= iv.hi && !cands.contains(&v) {
+            cands.push(v);
+        }
+    }
+    if iv.hi.is_finite() {
+        let v = iv.hi.floor();
+        if v >= iv.lo && v <= iv.hi && !cands.contains(&v) {
+            cands.push(v);
+        }
+    }
+    if cands.is_empty() {
+        cands.push(0.0);
+    }
+    cands
+}
+
+fn synthesize_counterexample(
+    target_expr: &Expr,
+    env: &HashMap<String, AbsInterval>,
+    rels: &RelMap,
+) -> Option<BTreeMap<String, f64>> {
+    let mut vars = BTreeSet::new();
+    collect_expr_vars(target_expr, &mut vars);
+    if vars.is_empty() || vars.len() > 4 {
+        return None;
+    }
+    let var_list: Vec<String> = vars.into_iter().collect();
+    let pools: Vec<Vec<f64>> = var_list
+        .iter()
+        .map(|v| candidate_values_for_interval(env.get(v).unwrap_or(&AbsInterval::any())))
+        .collect();
+
+    let mut cur = BTreeMap::new();
+    fn search(
+        idx: usize,
+        var_list: &[String],
+        pools: &[Vec<f64>],
+        cur: &mut BTreeMap<String, f64>,
+        target_expr: &Expr,
+        rels: &RelMap,
+    ) -> Option<BTreeMap<String, f64>> {
+        if idx == var_list.len() {
+            for ((x, y), &(strict, k)) in rels {
+                if let (Some(&vx), Some(&vy)) = (cur.get(x), cur.get(y)) {
+                    let ok = if strict { vx - vy > k } else { vx - vy >= k };
+                    if !ok {
+                        return None;
+                    }
+                }
+            }
+            if let Some(val) = eval_concrete_num(target_expr, cur)
+                && val.abs() < 1e-12
+            {
+                return Some(cur.clone());
+            }
+            return None;
+        }
+        let name = &var_list[idx];
+        for &v in &pools[idx] {
+            cur.insert(name.clone(), v);
+            if let Some(found) = search(idx + 1, var_list, pools, cur, target_expr, rels) {
+                return Some(found);
+            }
+        }
+        cur.remove(name);
+        None
+    }
+    search(0, &var_list, &pools, &mut cur, target_expr, rels)
+}
+
+fn format_counterexample(cx: &BTreeMap<String, f64>) -> String {
+    cx.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn collect_assigned_vars_in_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign(n, _) => {
+                out.insert(n.clone());
+            }
+            Stmt::If(_, t, e) => {
+                collect_assigned_vars_in_stmts(t, out);
+                collect_assigned_vars_in_stmts(e, out);
+            }
+            Stmt::While(_, b) => collect_assigned_vars_in_stmts(b, out),
+            Stmt::ForRange(v, _, _, b) | Stmt::ForEach(v, _, b) => {
+                out.insert(v.clone());
+                collect_assigned_vars_in_stmts(b, out);
+            }
+            Stmt::Try(b, _, c, f) => {
+                collect_assigned_vars_in_stmts(b, out);
+                collect_assigned_vars_in_stmts(c, out);
+                collect_assigned_vars_in_stmts(f, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_monotone_nondec_var_in_stmts(stmts: &[Stmt], var: &str) -> bool {
+    let mut ok = true;
+    for s in stmts {
+        match s {
+            Stmt::Assign(n, e) if n == var => {
+                let good = matches!(
+                    e,
+                    Expr::Bin(l, op, r)
+                        if matches!(**l, Expr::Var(ref vn) if vn == var)
+                            && op == "+"
+                            && matches!(**r, Expr::Num(k) if k >= 0.0)
+                );
+                if !good {
+                    return false;
+                }
+            }
+            Stmt::If(_, t, e) => {
+                ok &= is_monotone_nondec_var_in_stmts(t, var)
+                    && is_monotone_nondec_var_in_stmts(e, var);
+            }
+            Stmt::While(_, b) | Stmt::ForRange(_, _, _, b) | Stmt::ForEach(_, _, b) => {
+                ok &= is_monotone_nondec_var_in_stmts(b, var);
+            }
+            _ => {}
+        }
+    }
+    ok
+}
+
 fn refine_env_from_cond(env: &mut HashMap<String, AbsInterval>, cond: &Expr, truth: bool) {
     match cond {
         Expr::Bin(l, op, r) if truth && op == "and" => {
@@ -1750,6 +2159,31 @@ fn verify_contracts_strict(
     struct FnContractSig {
         params: Vec<String>,
         preconditions: Vec<Expr>,
+        postconditions: Vec<Expr>,
+        ret_var: Option<String>,
+    }
+
+    fn scan_ensures_in_stmts(stmts: &[Stmt], out: &mut Vec<Expr>, ret_var: &mut Option<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Expr(e) => {
+                    if let Some((cname, args)) = extract_direct_call(e)
+                        && cname == "ensures"
+                        && let Some(cond) = args.first()
+                    {
+                        out.push((*cond).clone());
+                    }
+                }
+                Stmt::Return(Some(Expr::Var(rv))) if ret_var.is_none() => {
+                    *ret_var = Some(rv.clone());
+                }
+                Stmt::If(_, t, e) => {
+                    scan_ensures_in_stmts(t, out, ret_var);
+                    scan_ensures_in_stmts(e, out, ret_var);
+                }
+                _ => {}
+            }
+        }
     }
 
     let mut fn_sigs: HashMap<String, FnContractSig> = HashMap::new();
@@ -1772,42 +2206,97 @@ fn verify_contracts_strict(
                 break;
             }
         }
+        let mut post = Vec::new();
+        let mut ret_var = None;
+        scan_ensures_in_stmts(body, &mut post, &mut ret_var);
         fn_sigs.insert(
             name.clone(),
             FnContractSig {
                 params: params.iter().map(|(pn, _)| pn.clone()).collect(),
                 preconditions: pre,
+                postconditions: post,
+                ret_var,
             },
         );
+    }
+
+    fn eval_expr_with_post(
+        e: &Expr,
+        env: &HashMap<String, AbsInterval>,
+        rels: &RelMap,
+        fn_sigs: &HashMap<String, FnContractSig>,
+    ) -> AbsInterval {
+        if let Some((cname, _)) = extract_direct_call(e)
+            && let Some(sig) = fn_sigs.get(cname)
+            && !sig.postconditions.is_empty()
+        {
+            let mut post_env: HashMap<String, AbsInterval> = HashMap::new();
+            let mut post_rels = RelMap::new();
+            for pc in &sig.postconditions {
+                refine_env_and_rels(&mut post_env, &mut post_rels, pc, true);
+            }
+            for key in [
+                sig.ret_var.as_deref(),
+                Some("result"),
+                Some("res"),
+                Some("ret"),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(iv) = post_env.get(key) {
+                    return iv.clone();
+                }
+            }
+        }
+        eval_interval_rel(e, env, rels)
     }
 
     fn verify_expr_strict(
         e: &Expr,
         env: &HashMap<String, AbsInterval>,
+        rels: &RelMap,
         fn_sigs: &HashMap<String, FnContractSig>,
         summary: &mut VerifySummary,
         errors: &mut Vec<String>,
     ) {
         if let Some((cname, args)) = extract_direct_call(e) {
             for a in &args {
-                verify_expr_strict(a, env, fn_sigs, summary, errors);
+                verify_expr_strict(a, env, rels, fn_sigs, summary, errors);
             }
             if let Some(sig) = fn_sigs.get(cname)
                 && !sig.preconditions.is_empty()
                 && args.len() == sig.params.len()
             {
                 let mut callee_env = HashMap::new();
+                let callee_rels = RelMap::new();
                 for (p, a) in sig.params.iter().zip(args.iter()) {
-                    callee_env.insert(p.clone(), eval_interval(a, env));
+                    callee_env.insert(p.clone(), eval_expr_with_post(a, env, rels, fn_sigs));
                 }
                 for pre in &sig.preconditions {
                     summary.invariants_checked += 1;
-                    if eval_cond_static(pre, &callee_env) == Some(false) {
-                        errors.push(format!(
-                            "verification error: call to '{cname}' violates requires(...) statically"
-                        ));
-                    } else if eval_cond_static(pre, &callee_env) == Some(true) {
-                        summary.contracts_proven += 1;
+                    match eval_cond_static_rel(pre, &callee_env, &callee_rels) {
+                        Some(false) => {
+                            if let Some(cx) =
+                                synthesize_counterexample(pre, &callee_env, &callee_rels)
+                            {
+                                summary
+                                    .counterexamples
+                                    .push(serde_json::to_value(&cx).unwrap_or_default());
+                                errors.push(format!(
+                                    "verification error: call to '{cname}' violates requires(...) statically [counterexample: {}]",
+                                    format_counterexample(&cx)
+                                ));
+                            } else {
+                                errors.push(format!(
+                                    "verification error: call to '{cname}' violates requires(...) statically"
+                                ));
+                            }
+                        }
+                        Some(true) => {
+                            summary.contracts_proven += 1;
+                        }
+                        None => {}
                     }
                 }
             }
@@ -1815,24 +2304,34 @@ fn verify_contracts_strict(
         }
         match e {
             Expr::Bin(l, op, r) => {
-                verify_expr_strict(l, env, fn_sigs, summary, errors);
-                verify_expr_strict(r, env, fn_sigs, summary, errors);
+                verify_expr_strict(l, env, rels, fn_sigs, summary, errors);
+                verify_expr_strict(r, env, rels, fn_sigs, summary, errors);
                 if matches!(op.as_str(), "/" | "%") {
                     summary.invariants_checked += 1;
-                    let d = eval_interval(r, env);
+                    let d = eval_expr_with_post(r, env, rels, fn_sigs);
                     if !d.definitely_nonzero() {
-                        errors.push(
-                            "verification error: potential division by zero (guard with 'requires(d != 0)' or 'if d != 0')"
-                                .into(),
-                        );
+                        if let Some(cx) = synthesize_counterexample(r, env, rels) {
+                            summary
+                                .counterexamples
+                                .push(serde_json::to_value(&cx).unwrap_or_default());
+                            errors.push(format!(
+                                "verification error: potential division by zero (guard with 'requires(d != 0)' or 'if d != 0') [counterexample: {}]",
+                                format_counterexample(&cx)
+                            ));
+                        } else {
+                            errors.push(
+                                "verification error: potential division by zero (guard with 'requires(d != 0)' or 'if d != 0')"
+                                    .into(),
+                            );
+                        }
                     }
                 }
             }
             Expr::Index(arr, idx) => {
-                verify_expr_strict(arr, env, fn_sigs, summary, errors);
-                verify_expr_strict(idx, env, fn_sigs, summary, errors);
-                let arr_iv = eval_interval(arr, env);
-                let idx_iv = eval_interval(idx, env);
+                verify_expr_strict(arr, env, rels, fn_sigs, summary, errors);
+                verify_expr_strict(idx, env, rels, fn_sigs, summary, errors);
+                let arr_iv = eval_interval_rel(arr, env, rels);
+                let idx_iv = eval_interval_rel(idx, env, rels);
                 if let Some(len) = arr_iv.list_len
                     && idx_iv.lo.is_finite()
                     && idx_iv.hi.is_finite()
@@ -1848,37 +2347,39 @@ fn verify_contracts_strict(
             }
             Expr::List(xs) => {
                 for x in xs {
-                    verify_expr_strict(x, env, fn_sigs, summary, errors);
+                    verify_expr_strict(x, env, rels, fn_sigs, summary, errors);
                 }
             }
             Expr::Map(ps) => {
                 for (k, v) in ps {
-                    verify_expr_strict(k, env, fn_sigs, summary, errors);
-                    verify_expr_strict(v, env, fn_sigs, summary, errors);
+                    verify_expr_strict(k, env, rels, fn_sigs, summary, errors);
+                    verify_expr_strict(v, env, rels, fn_sigs, summary, errors);
                 }
             }
             Expr::Ternary(c, a, b) => {
-                verify_expr_strict(c, env, fn_sigs, summary, errors);
+                verify_expr_strict(c, env, rels, fn_sigs, summary, errors);
                 let mut t_env = env.clone();
-                refine_env_from_cond(&mut t_env, c, true);
-                verify_expr_strict(a, &t_env, fn_sigs, summary, errors);
+                let mut t_rels = rels.clone();
+                refine_env_and_rels(&mut t_env, &mut t_rels, c, true);
+                verify_expr_strict(a, &t_env, &t_rels, fn_sigs, summary, errors);
                 let mut e_env = env.clone();
-                refine_env_from_cond(&mut e_env, c, false);
-                verify_expr_strict(b, &e_env, fn_sigs, summary, errors);
+                let mut e_rels = rels.clone();
+                refine_env_and_rels(&mut e_env, &mut e_rels, c, false);
+                verify_expr_strict(b, &e_env, &e_rels, fn_sigs, summary, errors);
             }
             Expr::Unary(_, x) | Expr::Await(x) | Expr::Member(x, _) => {
-                verify_expr_strict(x, env, fn_sigs, summary, errors);
+                verify_expr_strict(x, env, rels, fn_sigs, summary, errors);
             }
             Expr::MethodCall(o, _, args) => {
-                verify_expr_strict(o, env, fn_sigs, summary, errors);
+                verify_expr_strict(o, env, rels, fn_sigs, summary, errors);
                 for a in args {
-                    verify_expr_strict(a, env, fn_sigs, summary, errors);
+                    verify_expr_strict(a, env, rels, fn_sigs, summary, errors);
                 }
             }
             Expr::CallExpr(f, args) => {
-                verify_expr_strict(f, env, fn_sigs, summary, errors);
+                verify_expr_strict(f, env, rels, fn_sigs, summary, errors);
                 for a in args {
-                    verify_expr_strict(a, env, fn_sigs, summary, errors);
+                    verify_expr_strict(a, env, rels, fn_sigs, summary, errors);
                 }
             }
             _ => {}
@@ -1888,6 +2389,7 @@ fn verify_contracts_strict(
     fn verify_block_strict(
         stmts: &[Stmt],
         env: &mut HashMap<String, AbsInterval>,
+        rels: &mut RelMap,
         fn_sigs: &HashMap<String, FnContractSig>,
         strict_all: bool,
         summary: &mut VerifySummary,
@@ -1896,12 +2398,13 @@ fn verify_contracts_strict(
         for s in stmts {
             match s {
                 Stmt::Let(n, _, e, _) => {
-                    verify_expr_strict(e, env, fn_sigs, summary, errors);
-                    env.insert(n.clone(), eval_interval(e, env));
+                    verify_expr_strict(e, env, rels, fn_sigs, summary, errors);
+                    env.insert(n.clone(), eval_expr_with_post(e, env, rels, fn_sigs));
                 }
                 Stmt::Assign(n, e) => {
-                    verify_expr_strict(e, env, fn_sigs, summary, errors);
-                    env.insert(n.clone(), eval_interval(e, env));
+                    verify_expr_strict(e, env, rels, fn_sigs, summary, errors);
+                    env.insert(n.clone(), eval_expr_with_post(e, env, rels, fn_sigs));
+                    rels.retain(|(x, y), _| x != n && y != n);
                 }
                 Stmt::Expr(e) => {
                     if let Some((cname, args)) = extract_direct_call(e)
@@ -1909,11 +2412,21 @@ fn verify_contracts_strict(
                         && let Some(cond) = args.first()
                     {
                         summary.invariants_checked += 1;
-                        match eval_cond_static(cond, env) {
+                        match eval_cond_static_rel(cond, env, rels) {
                             Some(false) => {
-                                errors.push(format!(
-                                    "verification error: {cname} contract is statically falsified"
-                                ));
+                                if let Some(cx) = synthesize_counterexample(cond, env, rels) {
+                                    summary
+                                        .counterexamples
+                                        .push(serde_json::to_value(&cx).unwrap_or_default());
+                                    errors.push(format!(
+                                        "verification error: {cname} contract is statically falsified [counterexample: {}]",
+                                        format_counterexample(&cx)
+                                    ));
+                                } else {
+                                    errors.push(format!(
+                                        "verification error: {cname} contract is statically falsified"
+                                    ));
+                                }
                             }
                             Some(true) => {
                                 summary.contracts_proven += 1;
@@ -1921,41 +2434,101 @@ fn verify_contracts_strict(
                             None => {}
                         }
                         if cname == "requires" {
-                            refine_env_from_cond(env, cond, true);
+                            refine_env_and_rels(env, rels, cond, true);
                         }
                     } else {
-                        verify_expr_strict(e, env, fn_sigs, summary, errors);
+                        verify_expr_strict(e, env, rels, fn_sigs, summary, errors);
                     }
                 }
                 Stmt::Return(Some(e)) | Stmt::Throw(e) | Stmt::Yield(e) => {
-                    verify_expr_strict(e, env, fn_sigs, summary, errors);
+                    verify_expr_strict(e, env, rels, fn_sigs, summary, errors);
                 }
                 Stmt::If(c, t, e) => {
-                    verify_expr_strict(c, env, fn_sigs, summary, errors);
+                    verify_expr_strict(c, env, rels, fn_sigs, summary, errors);
                     let mut t_env = env.clone();
-                    refine_env_from_cond(&mut t_env, c, true);
-                    verify_block_strict(t, &mut t_env, fn_sigs, strict_all, summary, errors);
+                    let mut t_rels = rels.clone();
+                    refine_env_and_rels(&mut t_env, &mut t_rels, c, true);
+                    verify_block_strict(
+                        t,
+                        &mut t_env,
+                        &mut t_rels,
+                        fn_sigs,
+                        strict_all,
+                        summary,
+                        errors,
+                    );
+
                     let mut e_env = env.clone();
-                    refine_env_from_cond(&mut e_env, c, false);
-                    verify_block_strict(e, &mut e_env, fn_sigs, strict_all, summary, errors);
+                    let mut e_rels = rels.clone();
+                    refine_env_and_rels(&mut e_env, &mut e_rels, c, false);
+                    verify_block_strict(
+                        e,
+                        &mut e_env,
+                        &mut e_rels,
+                        fn_sigs,
+                        strict_all,
+                        summary,
+                        errors,
+                    );
+
                     for k in env.keys().cloned().collect::<Vec<_>>() {
-                        env.insert(k, AbsInterval::any());
+                        let jt = t_env.get(&k).cloned().unwrap_or_else(AbsInterval::any);
+                        let je = e_env.get(&k).cloned().unwrap_or_else(AbsInterval::any);
+                        env.insert(k, jt.join(&je));
                     }
+                    *rels = intersect_rels(&t_rels, &e_rels);
                 }
                 Stmt::While(c, b) => {
-                    for k in env.keys().cloned().collect::<Vec<_>>() {
-                        env.insert(k, AbsInterval::any());
-                    }
+                    let mut assigned = HashSet::new();
+                    collect_assigned_vars_in_stmts(b, &mut assigned);
                     let mut loop_env = env.clone();
-                    refine_env_from_cond(&mut loop_env, c, true);
-                    verify_block_strict(b, &mut loop_env, fn_sigs, strict_all, summary, errors);
+                    let mut loop_rels = rels.clone();
+                    for k in &assigned {
+                        let entry = env.get(k).cloned().unwrap_or_else(AbsInterval::any);
+                        let widened = if is_monotone_nondec_var_in_stmts(b, k) {
+                            AbsInterval {
+                                lo: entry.lo,
+                                hi: f64::INFINITY,
+                                non_zero: entry.lo > 0.0,
+                                list_len: None,
+                            }
+                        } else {
+                            AbsInterval::any()
+                        };
+                        loop_env.insert(k.clone(), widened);
+                        loop_rels.retain(|(x, y), _| x != k && y != k);
+                    }
+                    let mut post_loop_env = loop_env.clone();
+                    let mut post_loop_rels = loop_rels.clone();
+                    refine_env_and_rels(&mut loop_env, &mut loop_rels, c, true);
+                    verify_expr_strict(
+                        c,
+                        &post_loop_env,
+                        &post_loop_rels,
+                        fn_sigs,
+                        summary,
+                        errors,
+                    );
+                    verify_block_strict(
+                        b,
+                        &mut loop_env,
+                        &mut loop_rels,
+                        fn_sigs,
+                        strict_all,
+                        summary,
+                        errors,
+                    );
+                    refine_env_and_rels(&mut post_loop_env, &mut post_loop_rels, c, false);
+                    *env = post_loop_env;
+                    *rels = post_loop_rels;
                 }
                 Stmt::ForRange(v, a, b, body) => {
-                    verify_expr_strict(a, env, fn_sigs, summary, errors);
-                    verify_expr_strict(b, env, fn_sigs, summary, errors);
+                    verify_expr_strict(a, env, rels, fn_sigs, summary, errors);
+                    verify_expr_strict(b, env, rels, fn_sigs, summary, errors);
                     let mut fenv = env.clone();
-                    let a_iv = eval_interval(a, env);
-                    let b_iv = eval_interval(b, env);
+                    let mut frels = rels.clone();
+                    let a_iv = eval_interval_rel(a, env, rels);
+                    let b_iv = eval_interval_rel(b, env, rels);
                     if a_iv.lo.is_finite() && b_iv.hi.is_finite() {
                         fenv.insert(
                             v.clone(),
@@ -1967,25 +2540,45 @@ fn verify_contracts_strict(
                             },
                         );
                     }
-                    verify_block_strict(body, &mut fenv, fn_sigs, strict_all, summary, errors);
+                    verify_block_strict(
+                        body, &mut fenv, &mut frels, fn_sigs, strict_all, summary, errors,
+                    );
                 }
                 Stmt::Fn(_, params, _, body) | Stmt::AsyncFn(_, params, _, body) if strict_all => {
                     summary.functions_checked += 1;
                     let mut fn_env = HashMap::new();
+                    let mut fn_rels = RelMap::new();
                     for (p, _) in params {
                         fn_env.insert(p.clone(), AbsInterval::any());
                     }
-                    verify_block_strict(body, &mut fn_env, fn_sigs, strict_all, summary, errors);
+                    verify_block_strict(
+                        body,
+                        &mut fn_env,
+                        &mut fn_rels,
+                        fn_sigs,
+                        strict_all,
+                        summary,
+                        errors,
+                    );
                 }
                 Stmt::DecoratedFn(decs, _, params, _, body)
                     if strict_all || decorator_string_args(decs, "verify").0 =>
                 {
                     summary.functions_checked += 1;
                     let mut fn_env = HashMap::new();
+                    let mut fn_rels = RelMap::new();
                     for (p, _) in params {
                         fn_env.insert(p.clone(), AbsInterval::any());
                     }
-                    verify_block_strict(body, &mut fn_env, fn_sigs, strict_all, summary, errors);
+                    verify_block_strict(
+                        body,
+                        &mut fn_env,
+                        &mut fn_rels,
+                        fn_sigs,
+                        strict_all,
+                        summary,
+                        errors,
+                    );
                 }
                 _ => {}
             }
@@ -1995,7 +2588,16 @@ fn verify_contracts_strict(
     let mut summary = VerifySummary::default();
     if strict_all {
         let mut top_env = HashMap::new();
-        verify_block_strict(ast, &mut top_env, &fn_sigs, true, &mut summary, errors);
+        let mut top_rels = RelMap::new();
+        verify_block_strict(
+            ast,
+            &mut top_env,
+            &mut top_rels,
+            &fn_sigs,
+            true,
+            &mut summary,
+            errors,
+        );
     } else {
         fn scan_verify_fns(
             stmts: &[Stmt],
@@ -2009,10 +2611,19 @@ fn verify_contracts_strict(
                         if decorator_string_args(decs, "verify").0 {
                             summary.functions_checked += 1;
                             let mut fn_env = HashMap::new();
+                            let mut fn_rels = RelMap::new();
                             for (p, _) in params {
                                 fn_env.insert(p.clone(), AbsInterval::any());
                             }
-                            verify_block_strict(body, &mut fn_env, fn_sigs, true, summary, errors);
+                            verify_block_strict(
+                                body,
+                                &mut fn_env,
+                                &mut fn_rels,
+                                fn_sigs,
+                                true,
+                                summary,
+                                errors,
+                            );
                         }
                         scan_verify_fns(body, fn_sigs, summary, errors);
                     }
@@ -2053,6 +2664,7 @@ pub(crate) fn verify_source_strict(src: &str) -> Result<JsonValue, String> {
         "functions_checked": summary.functions_checked,
         "contracts_proven": summary.contracts_proven,
         "invariants_checked": summary.invariants_checked,
+        "counterexamples": summary.counterexamples,
         "diagnostics": errors,
     }))
 }

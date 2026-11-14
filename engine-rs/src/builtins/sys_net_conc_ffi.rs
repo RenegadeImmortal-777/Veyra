@@ -1163,6 +1163,24 @@ impl Vm {
                 }
                 self.gc_set_paused(false)
             }
+            "profile_start" => {
+                if !a.is_empty() {
+                    return Err("profile_start expects 0 arguments".into());
+                }
+                self.profile_start()
+            }
+            "profile_stop" => {
+                if !a.is_empty() {
+                    return Err("profile_stop expects 0 arguments".into());
+                }
+                self.profile_stop()?
+            }
+            "profile_report" => {
+                if !a.is_empty() {
+                    return Err("profile_report expects 0 arguments".into());
+                }
+                self.profile_report()?
+            }
             "sim_start" => {
                 if a.len() != 1 {
                     return Err("sim_start expects integer seed".into());
@@ -1328,6 +1346,94 @@ impl Vm {
                 }
                 crate::sim_actor::sim_trace()?
             }
+            "sim_fs_write" => {
+                if a.len() != 2 {
+                    return Err("sim_fs_write expects (path, content)".into());
+                }
+                let (Val::Str(path), Val::Str(content)) = (&a[0], &a[1]) else {
+                    return Err("sim_fs_write expects String arguments".into());
+                };
+                crate::sim_actor::sim_fs_write(path, content)?
+            }
+            "sim_fs_read" => {
+                if a.len() != 1 {
+                    return Err("sim_fs_read expects (path)".into());
+                }
+                let Val::Str(ref path) = a[0] else {
+                    return Err("sim_fs_read path must be String".into());
+                };
+                crate::sim_actor::sim_fs_read(path)?
+            }
+            "sim_fs_delete" => {
+                if a.len() != 1 {
+                    return Err("sim_fs_delete expects (path)".into());
+                }
+                let Val::Str(ref path) = a[0] else {
+                    return Err("sim_fs_delete path must be String".into());
+                };
+                crate::sim_actor::sim_fs_delete(path)?
+            }
+            "sim_fs_list" => {
+                if a.len() > 1 {
+                    return Err("sim_fs_list expects ([prefix])".into());
+                }
+                let prefix = match a.first() {
+                    None | Some(Val::Null) => None,
+                    Some(Val::Str(s)) => Some(s.as_str()),
+                    Some(_) => return Err("sim_fs_list prefix must be String".into()),
+                };
+                crate::sim_actor::sim_fs_list(prefix)?
+            }
+            "sim_fs_sync" => {
+                if !a.is_empty() {
+                    return Err("sim_fs_sync expects 0 arguments".into());
+                }
+                crate::sim_actor::sim_fs_sync()?
+            }
+            "sim_fs_crash" => {
+                if !a.is_empty() {
+                    return Err("sim_fs_crash expects 0 arguments".into());
+                }
+                crate::sim_actor::sim_fs_crash()?
+            }
+            "sim_fs_snapshot" => {
+                if !a.is_empty() {
+                    return Err("sim_fs_snapshot expects 0 arguments".into());
+                }
+                crate::sim_actor::sim_fs_snapshot()?
+            }
+            "actor_node_listen" => {
+                crate::runtime::require_cap("net")?;
+                if a.is_empty() || a.len() > 2 {
+                    return Err("actor_node_listen expects (actor_id[, port_or_addr])".into());
+                }
+                let Val::Num(id) = a[0] else {
+                    return Err("actor_node_listen actor_id must be Number".into());
+                };
+                if !id.is_finite() || id < 0.0 {
+                    return Err("actor_node_listen actor_id must be non-negative Number".into());
+                }
+                crate::sim_actor::actor_node_listen(id as u64, a.get(1))?
+            }
+            "actor_node_stop" => {
+                if a.len() != 1 {
+                    return Err("actor_node_stop expects (node_id_or_map)".into());
+                }
+                crate::sim_actor::actor_node_stop(&a[0])?
+            }
+            "actor_remote_send" => {
+                if a.len() != 2 {
+                    return Err("actor_remote_send expects (target, message)".into());
+                }
+                crate::sim_actor::actor_remote_send(&a[0], a[1].clone())?
+            }
+            "actor_remote_ask" => {
+                if a.len() < 2 || a.len() > 3 {
+                    return Err("actor_remote_ask expects (target, message[, timeout_ms])".into());
+                }
+                let timeout = parse_nonneg_timeout_ms(a.get(2), "actor_remote_ask")?;
+                crate::sim_actor::actor_remote_ask(&a[0], a[1].clone(), timeout)?
+            }
             "actor_spawn" => {
                 if a.is_empty() || a.len() > 2 {
                     return Err("actor_spawn expects (handler[, options_map])".into());
@@ -1356,13 +1462,7 @@ impl Vm {
                 if !id.is_finite() || id < 0.0 {
                     return Err("actor_ask id must be non-negative Number".into());
                 }
-                let timeout = match a.get(2) {
-                    None | Some(Val::Null) => 10_000u64,
-                    Some(Val::Num(ms)) if ms.is_finite() && *ms >= 0.0 => *ms as u64,
-                    Some(_) => {
-                        return Err("actor_ask timeout_ms must be non-negative Number".into());
-                    }
-                };
+                let timeout = parse_nonneg_timeout_ms(a.get(2), "actor_ask")?;
                 crate::sim_actor::actor_ask(id as u64, a[1].clone(), timeout)?
             }
             "actor_stop" => {
@@ -1544,5 +1644,13 @@ impl Vm {
             _ => return Ok(None),
         };
         Ok(Some(v))
+    }
+}
+
+fn parse_nonneg_timeout_ms(arg: Option<&Val>, fn_name: &str) -> Result<u64, String> {
+    match arg {
+        None | Some(Val::Null) => Ok(10_000),
+        Some(Val::Num(ms)) if ms.is_finite() && *ms >= 0.0 => Ok(*ms as u64),
+        Some(_) => Err(format!("{fn_name} timeout_ms must be non-negative Number")),
     }
 }

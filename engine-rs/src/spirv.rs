@@ -21,6 +21,7 @@ const OP_TYPE_BOOL: u16 = 20;
 const OP_TYPE_INT: u16 = 21;
 const OP_TYPE_FLOAT: u16 = 22;
 const OP_TYPE_VECTOR: u16 = 23;
+const OP_TYPE_ARRAY: u16 = 28;
 const OP_TYPE_RUNTIME_ARRAY: u16 = 29;
 const OP_TYPE_STRUCT: u16 = 30;
 const OP_TYPE_POINTER: u16 = 32;
@@ -34,6 +35,7 @@ const OP_STORE: u16 = 62;
 const OP_ACCESS_CHAIN: u16 = 65;
 const OP_DECORATE: u16 = 71;
 const OP_MEMBER_DECORATE: u16 = 72;
+const OP_CONVERT_U_TO_F: u16 = 112;
 const OP_BITCAST: u16 = 124;
 const OP_FNEGATE: u16 = 127;
 const OP_IADD: u16 = 128;
@@ -44,10 +46,13 @@ const OP_FMUL: u16 = 133;
 const OP_UDIV: u16 = 134;
 const OP_FDIV: u16 = 136;
 const OP_UMOD: u16 = 138;
+const OP_LOGICAL_AND: u16 = 167;
+const OP_SELECT: u16 = 169;
 const OP_IEQUAL: u16 = 170;
 const OP_UGREATER_THAN_EQUAL: u16 = 175;
 const OP_ULESS_THAN: u16 = 176;
 const OP_FORD_GREATER_THAN: u16 = 186;
+const OP_CONTROL_BARRIER: u16 = 224;
 const OP_PHI: u16 = 245;
 const OP_LOOP_MERGE: u16 = 246;
 const OP_SELECTION_MERGE: u16 = 247;
@@ -64,6 +69,7 @@ const MODE_LOCAL_SIZE: u32 = 17;
 
 const SC_INPUT: u32 = 1;
 const SC_UNIFORM: u32 = 2;
+const SC_WORKGROUP: u32 = 4;
 const SC_FUNCTION: u32 = 7;
 const SC_PUSH_CONSTANT: u32 = 9;
 
@@ -74,7 +80,11 @@ const DEC_BUILTIN: u32 = 11;
 const DEC_BINDING: u32 = 33;
 const DEC_DESCRIPTOR_SET: u32 = 34;
 const DEC_OFFSET: u32 = 35;
+const BUILTIN_LOCAL_INVOCATION_ID: u32 = 27;
 const BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28;
+const SCOPE_WORKGROUP: u32 = 2;
+// AcquireRelease (0x8) | WorkgroupMemory (0x100)
+const SEM_WORKGROUP_BARRIER: u32 = 0x108;
 
 const GLSL_POW: u32 = 26;
 const GLSL_EXP: u32 = 27;
@@ -116,10 +126,12 @@ struct SpvModule {
     t_f32: u32,
     t_ptr_in_u32: u32,
     t_ptr_buf_f32: u32,
+    t_ptr_wg_f32: u32,
     t_ptr_pc_u32: u32,
 
     glsl_id: u32,
     var_gid: u32,
+    var_lid: u32,
     var_a: u32,
     var_b: u32,
     var_out: u32,
@@ -131,6 +143,16 @@ struct SpvModule {
 
 impl SpvModule {
     fn new(local_x: u32, local_y: u32, local_z: u32, pc_u32_count: usize) -> Self {
+        Self::new_with_opts(local_x, local_y, local_z, pc_u32_count, false)
+    }
+
+    fn new_with_opts(
+        local_x: u32,
+        local_y: u32,
+        local_z: u32,
+        pc_u32_count: usize,
+        use_local_id: bool,
+    ) -> Self {
         let mut m = Self {
             next_id: 1,
             caps: Vec::new(),
@@ -147,9 +169,11 @@ impl SpvModule {
             t_f32: 0,
             t_ptr_in_u32: 0,
             t_ptr_buf_f32: 0,
+            t_ptr_wg_f32: 0,
             t_ptr_pc_u32: 0,
             glsl_id: 0,
             var_gid: 0,
+            var_lid: 0,
             var_a: 0,
             var_b: 0,
             var_out: 0,
@@ -210,6 +234,19 @@ impl SpvModule {
             OP_DECORATE,
             &[m.var_gid, DEC_BUILTIN, BUILTIN_GLOBAL_INVOCATION_ID],
         );
+        if use_local_id {
+            m.var_lid = m.id();
+            push_inst(
+                &mut m.types_consts_globals,
+                OP_VARIABLE,
+                &[t_ptr_in_v3, m.var_lid, SC_INPUT],
+            );
+            push_inst(
+                &mut m.decs,
+                OP_DECORATE,
+                &[m.var_lid, DEC_BUILTIN, BUILTIN_LOCAL_INVOCATION_ID],
+            );
+        }
 
         let t_rta_f32 = m.id();
         push_inst(
@@ -294,6 +331,9 @@ impl SpvModule {
         let mut ep_ops = vec![EXEC_GLCOMPUTE, fn_main];
         ep_ops.extend_from_slice(&encode_str_words("main"));
         ep_ops.push(m.var_gid);
+        if m.var_lid != 0 {
+            ep_ops.push(m.var_lid);
+        }
         push_inst(&mut m.entry_points, OP_ENTRY_POINT, &ep_ops);
         push_inst(
             &mut m.exec_modes,
@@ -466,6 +506,137 @@ impl SpvModule {
         let r = self.id();
         self.op(OP_EXT_INST, &[self.t_f32, r, self.glsl_id, inst, a, b]);
         r
+    }
+    fn lid_comp(&mut self, comp: u32) -> u32 {
+        let c = self.c_u32(comp);
+        let ptr = self.id();
+        self.op(OP_ACCESS_CHAIN, &[self.t_ptr_in_u32, ptr, self.var_lid, c]);
+        let val = self.id();
+        self.op(OP_LOAD, &[self.t_u32, val, ptr]);
+        val
+    }
+    fn declare_workgroup_f32_array(&mut self, len: u32) -> u32 {
+        if self.t_ptr_wg_f32 == 0 {
+            let p = self.id();
+            push_inst(
+                &mut self.types_consts_globals,
+                OP_TYPE_POINTER,
+                &[p, SC_WORKGROUP, self.t_f32],
+            );
+            self.t_ptr_wg_f32 = p;
+        }
+        let len_id = self.c_u32(len);
+        let t_arr = self.id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_ARRAY,
+            &[t_arr, self.t_f32, len_id],
+        );
+        let t_ptr_arr = self.id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_TYPE_POINTER,
+            &[t_ptr_arr, SC_WORKGROUP, t_arr],
+        );
+        let var = self.id();
+        push_inst(
+            &mut self.types_consts_globals,
+            OP_VARIABLE,
+            &[t_ptr_arr, var, SC_WORKGROUP],
+        );
+        var
+    }
+    fn load_wg(&mut self, var: u32, idx: u32) -> u32 {
+        let ptr = self.id();
+        self.op(OP_ACCESS_CHAIN, &[self.t_ptr_wg_f32, ptr, var, idx]);
+        let val = self.id();
+        self.op(OP_LOAD, &[self.t_f32, val, ptr]);
+        val
+    }
+    fn store_wg(&mut self, var: u32, idx: u32, val: u32) {
+        let ptr = self.id();
+        self.op(OP_ACCESS_CHAIN, &[self.t_ptr_wg_f32, ptr, var, idx]);
+        self.op(OP_STORE, &[ptr, val]);
+    }
+    fn workgroup_barrier(&mut self) {
+        let exec = self.c_u32(SCOPE_WORKGROUP);
+        let mem = self.c_u32(SCOPE_WORKGROUP);
+        let sem = self.c_u32(SEM_WORKGROUP_BARRIER);
+        self.op(OP_CONTROL_BARRIER, &[exec, mem, sem]);
+    }
+    fn select_f32(&mut self, cond: u32, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_SELECT, &[self.t_f32, r, cond, a, b]);
+        r
+    }
+    fn select_u32(&mut self, cond: u32, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_SELECT, &[self.t_u32, r, cond, a, b]);
+        r
+    }
+    fn logical_and(&mut self, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_LOGICAL_AND, &[self.t_bool, r, a, b]);
+        r
+    }
+    fn uless(&mut self, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_ULESS_THAN, &[self.t_bool, r, a, b]);
+        r
+    }
+    fn u2f(&mut self, a: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_CONVERT_U_TO_F, &[self.t_f32, r, a]);
+        r
+    }
+    fn for_range_acc3<F: FnOnce(&mut Self, u32, [u32; 3]) -> [u32; 3]>(
+        &mut self,
+        start: u32,
+        end: u32,
+        init: [u32; 3],
+        step_body: F,
+    ) -> [u32; 3] {
+        let c1 = self.c_u32(1);
+        let pre = self.id();
+        let hdr = self.id();
+        let body = self.id();
+        let cont = self.id();
+        let merge = self.id();
+
+        self.op(OP_BRANCH, &[pre]);
+        self.label(pre);
+        self.op(OP_BRANCH, &[hdr]);
+
+        self.label(hdr);
+        let idx = self.id();
+        let acc = [self.id(), self.id(), self.id()];
+        let idx_next = self.id();
+        let acc_next = [self.id(), self.id(), self.id()];
+        self.op(OP_PHI, &[self.t_u32, idx, start, pre, idx_next, cont]);
+        for i in 0..3 {
+            self.op(
+                OP_PHI,
+                &[self.t_f32, acc[i], init[i], pre, acc_next[i], cont],
+            );
+        }
+        let cond = self.uless(idx, end);
+        self.op(OP_LOOP_MERGE, &[merge, cont, 0]);
+        self.op(OP_BRANCH_CONDITIONAL, &[cond, body, merge]);
+
+        self.label(body);
+        let computed = step_body(self, idx, acc);
+        let f0 = self.c_f32(0.0);
+        for i in 0..3 {
+            self.op(OP_FADD, &[self.t_f32, acc_next[i], computed[i], f0]);
+        }
+        self.op(OP_BRANCH, &[cont]);
+
+        self.label(cont);
+        self.op(OP_IADD, &[self.t_u32, idx_next, idx, c1]);
+        self.op(OP_BRANCH, &[hdr]);
+
+        self.label(merge);
+        acc
     }
     fn guard_oob(&mut self, cond_oob: u32) {
         let lbl_ret = self.id();
@@ -1123,5 +1294,280 @@ pub(crate) fn spirv_fused_linear(act_code: u32, has_bias: bool) -> Vec<u32> {
     let row_n = m.umul(row, dim_n);
     let out_idx = m.uadd(row_n, col);
     m.store_out(out_idx, acc);
+    m.finish()
+}
+
+impl SpvModule {
+    /// Emits `if (in_bounds) { load_buf(buf, idx) } else { fallback }` without touching OOB memory.
+    fn cond_load_buf(&mut self, in_bounds: u32, buf: u32, idx: u32, fallback: u32) -> u32 {
+        let lbl_then = self.id();
+        let lbl_else = self.id();
+        let lbl_merge = self.id();
+        self.op(OP_SELECTION_MERGE, &[lbl_merge, 0]);
+        self.op(OP_BRANCH_CONDITIONAL, &[in_bounds, lbl_then, lbl_else]);
+        self.label(lbl_then);
+        let loaded = self.load_buf(buf, idx);
+        self.op(OP_BRANCH, &[lbl_merge]);
+        self.label(lbl_else);
+        self.op(OP_BRANCH, &[lbl_merge]);
+        self.label(lbl_merge);
+        let res = self.id();
+        self.op(
+            OP_PHI,
+            &[self.t_f32, res, loaded, lbl_then, fallback, lbl_else],
+        );
+        res
+    }
+
+    fn if_then<F: FnOnce(&mut Self)>(&mut self, cond: u32, body: F) {
+        let lbl_then = self.id();
+        let lbl_merge = self.id();
+        self.op(OP_SELECTION_MERGE, &[lbl_merge, 0]);
+        self.op(OP_BRANCH_CONDITIONAL, &[cond, lbl_then, lbl_merge]);
+        self.label(lbl_then);
+        body(self);
+        self.op(OP_BRANCH, &[lbl_merge]);
+        self.label(lbl_merge);
+    }
+}
+
+/// Generates Workgroup shared-memory tiled GEMM `C[M, N] = A[M, K] @ B[K, N]`.
+/// Uses `tile = 16` (`LocalSize(16, 16, 1)`) and `OpControlBarrier` across K-tiles.
+/// PushConstants: `[M, K, N, 0]`.
+pub(crate) fn spirv_tiled_matmul() -> Vec<u32> {
+    const TILE: u32 = 16;
+    let mut m = SpvModule::new_with_opts(TILE, TILE, 1, 4, true);
+    let dim_m = m.load_pc_u32(0);
+    let dim_k = m.load_pc_u32(1);
+    let dim_n = m.load_pc_u32(2);
+
+    let tile_a = m.declare_workgroup_f32_array(TILE * TILE);
+    let tile_b = m.declare_workgroup_f32_array(TILE * TILE);
+
+    let col = m.gid_comp(0);
+    let row = m.gid_comp(1);
+    let lx = m.lid_comp(0);
+    let ly = m.lid_comp(1);
+
+    let c0 = m.c_u32(0);
+    let c15 = m.c_u32(TILE - 1);
+    let c16 = m.c_u32(TILE);
+    let f0 = m.c_f32(0.0);
+
+    let in_row = m.uless(row, dim_m);
+    let in_col = m.uless(col, dim_n);
+    let in_out = m.logical_and(in_row, in_col);
+
+    let row_k = m.umul(row, dim_k);
+    let ly_16 = m.umul(ly, c16);
+    let local_idx = m.uadd(ly_16, lx);
+
+    let k_plus = m.uadd(dim_k, c15);
+    let num_tiles = m.udiv(k_plus, c16);
+
+    let acc = m.for_range_acc(c0, num_tiles, f0, |m, t_idx, acc| {
+        let t_base = m.umul(t_idx, c16);
+        let a_col = m.uadd(t_base, lx);
+        let a_in_k = m.uless(a_col, dim_k);
+        let load_a_ok = m.logical_and(in_row, a_in_k);
+        let a_idx = m.uadd(row_k, a_col);
+        let a_val = m.cond_load_buf(load_a_ok, m.var_a, a_idx, f0);
+        m.store_wg(tile_a, local_idx, a_val);
+
+        let b_row = m.uadd(t_base, ly);
+        let b_in_k = m.uless(b_row, dim_k);
+        let load_b_ok = m.logical_and(b_in_k, in_col);
+        let b_row_n = m.umul(b_row, dim_n);
+        let b_idx = m.uadd(b_row_n, col);
+        let b_val = m.cond_load_buf(load_b_ok, m.var_b, b_idx, f0);
+        m.store_wg(tile_b, local_idx, b_val);
+
+        m.workgroup_barrier();
+
+        let partial = m.for_range_acc(c0, c16, acc, |m, k_sub, p_acc| {
+            let ta_idx = m.uadd(ly_16, k_sub);
+            let k_16 = m.umul(k_sub, c16);
+            let tb_idx = m.uadd(k_16, lx);
+            let av = m.load_wg(tile_a, ta_idx);
+            let bv = m.load_wg(tile_b, tb_idx);
+            let prod = m.fmul(av, bv);
+            m.fadd(p_acc, prod)
+        });
+
+        m.workgroup_barrier();
+        partial
+    });
+
+    m.if_then(in_out, |m| {
+        let row_n = m.umul(row, dim_n);
+        let out_idx = m.uadd(row_n, col);
+        m.store_out(out_idx, acc);
+    });
+    m.finish()
+}
+
+/// Generates FlashAttention-style single-pass online-softmax scaled dot-product attention:
+/// `O = softmax(Q @ K^T / sqrt(HeadDim) [+ causal_mask]) @ V`.
+/// Buffer A: `Q[SeqQ * HeadDim]`. Buffer B: `[K[SeqK * HeadDim], V[SeqK * HeadDim]]`.
+/// PushConstants: `[SeqQ, SeqK, HeadDim, CausalFlag]`, LocalSize(64, 1, 1).
+pub(crate) fn spirv_attention(causal: bool) -> Vec<u32> {
+    let mut m = SpvModule::new(64, 1, 1, 4);
+    let seq_q = m.load_pc_u32(0);
+    let seq_k = m.load_pc_u32(1);
+    let head_dim = m.load_pc_u32(2);
+
+    let total = m.umul(seq_q, head_dim);
+    let gid = m.gid_comp(0);
+
+    let oob = m.id();
+    m.op(OP_UGREATER_THAN_EQUAL, &[m.t_bool, oob, gid, total]);
+    m.guard_oob(oob);
+
+    let c0 = m.c_u32(0);
+    let c1 = m.c_u32(1);
+    let hd_zero = m.id();
+    m.op(OP_IEQUAL, &[m.t_bool, hd_zero, head_dim, c0]);
+    m.guard_oob(hd_zero);
+
+    let q_row = m.udiv(gid, head_dim);
+    let d_col = m.umod(gid, head_dim);
+
+    let hd_f = m.u2f(head_dim);
+    let sqrt_d = m.glsl1(GLSL_SQRT, hd_f);
+    let f1 = m.c_f32(1.0);
+    let f0 = m.c_f32(0.0);
+    let inv_sqrt_d = m.fdiv(f1, sqrt_d);
+
+    let q_base = m.umul(q_row, head_dim);
+    let v_offset = m.umul(seq_k, head_dim);
+
+    let k_limit = if causal {
+        let q_plus1 = m.uadd(q_row, c1);
+        let q_lt = m.uless(q_plus1, seq_k);
+        m.select_u32(q_lt, q_plus1, seq_k)
+    } else {
+        seq_k
+    };
+
+    let f_neg_inf = m.c_f32(-1.0e30);
+    let state = m.for_range_acc3(
+        c0,
+        k_limit,
+        [f_neg_inf, f0, f0],
+        |m, k_idx, [mx, sum_e, out_a]| {
+            let k_base = m.umul(k_idx, head_dim);
+            let dot = m.for_range_acc(c0, head_dim, f0, |m, p_idx, d_acc| {
+                let qi = m.uadd(q_base, p_idx);
+                let ki = m.uadd(k_base, p_idx);
+                let qv = m.load_buf(m.var_a, qi);
+                let kv = m.load_buf(m.var_b, ki);
+                let prod = m.fmul(qv, kv);
+                m.fadd(d_acc, prod)
+            });
+            let score = m.fmul(dot, inv_sqrt_d);
+            let new_max = m.glsl2(GLSL_FMAX, mx, score);
+            let diff_old = m.fsub(mx, new_max);
+            let alpha = m.glsl1(GLSL_EXP, diff_old);
+            let diff_new = m.fsub(score, new_max);
+            let w = m.glsl1(GLSL_EXP, diff_new);
+
+            let sum_scaled = m.fmul(sum_e, alpha);
+            let new_sum = m.fadd(sum_scaled, w);
+
+            let vk_off = m.uadd(v_offset, k_base);
+            let vi = m.uadd(vk_off, d_col);
+            let vv = m.load_buf(m.var_b, vi);
+            let wv = m.fmul(w, vv);
+            let out_scaled = m.fmul(out_a, alpha);
+            let new_out = m.fadd(out_scaled, wv);
+            [new_max, new_sum, new_out]
+        },
+    );
+
+    let sum_e = state[1];
+    let out_a = state[2];
+    let pos_sum = m.id();
+    m.op(OP_FORD_GREATER_THAN, &[m.t_bool, pos_sum, sum_e, f0]);
+    let safe_denom = m.select_f32(pos_sum, sum_e, f1);
+    let normed = m.fdiv(out_a, safe_denom);
+    let res = m.select_f32(pos_sum, normed, f0);
+    m.store_out(gid, res);
+    m.finish()
+}
+
+/// Generates single-pass fused `Y = act(LayerNorm(X + Residual) * gamma + beta)`.
+/// Buffer A: `X[Rows * Cols]`.
+/// Buffer B: `[Residual[Rows * Cols] (, Gamma[Cols], Beta[Cols])]`.
+/// PushConstants: `[Rows, Cols, eps_f32_bits, 0]`, LocalSize(64, 1, 1).
+pub(crate) fn spirv_fused_layernorm_residual(act_code: u32, has_gamma_beta: bool) -> Vec<u32> {
+    let mut m = SpvModule::new(64, 1, 1, 4);
+    let rows = m.load_pc_u32(0);
+    let cols = m.load_pc_u32(1);
+    let eps = m.load_pc_f32(2);
+    let r = m.gid_comp(0);
+
+    let c0 = m.c_u32(0);
+    let f0 = m.c_f32(0.0);
+
+    let oob = m.id();
+    m.op(OP_UGREATER_THAN_EQUAL, &[m.t_bool, oob, r, rows]);
+    m.guard_oob(oob);
+    let cols_zero = m.id();
+    m.op(OP_IEQUAL, &[m.t_bool, cols_zero, cols, c0]);
+    m.guard_oob(cols_zero);
+
+    let cols_f = m.u2f(cols);
+    let base = m.umul(r, cols);
+    let rows_cols = m.umul(rows, cols);
+
+    let sum = m.for_range_acc(c0, cols, f0, |m, c_idx, acc| {
+        let idx = m.uadd(base, c_idx);
+        let xv = m.load_buf(m.var_a, idx);
+        let rv = m.load_buf(m.var_b, idx);
+        let hv = m.fadd(xv, rv);
+        m.fadd(acc, hv)
+    });
+    let mean = m.fdiv(sum, cols_f);
+
+    let sqsum = m.for_range_acc(c0, cols, f0, |m, c_idx, acc| {
+        let idx = m.uadd(base, c_idx);
+        let xv = m.load_buf(m.var_a, idx);
+        let rv = m.load_buf(m.var_b, idx);
+        let hv = m.fadd(xv, rv);
+        let diff = m.fsub(hv, mean);
+        let sq = m.fmul(diff, diff);
+        m.fadd(acc, sq)
+    });
+    let var = m.fdiv(sqsum, cols_f);
+    let var_eps = m.fadd(var, eps);
+    let std = m.glsl1(GLSL_SQRT, var_eps);
+
+    let gamma_off = rows_cols;
+    let beta_off = m.uadd(rows_cols, cols);
+
+    m.for_range_void(c0, cols, |m, c_idx| {
+        let idx = m.uadd(base, c_idx);
+        let xv = m.load_buf(m.var_a, idx);
+        let rv = m.load_buf(m.var_b, idx);
+        let hv = m.fadd(xv, rv);
+        let centered = m.fsub(hv, mean);
+        let mut norm = m.fdiv(centered, std);
+        if has_gamma_beta {
+            let gi = m.uadd(gamma_off, c_idx);
+            let bi = m.uadd(beta_off, c_idx);
+            let gv = m.load_buf(m.var_b, gi);
+            let bv = m.load_buf(m.var_b, bi);
+            let scaled = m.fmul(norm, gv);
+            norm = m.fadd(scaled, bv);
+        }
+        let activated = match act_code {
+            1 => m.glsl2(GLSL_FMAX, norm, f0),
+            2 => spirv_gelu(m, norm),
+            3 => spirv_silu(m, norm),
+            _ => norm,
+        };
+        m.store_out(idx, activated);
+    });
+
     m.finish()
 }

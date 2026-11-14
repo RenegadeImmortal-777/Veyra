@@ -40,7 +40,7 @@ Last full gate run: **2026-11-14**. Every gate passed (**8/8**).
 | Gate | Result |
 |---|---|
 | `cargo fmt --check` | PASS |
-| `cargo test` | PASS — 123 passed, 0 failed |
+| `cargo test` | PASS — 130 passed, 0 failed |
 | `cargo check --no-default-features` | PASS |
 | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | `cargo build --release` | PASS |
@@ -54,15 +54,19 @@ and per-gate exit codes are written to `gate-report.txt`.
 The engine source is modularized under `engine-rs/src/`:
 - `main.rs` is a 5-line binary entry point calling `veyra::run_cli()` in `lib.rs`.
 - `ir.rs` & `pipeline.rs` provide the SSA propagation / algebraic simplification / DCE optimizer
-  (`optimize_bytecode`, `ir_stats`), transitive `@pure`/`@effect(...)` checking, formal `@secret`/
-  `sanitize(...)` taint-flow verification, `@linear`/`linear_consume(...)` ownership analysis, and
-  `@verify` static interval/bounds proving.
+  (`optimize_bytecode`, `ir_stats`), compile-time escape-analysis `auto_arena` inference, transitive
+  `@pure`/`@effect(...)` checking, formal `@secret`/`sanitize(...)` taint-flow verification,
+  `@linear`/`linear_consume(...)` ownership analysis across calls/actors/channels/remotes, and the
+  relational difference-bound `@verify` solver with lattice joins, loop invariants, callee
+  `ensures` propagation, and concrete counterexample synthesis.
 - `vm.rs` implements the flat `CallFrame` execution stack, indexed local variable
   slots (`LoadLocal`/`DefineLocal`/`StoreLocal`), loop/indexing superinstructions, shared
   method cache, 2-generation nursery/old-gen cycle-collecting object GC with remembered-set
-  write barriers (`gc_collect("minor"|"major")`, `gc_stats`, `gc_pause`, `gc_resume`) and
-  deterministic LIFO `arena_scope(fn)` temporary arenas, automatic hot-function promotion
-  into `jit.rs`, and `Arc<Mutex<Val>>` closure upvalue cell management, while built-in operations live in
+  write barriers (`gc_collect("minor"|"major")`, `gc_stats`, `gc_pause`, `gc_resume`),
+  deterministic LIFO `arena_scope(fn)` + automatic escape-analysis `auto_arena` scopes, a
+  zero-when-disabled production flight-recorder profiler (`profile_start`/`profile_stop`/
+  `profile_report`, tracking VM frames and JIT calls), automatic hot-function promotion into
+  `jit.rs`, and `Arc<Mutex<Val>>` closure upvalue cell management, while built-in operations live in
   `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
 - `jit.rs` provides Veyra's in-memory **multi-architecture x86_64 & aarch64 native machine-code JIT compiler**
   (`W^X` executable allocation, CFG type/stack verification, self-recursion `call rel32`, inter-function calls,
@@ -72,7 +76,9 @@ The engine source is modularized under `engine-rs/src/`:
   backend** (`vulkan-1.dll`/`libvulkan.so.1`, `dxgi.dll`, `d3d11.dll`, `d3dcompiler_47.dll` with multi-threaded
   CPU fallback), rich adapter discovery (`gpu_devices`), single-pass fused elementwise kernel generation
   (`gpu_fuse`, `gpu_fuse_inspect` including `div`, `silu`, `clamp`, `pow_scalar`, `recip`), fused GEMM+bias+activation
-  (`gpu_fused_linear`), custom HLSL (`gpu_run_hlsl`), and `tensor_to(t, "gpu")` device execution.
+  (`gpu_fused_linear`), workgroup shared-memory tiled GEMM, Flash-style causal online-softmax attention, fused
+  Residual+LayerNorm+activation (`gpu_kernel_inspect`), IEEE-754 `f16`/`bf16` dtype casting, custom HLSL
+  (`gpu_run_hlsl`), and `tensor_to(t, "gpu")` device execution.
 - `native_codegen.rs` and `aot.rs` implement standalone WebAssembly (`.wasm`) compilation/disassembly/execution
   with WASI linear-memory strings & arrays (`veyra wasm [file.vy] [-o out.wasm] [--disasm] [--run <fn> [args...]]`,
   `wasm_compile`/`wasm_disasm`/`wasm_run`), direct zero-toolchain PE32+/ELF64 binary emission including
@@ -87,11 +93,14 @@ The engine source is modularized under `engine-rs/src/`:
 - `py_bridge.rs` provides in-process CPython C-API bindings (`python3xx.dll`/`libpython3`, zero-copy PEP 3118
   buffer `py_to_tensor`, and PyCapsule DLPack `DLManagedTensor` / `DLManagedTensorVersioned` contiguous +
   strided/non-contiguous interop via `tensor_to_dlpack` / `py_from_dlpack`) with subprocess fallback across VM and native AOT binaries.
-- `sim_actor.rs` implements SplitMix64 deterministic simulation and virtual-clock actor clusters
-  (`sim_start`/`sim_stop`/`sim_now`/`sim_advance`/`sim_rand`/`sim_fault`/`sim_log`, `sim_actor_spawn`,
-  `sim_actor_send`, `sim_step`, `sim_run_until`, `sim_partition`, `sim_actor_state`, `sim_trace`) and
-  OTP-style supervised actors (`actor_spawn`/`actor_send`/`actor_ask`/`actor_stop`/`actor_status`/
-  `actor_mailbox_len`, `supervisor_spawn` with `"one_for_one"`, `"one_for_all"`, `"rest_for_one"`, and `supervisor_status`).
+- `sim_actor.rs` implements SplitMix64 deterministic simulation, crash-safe fault-injectable virtual
+  filesystems (`sim_fs_write`/`sim_fs_read`/`sim_fs_delete`/`sim_fs_list`/`sim_fs_sync`/`sim_fs_crash`/
+  `sim_fs_snapshot`), and virtual-clock actor clusters (`sim_start`/`sim_stop`/`sim_now`/`sim_advance`/
+  `sim_rand`/`sim_fault`/`sim_log`, `sim_actor_spawn`, `sim_actor_send`, `sim_step`, `sim_run_until`,
+  `sim_partition`, `sim_actor_state`, `sim_trace`), alongside OTP-style supervised actors (`actor_spawn`/
+  `actor_send`/`actor_ask`/`actor_stop`/`actor_status`/`actor_mailbox_len`, `supervisor_spawn` with
+  `"one_for_one"`, `"one_for_all"`, `"rest_for_one"`, `supervisor_status`) and location-transparent
+  distributed TCP actor RPC (`actor_node_listen`/`actor_node_stop`/`actor_remote_send`/`actor_remote_ask`).
 - `dap.rs`, `lsp.rs`, and `server.rs` implement the time-travel reversible DAP server with forward & reverse
   data watchpoints (`stepBack`, `reverseContinue`, `dataBreakpointInfo`, `setDataBreakpoints`),
   the LSP server, and the AST dependency-driven reactive topological DAG notebook server (`veyra notebook [dir] [port]`,

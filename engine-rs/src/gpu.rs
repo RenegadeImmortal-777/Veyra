@@ -3347,6 +3347,445 @@ fn hlsl_fused_linear(act_code: u32, has_bias: bool) -> String {
     s
 }
 
+pub(crate) fn hlsl_tiled_matmul() -> String {
+    String::from(
+        "cbuffer Params : register(b0) { uint M; uint K; uint N; uint _p3; };\n\
+         StructuredBuffer<float> A : register(t0);\n\
+         StructuredBuffer<float> B : register(t1);\n\
+         RWStructuredBuffer<float> Out : register(u0);\n\
+         groupshared float tileA[16][16];\n\
+         groupshared float tileB[16][16];\n\
+         [numthreads(16, 16, 1)]\n\
+         void CSMain(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {\n\
+           uint col = dtid.x; uint row = dtid.y;\n\
+           uint lx = gtid.x; uint ly = gtid.y;\n\
+           float acc = 0.0;\n\
+           uint numTiles = (K + 15) / 16;\n\
+           for (uint t = 0; t < numTiles; t++) {\n\
+             uint ac = t * 16 + lx;\n\
+             uint br = t * 16 + ly;\n\
+             tileA[ly][lx] = (row < M && ac < K) ? A[row * K + ac] : 0.0;\n\
+             tileB[ly][lx] = (br < K && col < N) ? B[br * N + col] : 0.0;\n\
+             GroupMemoryBarrierWithGroupSync();\n\
+             [unroll] for (uint k = 0; k < 16; k++) { acc += tileA[ly][k] * tileB[k][lx]; }\n\
+             GroupMemoryBarrierWithGroupSync();\n\
+           }\n\
+           if (row < M && col < N) { Out[row * N + col] = acc; }\n\
+         }\n",
+    )
+}
+
+pub(crate) fn hlsl_attention(causal: bool) -> String {
+    let limit_expr = if causal {
+        "uint kLimit = min(SeqK, qRow + 1);"
+    } else {
+        "uint kLimit = SeqK;"
+    };
+    format!(
+        "cbuffer Params : register(b0) {{ uint SeqQ; uint SeqK; uint HeadDim; uint Causal; }};\n\
+         StructuredBuffer<float> Q : register(t0);\n\
+         StructuredBuffer<float> KV : register(t1);\n\
+         RWStructuredBuffer<float> Out : register(u0);\n\
+         [numthreads(64, 1, 1)]\n\
+         void CSMain(uint3 dtid : SV_DispatchThreadID) {{\n\
+           uint gid = dtid.x;\n\
+           if (gid >= SeqQ * HeadDim || HeadDim == 0) return;\n\
+           uint qRow = gid / HeadDim; uint dCol = gid % HeadDim;\n\
+           float invSqrtD = 1.0 / sqrt((float)HeadDim);\n\
+           uint vOff = SeqK * HeadDim;\n\
+           float mx = -1.0e30; float sumE = 0.0; float accO = 0.0;\n\
+           {limit_expr}\n\
+           for (uint k = 0; k < kLimit; k++) {{\n\
+             float dot = 0.0;\n\
+             for (uint p = 0; p < HeadDim; p++) {{ dot += Q[qRow * HeadDim + p] * KV[k * HeadDim + p]; }}\n\
+             float score = dot * invSqrtD;\n\
+             float newMax = max(mx, score);\n\
+             float alpha = exp(mx - newMax);\n\
+             float w = exp(score - newMax);\n\
+             sumE = sumE * alpha + w;\n\
+             accO = accO * alpha + w * KV[vOff + k * HeadDim + dCol];\n\
+             mx = newMax;\n\
+           }}\n\
+           Out[gid] = (sumE > 0.0) ? (accO / sumE) : 0.0;\n\
+         }}\n"
+    )
+}
+
+pub(crate) fn hlsl_fused_layernorm_residual(act_code: u32, has_gamma_beta: bool) -> String {
+    let mut s = String::from(
+        "cbuffer Params : register(b0) { uint Rows; uint Cols; uint EpsBits; uint _p3; };\n\
+         StructuredBuffer<float> A : register(t0);\n\
+         StructuredBuffer<float> B : register(t1);\n\
+         RWStructuredBuffer<float> Out : register(u0);\n\
+         [numthreads(64, 1, 1)]\n\
+         void CSMain(uint3 dtid : SV_DispatchThreadID) {\n\
+           uint r = dtid.x; if (r >= Rows || Cols == 0) return;\n\
+           float eps = asfloat(EpsBits);\n\
+           uint base = r * Cols;\n\
+           float sum = 0.0;\n\
+           for (uint c = 0; c < Cols; c++) { sum += A[base + c] + B[base + c]; }\n\
+           float mean = sum / (float)Cols;\n\
+           float sq = 0.0;\n\
+           for (uint c2 = 0; c2 < Cols; c2++) { float d = (A[base + c2] + B[base + c2]) - mean; sq += d * d; }\n\
+           float invStd = 1.0 / sqrt(sq / (float)Cols + eps);\n",
+    );
+    if has_gamma_beta {
+        s.push_str(
+            "  uint gOff = Rows * Cols; uint bOff = gOff + Cols;\n\
+             for (uint c3 = 0; c3 < Cols; c3++) {\n\
+               float norm = ((A[base + c3] + B[base + c3]) - mean) * invStd * B[gOff + c3] + B[bOff + c3];\n",
+        );
+    } else {
+        s.push_str(
+            "  for (uint c3 = 0; c3 < Cols; c3++) {\n\
+               float norm = ((A[base + c3] + B[base + c3]) - mean) * invStd;\n",
+        );
+    }
+    match act_code {
+        1 => s.push_str("    norm = max(norm, 0.0);\n"),
+        2 => s.push_str("    float y = 0.79788456 * (norm + 0.044715 * norm * norm * norm); float y2 = clamp(2.0 * y, -18.0, 18.0); norm = 0.5 * norm * (2.0 - 2.0 / (exp(y2) + 1.0));\n"),
+        3 => s.push_str("    norm = norm / (1.0 + exp(-norm));\n"),
+        _ => {}
+    }
+    s.push_str("    Out[base + c3] = norm;\n  }\n}\n");
+    s
+}
+
+pub(crate) fn parse_fused_act_code(act: &str) -> Result<u32, String> {
+    match act {
+        "none" | "" => Ok(0),
+        "relu" => Ok(1),
+        "gelu" => Ok(2),
+        "silu" => Ok(3),
+        other => Err(format!(
+            "unsupported activation '{other}'; expected 'none', 'relu', 'gelu', or 'silu'"
+        )),
+    }
+}
+
+fn apply_act_f64(acc: f64, act_code: u32) -> f64 {
+    match act_code {
+        1 => acc.max(0.0),
+        2 => {
+            let y = 0.797_884_560_802_865_4 * (acc + 0.044_715 * acc * acc * acc);
+            0.5 * acc * (1.0 + y.tanh())
+        }
+        3 => acc / (1.0 + (-acc).exp()),
+        _ => acc,
+    }
+}
+
+pub(crate) fn gpu_tiled_matmul_f64(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
+    if m == 0 || k == 0 || n == 0 {
+        return vec![0.0; m * n];
+    }
+    GPU_FUSED_KERNELS.fetch_add(1, Ordering::Relaxed);
+    let gx = (n as u32).div_ceil(16);
+    let gy = (m as u32).div_ceil(16);
+    let want_f64 = current_precision_pref() == PrecisionPref::F64;
+    if matches!(
+        resolve_backend(),
+        ResolvedBackend::D3D11 | ResolvedBackend::Vulkan
+    ) && !want_f64
+    {
+        let af: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+        let bf: Vec<f32> = b.iter().map(|&v| v as f32).collect();
+        match resolve_backend() {
+            ResolvedBackend::D3D11 => {
+                #[cfg(windows)]
+                {
+                    let src = hlsl_tiled_matmul();
+                    if let Ok(out) = d3d11_backend::with_d3d11(|st| {
+                        st.dispatch(
+                            "veyra:tiled_matmul",
+                            &src,
+                            "CSMain",
+                            &af,
+                            &bf,
+                            m * n,
+                            &[m as u32, k as u32, n as u32, 0],
+                            (gx, gy, 1),
+                        )
+                    }) {
+                        return out.into_iter().map(|v| v as f64).collect();
+                    }
+                }
+            }
+            ResolvedBackend::Vulkan => {
+                let spv = crate::spirv::spirv_tiled_matmul();
+                if let Ok(out) = vulkan_backend::with_vulkan(|st| {
+                    st.dispatch(
+                        "vk:tiled_matmul",
+                        &spv,
+                        &af,
+                        &bf,
+                        m * n,
+                        &[m as u32, k as u32, n as u32, 0],
+                        (gx, gy, 1),
+                    )
+                }) {
+                    return out.into_iter().map(|v| v as f64).collect();
+                }
+            }
+            ResolvedBackend::Cpu => {}
+        }
+    }
+
+    // Cache-blocked 16x16 tiled CPU fallback matching workgroup tile geometry
+    const TILE: usize = 16;
+    let mut out = vec![0.0; m * n];
+    for r0 in (0..m).step_by(TILE) {
+        let r_end = (r0 + TILE).min(m);
+        for c0 in (0..n).step_by(TILE) {
+            let c_end = (c0 + TILE).min(n);
+            for p0 in (0..k).step_by(TILE) {
+                let p_end = (p0 + TILE).min(k);
+                for r in r0..r_end {
+                    let rk = r * k;
+                    let rn = r * n;
+                    for p in p0..p_end {
+                        let ap = a[rk + p];
+                        let pn = p * n;
+                        for c in c0..c_end {
+                            out[rn + c] += ap * b[pn + c];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn gpu_attention_f64(
+    q: &[f64],
+    k_mat: &[f64],
+    v: &[f64],
+    seq_q: usize,
+    seq_k: usize,
+    head_dim: usize,
+    causal: bool,
+) -> Vec<f64> {
+    if seq_q == 0 || seq_k == 0 || head_dim == 0 {
+        return vec![0.0; seq_q * head_dim];
+    }
+    GPU_FUSED_KERNELS.fetch_add(1, Ordering::Relaxed);
+    let total = seq_q * head_dim;
+    let gx = (total as u32).div_ceil(64);
+    let want_f64 = current_precision_pref() == PrecisionPref::F64;
+    if matches!(
+        resolve_backend(),
+        ResolvedBackend::D3D11 | ResolvedBackend::Vulkan
+    ) && !want_f64
+    {
+        let af: Vec<f32> = q.iter().map(|&x| x as f32).collect();
+        let mut bf: Vec<f32> = Vec::with_capacity(k_mat.len() + v.len());
+        bf.extend(k_mat.iter().map(|&x| x as f32));
+        bf.extend(v.iter().map(|&x| x as f32));
+        match resolve_backend() {
+            ResolvedBackend::D3D11 => {
+                #[cfg(windows)]
+                {
+                    let src = hlsl_attention(causal);
+                    let key = format!("veyra:attn:{}", u8::from(causal));
+                    if let Ok(out) = d3d11_backend::with_d3d11(|st| {
+                        st.dispatch(
+                            &key,
+                            &src,
+                            "CSMain",
+                            &af,
+                            &bf,
+                            total,
+                            &[
+                                seq_q as u32,
+                                seq_k as u32,
+                                head_dim as u32,
+                                u32::from(causal),
+                            ],
+                            (gx, 1, 1),
+                        )
+                    }) {
+                        return out.into_iter().map(|x| x as f64).collect();
+                    }
+                }
+            }
+            ResolvedBackend::Vulkan => {
+                let spv = crate::spirv::spirv_attention(causal);
+                let key = format!("vk:attn:{}", u8::from(causal));
+                if let Ok(out) = vulkan_backend::with_vulkan(|st| {
+                    st.dispatch(
+                        &key,
+                        &spv,
+                        &af,
+                        &bf,
+                        total,
+                        &[
+                            seq_q as u32,
+                            seq_k as u32,
+                            head_dim as u32,
+                            u32::from(causal),
+                        ],
+                        (gx, 1, 1),
+                    )
+                }) {
+                    return out.into_iter().map(|x| x as f64).collect();
+                }
+            }
+            ResolvedBackend::Cpu => {}
+        }
+    }
+
+    // Online-softmax FlashAttention-style CPU path (single pass over K/V per query row)
+    let inv_sqrt_d = 1.0 / (head_dim as f64).sqrt();
+    let mut out = vec![0.0; seq_q * head_dim];
+    for qr in 0..seq_q {
+        let q_row = &q[qr * head_dim..(qr + 1) * head_dim];
+        let k_limit = if causal { (qr + 1).min(seq_k) } else { seq_k };
+        let mut mx = f64::NEG_INFINITY;
+        let mut sum_e = 0.0;
+        let out_row = &mut out[qr * head_dim..(qr + 1) * head_dim];
+        for kr in 0..k_limit {
+            let k_row = &k_mat[kr * head_dim..(kr + 1) * head_dim];
+            let mut dot = 0.0;
+            for d in 0..head_dim {
+                dot += q_row[d] * k_row[d];
+            }
+            let score = dot * inv_sqrt_d;
+            let new_max = mx.max(score);
+            let alpha = if mx.is_finite() {
+                (mx - new_max).exp()
+            } else {
+                0.0
+            };
+            let w = (score - new_max).exp();
+            sum_e = sum_e * alpha + w;
+            let v_row = &v[kr * head_dim..(kr + 1) * head_dim];
+            for d in 0..head_dim {
+                out_row[d] = out_row[d] * alpha + w * v_row[d];
+            }
+            mx = new_max;
+        }
+        if sum_e > 0.0 {
+            let inv = 1.0 / sum_e;
+            for v_o in out_row.iter_mut() {
+                *v_o *= inv;
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn gpu_fused_layernorm_f64(
+    x: &[f64],
+    residual: &[f64],
+    gamma: Option<&[f64]>,
+    beta: Option<&[f64]>,
+    rows: usize,
+    cols: usize,
+    eps: f64,
+    act: &str,
+) -> Result<Vec<f64>, String> {
+    let act_code = parse_fused_act_code(act)?;
+    if rows == 0 || cols == 0 {
+        return Ok(vec![0.0; rows * cols]);
+    }
+    GPU_FUSED_KERNELS.fetch_add(1, Ordering::Relaxed);
+    let has_gb = gamma.is_some() || beta.is_some();
+    let gx = (rows as u32).div_ceil(64);
+    let eps_bits = (eps as f32).to_bits();
+    let want_f64 = current_precision_pref() == PrecisionPref::F64;
+    if matches!(
+        resolve_backend(),
+        ResolvedBackend::D3D11 | ResolvedBackend::Vulkan
+    ) && !want_f64
+    {
+        let af: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        let mut bf: Vec<f32> =
+            Vec::with_capacity(residual.len() + if has_gb { cols * 2 } else { 0 });
+        bf.extend(residual.iter().map(|&v| v as f32));
+        if has_gb {
+            if let Some(g) = gamma {
+                bf.extend(g.iter().map(|&v| v as f32));
+            } else {
+                bf.extend(std::iter::repeat_n(1.0f32, cols));
+            }
+            if let Some(b) = beta {
+                bf.extend(b.iter().map(|&v| v as f32));
+            } else {
+                bf.extend(std::iter::repeat_n(0.0f32, cols));
+            }
+        }
+        match resolve_backend() {
+            ResolvedBackend::D3D11 => {
+                #[cfg(windows)]
+                {
+                    let src = hlsl_fused_layernorm_residual(act_code, has_gb);
+                    let key = format!("veyra:fused_ln:{act_code}:{}", u8::from(has_gb));
+                    if let Ok(out) = d3d11_backend::with_d3d11(|st| {
+                        st.dispatch(
+                            &key,
+                            &src,
+                            "CSMain",
+                            &af,
+                            &bf,
+                            rows * cols,
+                            &[rows as u32, cols as u32, eps_bits, 0],
+                            (gx, 1, 1),
+                        )
+                    }) {
+                        return Ok(out.into_iter().map(|v| v as f64).collect());
+                    }
+                }
+            }
+            ResolvedBackend::Vulkan => {
+                let spv = crate::spirv::spirv_fused_layernorm_residual(act_code, has_gb);
+                let key = format!("vk:fused_ln:{act_code}:{}", u8::from(has_gb));
+                if let Ok(out) = vulkan_backend::with_vulkan(|st| {
+                    st.dispatch(
+                        &key,
+                        &spv,
+                        &af,
+                        &bf,
+                        rows * cols,
+                        &[rows as u32, cols as u32, eps_bits, 0],
+                        (gx, 1, 1),
+                    )
+                }) {
+                    return Ok(out.into_iter().map(|v| v as f64).collect());
+                }
+            }
+            ResolvedBackend::Cpu => {}
+        }
+    }
+
+    let mut out = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let base = r * cols;
+        let mut sum = 0.0;
+        for c in 0..cols {
+            sum += x[base + c] + residual[base + c];
+        }
+        let mean = sum / cols as f64;
+        let mut sq = 0.0;
+        for c in 0..cols {
+            let d = (x[base + c] + residual[base + c]) - mean;
+            sq += d * d;
+        }
+        let inv_std = 1.0 / (sq / cols as f64 + eps).sqrt();
+        for c in 0..cols {
+            let mut norm = ((x[base + c] + residual[base + c]) - mean) * inv_std;
+            if let Some(g) = gamma {
+                norm *= g[c];
+            }
+            if let Some(b) = beta {
+                norm += b[c];
+            }
+            out[base + c] = apply_act_f64(norm, act_code);
+        }
+    }
+    Ok(out)
+}
+
 fn fused_pipeline_hash(ops: &[crate::spirv::FusedEwiseOp]) -> u64 {
     use crate::spirv::FusedEwiseOp;
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -3477,17 +3916,7 @@ pub(crate) fn gpu_fused_linear_f64(
     n: usize,
     act: &str,
 ) -> Result<Vec<f64>, String> {
-    let act_code: u32 = match act {
-        "none" | "" => 0,
-        "relu" => 1,
-        "gelu" => 2,
-        "silu" => 3,
-        other => {
-            return Err(format!(
-                "gpu_fused_linear unsupported activation '{other}'; expected 'none', 'relu', 'gelu', or 'silu'"
-            ));
-        }
-    };
+    let act_code: u32 = parse_fused_act_code(act)?;
     if m == 0 || k == 0 || n == 0 {
         return Ok(vec![0.0; m * n]);
     }

@@ -899,3 +899,101 @@ pub(crate) fn tensor_gc_unreachable(live_roots: &HashSet<u64>) -> Result<usize, 
     });
     Ok(removed)
 }
+
+/// Converts `f64` to IEEE-754 binary16 bit representation (round-to-nearest-even).
+pub(crate) fn f64_to_f16_bits(v: f64) -> u16 {
+    let f = v as f32;
+    let bits = f.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7F_FFFF;
+    if exp == 0xFF {
+        return if mant != 0 {
+            sign | 0x7E00 | ((mant >> 13) as u16).max(1)
+        } else {
+            sign | 0x7C00
+        };
+    }
+    let unbiased = exp - 127;
+    if unbiased > 15 {
+        return sign | 0x7C00;
+    }
+    if unbiased < -24 {
+        return sign;
+    }
+    if unbiased < -14 {
+        let sig = mant | 0x80_0000;
+        let shift = (-14 - unbiased + 13) as u32;
+        let sub = (sig >> shift) as u16;
+        let rem = sig & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        let round_up = rem > half || (rem == half && (sub & 1) == 1);
+        return sign | (sub + u16::from(round_up));
+    }
+    let h_exp = ((unbiased + 15) as u16) << 10;
+    let h_mant = (mant >> 13) as u16;
+    let rem = mant & 0x1FFF;
+    let round_up = rem > 0x1000 || (rem == 0x1000 && (h_mant & 1) == 1);
+    let combined = (sign | h_exp | h_mant) + u16::from(round_up);
+    combined
+}
+
+/// Converts IEEE-754 binary16 bit representation back to `f64`.
+pub(crate) fn f16_bits_to_f64(h: u16) -> f64 {
+    let sign = ((h as u32) & 0x8000) << 16;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let mant = (h & 0x03FF) as u32;
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            let mut m = mant;
+            let mut e: u32 = 127 - 15 + 1;
+            while (m & 0x0400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x03FF;
+            sign | (e << 23) | (m << 13)
+        }
+    } else if exp == 0x1F {
+        sign | (0xFF << 23) | (mant << 13)
+    } else {
+        sign | ((exp + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits) as f64
+}
+
+/// Converts `f64` to bfloat16 bit representation (round-to-nearest-even).
+pub(crate) fn f64_to_bf16_bits(v: f64) -> u16 {
+    let bits = (v as f32).to_bits();
+    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let lsb = (bits >> 16) & 1;
+    let rounded = bits.wrapping_add(0x7FFF + lsb);
+    (rounded >> 16) as u16
+}
+
+/// Converts bfloat16 bit representation back to `f64`.
+pub(crate) fn bf16_bits_to_f64(b: u16) -> f64 {
+    f32::from_bits((b as u32) << 16) as f64
+}
+
+pub(crate) fn cast_f64_slice_dtype(vals: &[f64], dtype: &str) -> Result<Vec<f64>, String> {
+    match dtype.trim().to_ascii_lowercase().as_str() {
+        "f64" | "float64" => Ok(vals.to_vec()),
+        "f32" | "float32" => Ok(vals.iter().map(|&v| (v as f32) as f64).collect()),
+        "f16" | "float16" => Ok(vals
+            .iter()
+            .map(|&v| f16_bits_to_f64(f64_to_f16_bits(v)))
+            .collect()),
+        "bf16" | "bfloat16" => Ok(vals
+            .iter()
+            .map(|&v| bf16_bits_to_f64(f64_to_bf16_bits(v)))
+            .collect()),
+        other => Err(format!(
+            "unsupported tensor dtype '{other}'; expected 'f64', 'f32', 'f16', or 'bf16'"
+        )),
+    }
+}

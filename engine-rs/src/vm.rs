@@ -41,6 +41,15 @@ pub(crate) struct CallFrame {
     dap_pushed: bool,
     active_class: Option<String>,
     active_self: Option<Val>,
+    active_auto_arena: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProfileFnStats {
+    pub(crate) calls: u64,
+    pub(crate) total_ns: u64,
+    pub(crate) self_ns: u64,
+    pub(crate) max_ns: u64,
 }
 
 struct PreparedCall {
@@ -67,6 +76,7 @@ pub(crate) struct GcStatsInner {
     pub(crate) promotions: usize,
     pub(crate) write_barriers: usize,
     pub(crate) arena_freed: usize,
+    pub(crate) auto_arena_scopes: usize,
     pub(crate) total_collected: usize,
     pub(crate) last_collected: usize,
     pub(crate) next_threshold: usize,
@@ -87,6 +97,7 @@ impl Default for GcStatsInner {
             promotions: 0,
             write_barriers: 0,
             arena_freed: 0,
+            auto_arena_scopes: 0,
             total_collected: 0,
             last_collected: 0,
             next_threshold: 4096,
@@ -145,6 +156,13 @@ pub(crate) struct Vm {
     pub(crate) call_counts: HashMap<usize, u32>,
     pub(crate) active_class: Option<String>,
     pub(crate) active_self: Option<Val>,
+    pub(crate) active_auto_arena: bool,
+    pub(crate) auto_arena_cache: HashMap<usize, bool>,
+    pub(crate) profiling: bool,
+    pub(crate) profile_started_at: Option<std::time::Instant>,
+    pub(crate) profile_total_ns: u64,
+    profile_stack: Vec<(String, std::time::Instant, u64)>,
+    pub(crate) profile_stats: HashMap<String, ProfileFnStats>,
 }
 
 static GENERATORS: OnceLock<Mutex<HashMap<u64, Vm>>> = OnceLock::new();
@@ -248,6 +266,13 @@ impl Vm {
             call_counts: HashMap::new(),
             active_class: None,
             active_self: None,
+            active_auto_arena: false,
+            auto_arena_cache: HashMap::new(),
+            profiling: false,
+            profile_started_at: None,
+            profile_total_ns: 0,
+            profile_stack: Vec::new(),
+            profile_stats: HashMap::new(),
         }
     }
     fn nested_from_prepared(&self, prepared: PreparedCall) -> Self {
@@ -280,6 +305,13 @@ impl Vm {
             call_counts: HashMap::new(),
             active_class: prepared.active_class,
             active_self: prepared.active_self,
+            active_auto_arena: false,
+            auto_arena_cache: HashMap::new(),
+            profiling: self.profiling,
+            profile_started_at: None,
+            profile_total_ns: 0,
+            profile_stack: Vec::new(),
+            profile_stats: HashMap::new(),
         }
     }
     fn child_debug_scope(&self, def_ip: usize, sub_idx: usize) -> usize {
@@ -547,7 +579,156 @@ impl Vm {
             active_self: None,
         })
     }
+    fn should_auto_arena(&mut self, code: &Arc<Vec<Op>>) -> bool {
+        if self.gc.paused.load(Ordering::Relaxed) {
+            return false;
+        }
+        let ptr = Arc::as_ptr(code) as usize;
+        if let Some(&cached) = self.auto_arena_cache.get(&ptr) {
+            return cached;
+        }
+        let eligible = crate::ir::code_eligible_for_auto_arena(code);
+        self.auto_arena_cache.insert(ptr, eligible);
+        eligible
+    }
+    fn pop_active_auto_arena(&mut self) -> Option<HashSet<u64>> {
+        if !self.active_auto_arena {
+            return None;
+        }
+        self.active_auto_arena = false;
+        self.gc
+            .inner
+            .lock()
+            .ok()
+            .and_then(|mut st| st.arena_frames.pop())
+    }
+    fn profile_enter(&mut self, name: &str) {
+        if !self.profiling {
+            return;
+        }
+        let label = if name.is_empty() { "<fn>" } else { name };
+        self.profile_stack
+            .push((label.to_string(), std::time::Instant::now(), 0));
+    }
+    fn record_profile_sample(&mut self, name: String, elapsed: u64, child_ns: u64) {
+        let label = if name.is_empty() {
+            "<fn>".to_string()
+        } else {
+            name
+        };
+        let self_ns = elapsed.saturating_sub(child_ns);
+        let entry = self.profile_stats.entry(label).or_default();
+        entry.calls += 1;
+        entry.total_ns = entry.total_ns.saturating_add(elapsed);
+        entry.self_ns = entry.self_ns.saturating_add(self_ns);
+        entry.max_ns = entry.max_ns.max(elapsed);
+        if let Some(parent) = self.profile_stack.last_mut() {
+            parent.2 = parent.2.saturating_add(elapsed);
+        }
+    }
+    fn profile_exit(&mut self) {
+        if !self.profiling {
+            return;
+        }
+        if let Some((name, start, child_ns)) = self.profile_stack.pop() {
+            let elapsed = start.elapsed().as_nanos() as u64;
+            self.record_profile_sample(name, elapsed, child_ns);
+        }
+    }
+    fn merge_profile_stats(&mut self, other: HashMap<String, ProfileFnStats>) {
+        for (k, v) in other {
+            let entry = self.profile_stats.entry(k).or_default();
+            entry.calls = entry.calls.saturating_add(v.calls);
+            entry.total_ns = entry.total_ns.saturating_add(v.total_ns);
+            entry.self_ns = entry.self_ns.saturating_add(v.self_ns);
+            entry.max_ns = entry.max_ns.max(v.max_ns);
+        }
+    }
+    pub(crate) fn profile_start(&mut self) -> Val {
+        self.profiling = true;
+        self.profile_started_at = Some(std::time::Instant::now());
+        self.profile_total_ns = 0;
+        self.profile_stack.clear();
+        self.profile_stats.clear();
+        Val::Bool(true)
+    }
+    pub(crate) fn profile_stop(&mut self) -> Result<Val, String> {
+        if let Some(t0) = self.profile_started_at.take() {
+            self.profile_total_ns = t0.elapsed().as_nanos() as u64;
+        }
+        while !self.profile_stack.is_empty() {
+            self.profile_exit();
+        }
+        self.profiling = false;
+        self.profile_report()
+    }
+    pub(crate) fn profile_report_rows(&self) -> Vec<(String, ProfileFnStats)> {
+        let mut rows: Vec<(String, ProfileFnStats)> = self
+            .profile_stats
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        rows.sort_by(|a, b| {
+            b.1.total_ns
+                .cmp(&a.1.total_ns)
+                .then_with(|| b.1.calls.cmp(&a.1.calls))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        rows
+    }
+    pub(crate) fn profile_report(&self) -> Result<Val, String> {
+        let total_ns = if let Some(t0) = self.profile_started_at {
+            t0.elapsed().as_nanos() as u64
+        } else {
+            self.profile_total_ns
+        };
+        let rows = self.profile_report_rows();
+        let mut total_calls: u64 = 0;
+        let mut fn_vals = Vec::with_capacity(rows.len());
+        for (name, st) in rows {
+            total_calls = total_calls.saturating_add(st.calls);
+            let avg_ms = if st.calls > 0 {
+                (st.total_ns as f64 / st.calls as f64) / 1_000_000.0
+            } else {
+                0.0
+            };
+            fn_vals.push(Val::Map(vec![
+                (Val::Str("name".into()), Val::Str(name)),
+                (Val::Str("calls".into()), Val::Num(st.calls as f64)),
+                (
+                    Val::Str("total_ms".into()),
+                    Val::Num(st.total_ns as f64 / 1_000_000.0),
+                ),
+                (
+                    Val::Str("self_ms".into()),
+                    Val::Num(st.self_ns as f64 / 1_000_000.0),
+                ),
+                (
+                    Val::Str("max_ms".into()),
+                    Val::Num(st.max_ns as f64 / 1_000_000.0),
+                ),
+                (Val::Str("avg_ms".into()), Val::Num(avg_ms)),
+            ]));
+        }
+        let gc = self.gc_stats()?;
+        Ok(Val::Map(vec![
+            (Val::Str("active".into()), Val::Bool(self.profiling)),
+            (
+                Val::Str("total_ms".into()),
+                Val::Num(total_ns as f64 / 1_000_000.0),
+            ),
+            (Val::Str("total_calls".into()), Val::Num(total_calls as f64)),
+            (Val::Str("functions".into()), Val::List(fn_vals)),
+            (Val::Str("gc".into()), gc),
+        ]))
+    }
     fn push_prepared_frame(&mut self, prepared: PreparedCall) {
+        let enter_auto = !prepared.is_generator && self.should_auto_arena(&prepared.code);
+        let prof_name = if self.profiling {
+            Some(prepared.debug_name.clone())
+        } else {
+            None
+        };
         let dap_pushed = if let Some(ref dbg) = self.debugger {
             dbg.update_caller_frame(
                 self.debug_scope,
@@ -584,8 +765,18 @@ impl Vm {
             dap_pushed,
             active_class: std::mem::replace(&mut self.active_class, prepared.active_class),
             active_self: std::mem::replace(&mut self.active_self, prepared.active_self),
+            active_auto_arena: std::mem::replace(&mut self.active_auto_arena, enter_auto),
         };
+        if enter_auto {
+            if let Ok(mut st) = self.gc.inner.lock() {
+                st.auto_arena_scopes += 1;
+                st.arena_frames.push(HashSet::new());
+            }
+        }
         self.frames.push(frame);
+        if let Some(name) = prof_name {
+            self.profile_enter(&name);
+        }
     }
     fn restore_frame(&mut self, caller: CallFrame) {
         if caller.dap_pushed {
@@ -608,6 +799,7 @@ impl Vm {
         self.debug_scope = caller.debug_scope;
         self.active_class = caller.active_class;
         self.active_self = caller.active_self;
+        self.active_auto_arena = caller.active_auto_arena;
     }
     pub(crate) fn resolve_jit_callee(&self, fname: &str) -> Option<FunctionDef> {
         match self.get_var(fname) {
@@ -654,11 +846,20 @@ impl Vm {
                 *entry = entry.saturating_add(1);
                 *entry
             };
+            let jit_t0 = if self.profiling {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             if let Some(res) =
                 crate::jit::jit_try_run(&def.debug_name, &def, &args, count, &|fname| {
                     self.resolve_jit_callee(fname)
                 })
             {
+                if let Some(t0) = jit_t0 {
+                    let elapsed = t0.elapsed().as_nanos() as u64;
+                    self.record_profile_sample(def.debug_name.clone(), elapsed, 0);
+                }
                 self.stack.push(res);
                 return Ok(());
             }
@@ -820,6 +1021,13 @@ impl Vm {
             call_counts: HashMap::new(),
             active_class: self.active_class.clone(),
             active_self: self.active_self.clone(),
+            active_auto_arena: false,
+            auto_arena_cache: HashMap::new(),
+            profiling: false,
+            profile_started_at: None,
+            profile_total_ns: 0,
+            profile_stack: Vec::new(),
+            profile_stats: HashMap::new(),
         }
     }
     fn run_prepared_call(&self, prepared: PreparedCall) -> Result<Val, String> {
@@ -842,6 +1050,10 @@ impl Vm {
         let return_type = prepared.return_type.clone();
         let debug_name = prepared.debug_name.clone();
         let debug_scope = prepared.debug_scope;
+        let prof_active = self.profiling;
+        if prof_active {
+            self.profile_enter(&debug_name);
+        }
         let mut nested = self.nested_from_prepared(prepared);
         let res = Self::exec_prepared_nested(
             self,
@@ -850,7 +1062,16 @@ impl Vm {
             return_type,
             debug_name,
             debug_scope,
-        )?;
+        );
+        if prof_active {
+            let inner_ns: u64 = nested.profile_stats.values().map(|s| s.self_ns).sum();
+            if let Some(top) = self.profile_stack.last_mut() {
+                top.2 = top.2.saturating_add(inner_ns);
+            }
+            self.merge_profile_stats(nested.profile_stats);
+            self.profile_exit();
+        }
+        let res = res?;
         if !Arc::ptr_eq(&self.funcs, &nested.funcs) {
             self.funcs = nested.funcs;
         }
@@ -3145,6 +3366,10 @@ impl Vm {
                 Val::Num(st.arena_freed as f64),
             ),
             (
+                Val::Str("auto_arena_scopes".into()),
+                Val::Num(st.auto_arena_scopes as f64),
+            ),
+            (
                 Val::Str("last_collected".into()),
                 Val::Num(st.last_collected as f64),
             ),
@@ -3204,6 +3429,76 @@ impl Vm {
         Ok(Val::Map(Self::gc_metrics_pairs(&st, live, paused)))
     }
 
+    fn reclaim_arena_ids(
+        &mut self,
+        root_val: Option<&Val>,
+        arena_ids: HashSet<u64>,
+    ) -> Result<(), String> {
+        if arena_ids.is_empty() {
+            return Ok(());
+        }
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut work_objs: Vec<u64> = Vec::new();
+        let mut seen_funcs: HashSet<String> = HashSet::new();
+        let mut pending_funcs: Vec<String> = Vec::new();
+        let mut seen_gens: HashSet<u64> = HashSet::new();
+        let mut pending_gens: Vec<u64> = Vec::new();
+
+        if let Some(rv) = root_val {
+            Self::collect_val_gc_refs(
+                rv,
+                &mut visited,
+                &mut work_objs,
+                &mut seen_funcs,
+                &mut pending_funcs,
+                &mut seen_gens,
+                &mut pending_gens,
+            );
+        }
+        Self::seed_vm_gc_roots(
+            self,
+            &mut visited,
+            &mut work_objs,
+            &mut seen_funcs,
+            &mut pending_funcs,
+            &mut seen_gens,
+            &mut pending_gens,
+        );
+        self.seed_class_object_roots(&mut visited, &mut work_objs);
+        self.trace_gc_worklist(
+            &|_| true,
+            &mut visited,
+            &mut work_objs,
+            &mut seen_funcs,
+            &mut pending_funcs,
+            &mut seen_gens,
+            &mut pending_gens,
+        )?;
+
+        let mut freed = 0usize;
+        {
+            let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+            for &aid in &arena_ids {
+                if !visited.contains(&aid) && heap.remove(&aid).is_some() {
+                    freed += 1;
+                }
+            }
+        }
+        if let Ok(mut st) = self.gc.inner.lock() {
+            for &aid in &arena_ids {
+                if !visited.contains(&aid) {
+                    st.nursery.remove(&aid);
+                    st.old_gen.remove(&aid);
+                    st.remembered_set.remove(&aid);
+                } else if let Some(parent) = st.arena_frames.last_mut() {
+                    parent.insert(aid);
+                }
+            }
+            st.arena_freed += freed;
+        }
+        Ok(())
+    }
+
     pub(crate) fn arena_scope(&mut self, callee: Val) -> Result<Val, String> {
         {
             let mut st = self.gc.inner.lock().map_err(|_| "gc state poisoned")?;
@@ -3215,65 +3510,7 @@ impl Vm {
             st.arena_frames.pop().unwrap_or_default()
         };
         let out = res?;
-        if !arena_ids.is_empty() {
-            let mut visited: HashSet<u64> = HashSet::new();
-            let mut work_objs: Vec<u64> = Vec::new();
-            let mut seen_funcs: HashSet<String> = HashSet::new();
-            let mut pending_funcs: Vec<String> = Vec::new();
-            let mut seen_gens: HashSet<u64> = HashSet::new();
-            let mut pending_gens: Vec<u64> = Vec::new();
-
-            Self::collect_val_gc_refs(
-                &out,
-                &mut visited,
-                &mut work_objs,
-                &mut seen_funcs,
-                &mut pending_funcs,
-                &mut seen_gens,
-                &mut pending_gens,
-            );
-            Self::seed_vm_gc_roots(
-                self,
-                &mut visited,
-                &mut work_objs,
-                &mut seen_funcs,
-                &mut pending_funcs,
-                &mut seen_gens,
-                &mut pending_gens,
-            );
-            self.seed_class_object_roots(&mut visited, &mut work_objs);
-            self.trace_gc_worklist(
-                &|_| true,
-                &mut visited,
-                &mut work_objs,
-                &mut seen_funcs,
-                &mut pending_funcs,
-                &mut seen_gens,
-                &mut pending_gens,
-            )?;
-
-            let mut freed = 0usize;
-            {
-                let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-                for &aid in &arena_ids {
-                    if !visited.contains(&aid) && heap.remove(&aid).is_some() {
-                        freed += 1;
-                    }
-                }
-            }
-            if let Ok(mut st) = self.gc.inner.lock() {
-                for &aid in &arena_ids {
-                    if !visited.contains(&aid) {
-                        st.nursery.remove(&aid);
-                        st.old_gen.remove(&aid);
-                        st.remembered_set.remove(&aid);
-                    } else if let Some(parent) = st.arena_frames.last_mut() {
-                        parent.insert(aid);
-                    }
-                }
-                st.arena_freed += freed;
-            }
-        }
+        self.reclaim_arena_ids(Some(&out), arena_ids)?;
         Ok(out)
     }
 
@@ -3368,8 +3605,13 @@ impl Vm {
     }
     fn pop_frame_or_finish(&mut self, val: Val, context: &str) -> Result<Option<Val>, String> {
         let expected_ret = self.return_type.clone();
+        let arena_ids = self.pop_active_auto_arena();
         if let Some(caller) = self.frames.pop() {
+            self.profile_exit();
             self.restore_frame(caller);
+            if let Some(ids) = arena_ids {
+                self.reclaim_arena_ids(Some(&val), ids)?;
+            }
             if let Some(expected) = expected_ret {
                 if !self.value_matches(&val, &expected) {
                     return Err(format!(
@@ -3381,6 +3623,9 @@ impl Vm {
             self.stack.push(val);
             Ok(None)
         } else {
+            if let Some(ids) = arena_ids {
+                self.reclaim_arena_ids(Some(&val), ids)?;
+            }
             if let Some(expected) = expected_ret {
                 if !self.value_matches(&val, &expected) {
                     return Err(format!(
@@ -3779,7 +4024,12 @@ impl Vm {
                                 break;
                             }
                             if let Some(caller) = self.frames.pop() {
+                                self.profile_exit();
+                                let arena_ids = self.pop_active_auto_arena();
                                 self.restore_frame(caller);
+                                if let Some(ids) = arena_ids {
+                                    let _ = self.reclaim_arena_ids(None, ids);
+                                }
                             } else {
                                 break;
                             }
@@ -3789,11 +4039,19 @@ impl Vm {
                         }
                     }
                     while let Some(caller) = self.frames.pop() {
+                        self.profile_exit();
                         if caller.dap_pushed {
                             if let Some(ref dbg) = self.debugger {
                                 dbg.pop_frame();
                             }
                         }
+                        if let Some(ids) = self.pop_active_auto_arena() {
+                            let _ = self.reclaim_arena_ids(None, ids);
+                        }
+                        self.active_auto_arena = caller.active_auto_arena;
+                    }
+                    if let Some(ids) = self.pop_active_auto_arena() {
+                        let _ = self.reclaim_arena_ids(None, ids);
                     }
                     return Err(err);
                 }

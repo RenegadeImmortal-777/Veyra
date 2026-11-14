@@ -56,6 +56,24 @@ Built-in types include Int, Float, Number, String, Bool, List, Map, Function, Nu
         return a / b;
     }
 
+## Distributed Actors, Crash-Safe Simulation & Profiling
+
+    let listener = actor_node_listen("127.0.0.1:0", fn(msg, state) {
+        return {"state": state + 1, "reply": msg};
+    }, 0);
+    let reply = actor_remote_ask(listener.addr, "ping", 2000);
+    actor_node_stop(listener.id);
+
+    sim_start(42);
+    sim_fs_write("/wal/entry", "committed");
+    sim_fs_sync();
+    sim_fs_write("/wal/temp", "uncommitted");
+    sim_fs_crash(); // drops uncommitted writes while keeping /wal/entry
+
+    profile_start();
+    let work = safe_div(100, 5);
+    let report = profile_stop();
+
 ## Modules
 
     use "other.vy";

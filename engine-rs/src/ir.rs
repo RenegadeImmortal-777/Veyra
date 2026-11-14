@@ -605,3 +605,69 @@ fn thread_jumps(code: &mut [Op]) {
         }
     }
 }
+
+/// Compile-time escape analysis over compiled bytecode: determines whether a function
+/// may allocate objects/lists without escaping through global mutation, generators,
+/// closures, or concurrent actors, making it safe for automatic VM arena framing.
+pub(crate) fn code_eligible_for_auto_arena(code: &[Op]) -> bool {
+    let mut may_alloc = false;
+    for op in code {
+        match op {
+            Op::Yield
+            | Op::Store(_)
+            | Op::Def(_, _, _, _, _)
+            | Op::DefClass(_, _, _)
+            | Op::BuildClass(_, _, _)
+            | Op::FunctionRef(_) => return false,
+            Op::Call(name, _) => {
+                if matches!(
+                    name.as_str(),
+                    "actor_spawn"
+                        | "actor_send"
+                        | "actor_ask"
+                        | "chan_send"
+                        | "channel_send"
+                        | "sim_actor_spawn"
+                        | "sim_actor_send"
+                        | "supervisor_spawn"
+                        | "arena_scope"
+                        | "spawn"
+                        | "global_set"
+                ) {
+                    return false;
+                }
+                if !matches!(
+                    name.as_str(),
+                    "abs"
+                        | "min"
+                        | "max"
+                        | "sqrt"
+                        | "sin"
+                        | "cos"
+                        | "tan"
+                        | "exp"
+                        | "log"
+                        | "log2"
+                        | "pow"
+                        | "floor"
+                        | "ceil"
+                        | "round"
+                        | "len"
+                        | "int"
+                        | "float"
+                        | "bool"
+                        | "assert"
+                        | "requires"
+                        | "ensures"
+                ) {
+                    may_alloc = true;
+                }
+            }
+            Op::CallExpr(_) | Op::CallMethod(_, _) | Op::CallExt(_, _, _) => {
+                may_alloc = true;
+            }
+            _ => {}
+        }
+    }
+    may_alloc
+}

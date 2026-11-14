@@ -19,8 +19,17 @@ release date in the source material; earlier entries are undated.
 
 ## 12.0 Sovereign
 
-Self-hosting, language parity, compiler optimization, tensor broadcasting, and 8-pillar horizon release.
-Release gate verified **2026-11-14** (**123/123** unit tests, **74/74** packages, **8/8** release gates).
+Self-hosting, language parity, compiler optimization, tensor broadcasting, and full-stack Sovereign Apex release.
+Release gate verified **2026-11-14** (**130/130** unit tests, **74/74** packages, **8/8** release gates).
+
+- **GPU Tiled/Attention Kernels & Low-Precision Dtypes (`spirv.rs`, `gpu.rs`, `tensor.rs`, `builtins/science_ml.rs`)**:
+  - Added workgroup shared-memory tiled GEMM, Flash-style causal online-softmax attention, and fused Residual+LayerNorm+activation pipelines across SPIR-V, HLSL `cs_5_0`, and CPU fallback (`gpu_kernel_inspect`), plus IEEE-754 `f16`/`bf16` dtype casting.
+- **Relational `@verify` Prover, `@linear` Move Enforcement & Auto-Arena Escape Analysis (`ir.rs`, `pipeline.rs`, `vm.rs`)**:
+  - Upgraded `@verify` to a relational difference-bound solver with `if`/`else` lattice joins, half-bounded interval arithmetic, loop invariant + post-loop negation reasoning, callee `ensures` propagation, and concrete counterexample witnesses.
+  - Extended `@linear` move checking into actor/channel/remote boundaries (`actor_send`, `actor_ask`, `actor_remote_send`, `actor_remote_ask`, `chan_send`) and added compile-time escape-analysis `auto_arena` reclamation.
+- **Distributed TCP Actors, Crash-Safe Virtual FS, Flight-Recorder Profiler & Self-Hosted Peephole (`sim_actor.rs`, `vm.rs`, `tooling.rs`, `compiler-vy/src/main.vy`)**:
+  - Added location-transparent TCP actor RPC (`actor_node_listen`, `actor_node_stop`, `actor_remote_send`, `actor_remote_ask`) and deterministic crash-safe fault-injectable VFS (`sim_fs_write`, `sim_fs_read`, `sim_fs_delete`, `sim_fs_list`, `sim_fs_sync`, `sim_fs_crash`, `sim_fs_snapshot`).
+  - Added a zero-when-disabled production flight-recorder profiler (`profile_start`, `profile_stop`, `profile_report`) instrumenting both VM frames and JIT calls alongside upgraded `veyra profile` GC/auto-arena reporting, plus pure-Veyra arithmetic constant folding in `compiler-vy/src/main.vy` (preserving 3-stage bootstrap fixpoint).
 
 - **IR Optimizer, Formal Taint, Linear Ownership & Interval Verifier (`ir.rs`, `pipeline.rs`)**:
   - Added SSA copy/constant propagation, algebraic identities, dead code elimination (`ir_stats`), formal `@secret`/`sanitize(...)` information-flow taint verification, `@linear`/`linear_consume(...)` ownership analysis across branches, and `@verify` static interval/bounds proofs.

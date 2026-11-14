@@ -4,20 +4,24 @@
 use std::{
     cell::RefCell,
     cmp::Ordering as CmpOrdering,
-    collections::{BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap, HashMap},
+    io::{BufRead, BufReader, Write},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
     time::Duration,
 };
 
+use serde_json::Value as JsonValue;
+
 use crate::bytecode::Op;
 use crate::runtime::resolve_function_object;
-use crate::value::{Val, map_lookup};
+use crate::value::{Val, json_to_val, map_lookup, val_to_json};
 use crate::vm::Vm;
 
 #[derive(Clone, Debug)]
@@ -84,6 +88,8 @@ pub(crate) struct SimState {
     sim_queue: BinaryHeap<SimEvent>,
     partitions: HashMap<(String, String), f64>,
     sim_trace: Vec<Val>,
+    vfs_synced: BTreeMap<String, String>,
+    vfs_dirty: BTreeMap<String, Option<String>>,
 }
 
 impl SimState {
@@ -104,6 +110,38 @@ impl SimState {
             sim_queue: BinaryHeap::new(),
             partitions: HashMap::new(),
             sim_trace: Vec::new(),
+            vfs_synced: BTreeMap::new(),
+            vfs_dirty: BTreeMap::new(),
+        }
+    }
+
+    fn trigger_fault_if_configured(&mut self, targets: &[&str]) -> Option<String> {
+        for &target in targets {
+            let rate = self.faults.get(target).copied().unwrap_or(0.0);
+            if rate <= 0.0 {
+                continue;
+            }
+            let draw = self.next_f64();
+            let hit = rate >= 1.0 || draw < rate;
+            if hit {
+                self.push_event(
+                    "fault",
+                    vec![
+                        (Val::Str("target".into()), Val::Str(target.into())),
+                        (Val::Str("triggered".into()), Val::Bool(true)),
+                    ],
+                );
+                return Some(format!("SimulatedFault: {target}"));
+            }
+        }
+        None
+    }
+
+    fn vfs_effective(&self, norm: &str) -> Option<&String> {
+        if let Some(opt) = self.vfs_dirty.get(norm) {
+            opt.as_ref()
+        } else {
+            self.vfs_synced.get(norm)
         }
     }
 
@@ -1210,4 +1248,425 @@ pub(crate) fn supervisor_status(sup_id: u64) -> Result<Val, String> {
         (Val::Str("named".into()), Val::Map(named_pairs)),
         (Val::Str("children".into()), Val::List(child_statuses)),
     ]))
+}
+
+// =========================================================================
+// Deterministic Virtual Fault-Injectable Filesystem (Crash + Replay Safe)
+// =========================================================================
+
+fn vfs_norm_path(raw: &str) -> Result<String, String> {
+    let replaced = raw.replace('\\', "/");
+    let mut parts = Vec::new();
+    for seg in replaced.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return Err(format!("sim_fs invalid path traversal in '{raw}'"));
+        }
+        parts.push(seg);
+    }
+    if parts.is_empty() {
+        return Err("sim_fs path must not be empty".into());
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn vfs_map_to_val(entries: impl Iterator<Item = (String, String)>) -> Val {
+    Val::Map(entries.map(|(k, v)| (Val::Str(k), Val::Str(v))).collect())
+}
+
+pub(crate) fn sim_fs_write(path: &str, data: &str) -> Result<Val, String> {
+    let norm = vfs_norm_path(path)?;
+    let arc = require_sim()?;
+    let mut st = arc.lock().map_err(|_| "simulation state poisoned")?;
+    if let Some(err) = st.trigger_fault_if_configured(&["fs.write", "fs"]) {
+        return Err(err);
+    }
+    st.vfs_dirty.insert(norm.clone(), Some(data.to_string()));
+    st.push_event(
+        "fs_write",
+        vec![
+            (Val::Str("path".into()), Val::Str(norm)),
+            (Val::Str("bytes".into()), Val::Num(data.len() as f64)),
+        ],
+    );
+    Ok(Val::Num(data.len() as f64))
+}
+
+pub(crate) fn sim_fs_read(path: &str) -> Result<Val, String> {
+    let norm = vfs_norm_path(path)?;
+    let arc = require_sim()?;
+    let mut st = arc.lock().map_err(|_| "simulation state poisoned")?;
+    if let Some(err) = st.trigger_fault_if_configured(&["fs.read", "fs"]) {
+        return Err(err);
+    }
+    match st.vfs_effective(&norm) {
+        Some(content) => {
+            let out = content.clone();
+            st.push_event("fs_read", vec![(Val::Str("path".into()), Val::Str(norm))]);
+            Ok(Val::Str(out))
+        }
+        None => Err(format!("sim_fs_read: file '{norm}' not found")),
+    }
+}
+
+pub(crate) fn sim_fs_delete(path: &str) -> Result<Val, String> {
+    let norm = vfs_norm_path(path)?;
+    let arc = require_sim()?;
+    let mut st = arc.lock().map_err(|_| "simulation state poisoned")?;
+    if let Some(err) = st.trigger_fault_if_configured(&["fs.delete", "fs"]) {
+        return Err(err);
+    }
+    let existed = st.vfs_effective(&norm).is_some();
+    if existed {
+        if st.vfs_synced.contains_key(&norm) {
+            st.vfs_dirty.insert(norm.clone(), None);
+        } else {
+            st.vfs_dirty.remove(&norm);
+        }
+    }
+    st.push_event(
+        "fs_delete",
+        vec![
+            (Val::Str("path".into()), Val::Str(norm)),
+            (Val::Str("existed".into()), Val::Bool(existed)),
+        ],
+    );
+    Ok(Val::Bool(existed))
+}
+
+pub(crate) fn sim_fs_list(prefix: Option<&str>) -> Result<Val, String> {
+    let norm_prefix = match prefix {
+        Some(p) if !p.trim().is_empty() && p.trim() != "/" => Some(vfs_norm_path(p)?),
+        _ => None,
+    };
+    let arc = require_sim()?;
+    let st = arc.lock().map_err(|_| "simulation state poisoned")?;
+    let mut keys: Vec<String> = st
+        .vfs_synced
+        .keys()
+        .chain(st.vfs_dirty.keys())
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let out = keys
+        .into_iter()
+        .filter(|k| st.vfs_effective(k).is_some())
+        .filter(|k| {
+            norm_prefix
+                .as_ref()
+                .is_none_or(|p| k == p || k.starts_with(&format!("{p}/")))
+        })
+        .map(Val::Str)
+        .collect();
+    Ok(Val::List(out))
+}
+
+pub(crate) fn sim_fs_sync() -> Result<Val, String> {
+    let arc = require_sim()?;
+    let mut st = arc.lock().map_err(|_| "simulation state poisoned")?;
+    if let Some(err) = st.trigger_fault_if_configured(&["fs.sync", "fs"]) {
+        return Err(err);
+    }
+    let dirty = std::mem::take(&mut st.vfs_dirty);
+    let count = dirty.len();
+    for (k, opt) in dirty {
+        match opt {
+            Some(content) => {
+                st.vfs_synced.insert(k, content);
+            }
+            None => {
+                st.vfs_synced.remove(&k);
+            }
+        }
+    }
+    st.push_event(
+        "fs_sync",
+        vec![(Val::Str("flushed".into()), Val::Num(count as f64))],
+    );
+    Ok(Val::Num(count as f64))
+}
+
+pub(crate) fn sim_fs_crash() -> Result<Val, String> {
+    let arc = require_sim()?;
+    let mut st = arc.lock().map_err(|_| "simulation state poisoned")?;
+    let lost = st.vfs_dirty.len();
+    st.vfs_dirty.clear();
+    st.push_event(
+        "fs_crash",
+        vec![(Val::Str("lost_dirty".into()), Val::Num(lost as f64))],
+    );
+    Ok(Val::Map(vec![
+        (Val::Str("lost_dirty".into()), Val::Num(lost as f64)),
+        (
+            Val::Str("synced_files".into()),
+            Val::Num(st.vfs_synced.len() as f64),
+        ),
+    ]))
+}
+
+pub(crate) fn sim_fs_snapshot() -> Result<Val, String> {
+    let arc = require_sim()?;
+    let st = arc.lock().map_err(|_| "simulation state poisoned")?;
+    let synced = vfs_map_to_val(st.vfs_synced.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let dirty = Val::Map(
+        st.vfs_dirty
+            .iter()
+            .map(|(k, opt)| {
+                let val = match opt {
+                    Some(s) => Val::Str(s.clone()),
+                    None => Val::Null,
+                };
+                (Val::Str(k.clone()), val)
+            })
+            .collect(),
+    );
+    let mut eff_keys: Vec<String> = st
+        .vfs_synced
+        .keys()
+        .chain(st.vfs_dirty.keys())
+        .cloned()
+        .collect();
+    eff_keys.sort();
+    eff_keys.dedup();
+    let effective = vfs_map_to_val(
+        eff_keys
+            .into_iter()
+            .filter_map(|k| st.vfs_effective(&k).map(|v| (k, v.clone()))),
+    );
+    Ok(Val::Map(vec![
+        (Val::Str("synced".into()), synced),
+        (Val::Str("dirty".into()), dirty),
+        (Val::Str("effective".into()), effective),
+        (Val::Str("tick".into()), Val::Num(st.tick as f64)),
+    ]))
+}
+
+// =========================================================================
+// Location-Transparent Distributed TCP Actor Nodes
+// =========================================================================
+
+struct ActorNodeHandle {
+    addr: String,
+    running: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+static NODE_IDS: AtomicU64 = AtomicU64::new(1);
+static ACTOR_NODES: OnceLock<Mutex<HashMap<u64, ActorNodeHandle>>> = OnceLock::new();
+
+fn actor_nodes() -> &'static Mutex<HashMap<u64, ActorNodeHandle>> {
+    ACTOR_NODES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn write_json_line(stream: &mut TcpStream, body: &JsonValue) -> Result<(), String> {
+    let mut line = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())
+}
+
+fn handle_actor_node_conn(mut stream: TcpStream, actor_id: u64) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+    let reader_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(reader_stream);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) | Err(_) => return,
+        Ok(_) => {}
+    }
+    let resp = match serde_json::from_str::<JsonValue>(line.trim()) {
+        Ok(req) => {
+            let op = req.get("op").and_then(JsonValue::as_str).unwrap_or("ask");
+            let timeout = req
+                .get("timeout_ms")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(10_000);
+            let payload = req.get("payload").map(json_to_val).unwrap_or(Val::Null);
+            let res = match op {
+                "send" => actor_send(actor_id, payload),
+                "ask" => actor_ask(actor_id, payload, timeout),
+                other => Err(format!("unknown remote actor op '{other}'")),
+            };
+            match res {
+                Ok(v) => serde_json::json!({ "ok": val_to_json(&v) }),
+                Err(e) => serde_json::json!({ "err": e }),
+            }
+        }
+        Err(e) => serde_json::json!({ "err": format!("invalid actor RPC JSON: {e}") }),
+    };
+    let _ = write_json_line(&mut stream, &resp);
+}
+
+pub(crate) fn actor_node_listen(actor_id: u64, bind: Option<&Val>) -> Result<Val, String> {
+    let _ = actor_entry(actor_id)?;
+    let bind_addr = match bind {
+        None | Some(Val::Null) => "127.0.0.1:0".to_string(),
+        Some(Val::Num(port)) if port.is_finite() && *port >= 0.0 && *port <= 65535.0 => {
+            format!("127.0.0.1:{}", *port as u16)
+        }
+        Some(Val::Str(s)) if !s.trim().is_empty() => s.trim().to_string(),
+        Some(_) => {
+            return Err(
+                "actor_node_listen second argument must be port Number or bind String".into(),
+            );
+        }
+    };
+    let listener = TcpListener::bind(&bind_addr)
+        .map_err(|e| format!("actor_node_listen failed to bind '{bind_addr}': {e}"))?;
+    let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("actor_node_listen set_nonblocking failed: {e}"))?;
+    let addr_str = local_addr.to_string();
+    let port = local_addr.port();
+    let node_id = NODE_IDS.fetch_add(1, Ordering::SeqCst);
+    let running = Arc::new(AtomicBool::new(true));
+    let running_thr = running.clone();
+    let join = thread::spawn(move || {
+        while running_thr.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    thread::spawn(move || handle_actor_node_conn(stream, actor_id));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let mut map = actor_nodes()
+        .lock()
+        .map_err(|_| "actor node registry poisoned")?;
+    map.insert(
+        node_id,
+        ActorNodeHandle {
+            addr: addr_str.clone(),
+            running,
+            join: Some(join),
+        },
+    );
+    Ok(Val::Map(vec![
+        (Val::Str("node_id".into()), Val::Num(node_id as f64)),
+        (Val::Str("actor_id".into()), Val::Num(actor_id as f64)),
+        (Val::Str("addr".into()), Val::Str(addr_str)),
+        (Val::Str("port".into()), Val::Num(port as f64)),
+    ]))
+}
+
+pub(crate) fn actor_node_stop(target: &Val) -> Result<Val, String> {
+    let node_id = match target {
+        Val::Num(n) if n.is_finite() && *n >= 0.0 => *n as u64,
+        Val::Map(pairs) => match map_lookup(pairs, &Val::Str("node_id".into())) {
+            Some(Val::Num(n)) if n.is_finite() && *n >= 0.0 => *n as u64,
+            _ => return Err("actor_node_stop map missing numeric node_id".into()),
+        },
+        _ => return Err("actor_node_stop expects node_id Number or node Map".into()),
+    };
+    let handle = {
+        let mut map = actor_nodes()
+            .lock()
+            .map_err(|_| "actor node registry poisoned")?;
+        map.remove(&node_id)
+            .ok_or_else(|| format!("unknown actor node id {node_id}"))?
+    };
+    handle.running.store(false, Ordering::SeqCst);
+    let _ = &handle.addr;
+    if let Some(j) = handle.join {
+        let _ = j.join();
+    }
+    Ok(Val::Bool(true))
+}
+
+enum RemoteTarget {
+    LocalActor(u64),
+    TcpAddr(String),
+}
+
+fn resolve_remote_target(target: &Val) -> Result<RemoteTarget, String> {
+    match target {
+        Val::Num(n) if n.is_finite() && *n >= 0.0 => Ok(RemoteTarget::LocalActor(*n as u64)),
+        Val::Str(s) => {
+            if let Some(rest) = s.strip_prefix("local:") {
+                let id = rest
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid local actor ref '{s}'"))?;
+                Ok(RemoteTarget::LocalActor(id))
+            } else {
+                Ok(RemoteTarget::TcpAddr(s.trim().to_string()))
+            }
+        }
+        Val::Map(pairs) => {
+            if let Some(Val::Str(addr)) = map_lookup(pairs, &Val::Str("addr".into())) {
+                Ok(RemoteTarget::TcpAddr(addr.clone()))
+            } else if let Some(Val::Num(id)) = map_lookup(pairs, &Val::Str("actor_id".into()))
+                && id.is_finite()
+                && *id >= 0.0
+            {
+                Ok(RemoteTarget::LocalActor(*id as u64))
+            } else {
+                Err("remote actor Map must contain 'addr' or 'actor_id'".into())
+            }
+        }
+        _ => Err("remote actor target must be actor_id, 'host:port' String, or node Map".into()),
+    }
+}
+
+fn actor_remote_rpc(addr: &str, op: &str, payload: &Val, timeout_ms: u64) -> Result<Val, String> {
+    crate::runtime::require_cap("net")?;
+    if sim_should_fault("net") || sim_should_fault(&format!("actor.remote.{op}")) {
+        return Err(format!("SimulatedFault: actor.remote.{op}"));
+    }
+    let sock_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("failed to resolve actor addr '{addr}': {e}"))?
+        .next()
+        .ok_or_else(|| format!("no socket address resolved for '{addr}'"))?;
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    let mut stream = TcpStream::connect_timeout(&sock_addr, timeout)
+        .map_err(|e| format!("remote actor connect '{addr}' failed: {e}"))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let req = serde_json::json!({
+        "op": op,
+        "payload": val_to_json(payload),
+        "timeout_ms": timeout_ms,
+    });
+    write_json_line(&mut stream, &req)?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("remote actor response read '{addr}' failed: {e}"))?;
+    let parsed: JsonValue = serde_json::from_str(line.trim())
+        .map_err(|e| format!("invalid remote actor response from '{addr}': {e}"))?;
+    if let Some(err) = parsed.get("err").and_then(JsonValue::as_str) {
+        return Err(err.to_string());
+    }
+    Ok(parsed.get("ok").map(json_to_val).unwrap_or(Val::Null))
+}
+
+pub(crate) fn actor_remote_send(target: &Val, payload: Val) -> Result<Val, String> {
+    match resolve_remote_target(target)? {
+        RemoteTarget::LocalActor(id) => actor_send(id, payload),
+        RemoteTarget::TcpAddr(addr) => actor_remote_rpc(&addr, "send", &payload, 5_000),
+    }
+}
+
+pub(crate) fn actor_remote_ask(target: &Val, payload: Val, timeout_ms: u64) -> Result<Val, String> {
+    match resolve_remote_target(target)? {
+        RemoteTarget::LocalActor(id) => actor_ask(id, payload, timeout_ms),
+        RemoteTarget::TcpAddr(addr) => actor_remote_rpc(&addr, "ask", &payload, timeout_ms),
+    }
 }
