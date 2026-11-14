@@ -1,57 +1,129 @@
-# Veyra 12.0 Sovereign
+# Veyra 12.0 "Sovereign"
 
-Veyra is a native-first general-purpose language and application platform with its own Rust lexer, parser, semantic checker, bytecode compiler, VM, multi-arch native JIT, universal GPU compute, native AOT compiler, federated package ecosystem, and developer tooling.
+> **Python ergonomics. Single-binary Rust runtime (`8.8 MB`). Static `@verify` proofs, GPU FlashAttention/tiled GEMM (`SPIR-V` + `HLSL`), crash-safe deterministic actors, and zero-toolchain native/Wasm AOT — with zero Python dependency.**
 
-## Sovereign highlights
+[![Release Binaries](https://img.shields.io/badge/release-v12.0.0--sovereign-0ea5e9)](https://github.com/RenegadeImmortal-777/Veyra/releases/tag/v12.0.0-sovereign)
+[![Tests](https://img.shields.io/badge/cargo%20test-130%2F130%20pass-10b981)](STATUS.md)
+[![Packages](https://img.shields.io/badge/packages-74%2F74%20verified-10b981)](docs/PACKAGES.md)
+[![Gates](https://img.shields.io/badge/release%20gates-8%2F8%20pass-10b981)](STATUS.md)
 
-- full Python-parity OOP: C3 MRO multiple inheritance, `super()`, descriptors (`@property`), metaclasses, stacked decorators, closures, escaping function objects, and arbitrary-precision `BigInt`/`BigDecimal`/`Complex`/`FFT`
-- full structural `match`/`case` pattern matching (literals, sequences with `*rest`, mappings with `**rest`, class patterns with positional/keyword fields, `|`, `as`, `if` guards), generators, comprehensions
-- decorators, `with`/`as`, `try`/`catch`/`finally`
-- async functions, `gather`, tasks, channels, task status and timeout-aware waits
-- module objects via `import_package()`
-- C ABI FFI + pure-Rust C header `struct`/`enum`/`#define` bindgen (`veyra ffi bindgen <header.h> <lib_path>`) + dynamic multi-arg x86_64 C-ABI calls + bounded `mem_*` buffers + in-process CPython C-API + PEP 3118 & strided PyCapsule DLPack (`tensor_to_dlpack` / `py_from_dlpack`) zero-copy tensor interop
-- IR SSA / algebraic / DCE optimizer (`ir_stats`), compile-time escape-analysis `auto_arena`, self-hosted `compiler-vy` arithmetic constant-folding peephole, first-class `requires` / `ensures` contracts, transitive `@pure` / `@effect(...)`, formal `@secret` / `sanitize(...)` taint flow, `@linear` / `linear_consume(...)` ownership across branches/actors/remotes, and relational difference-bound `@verify` proofs with counterexample synthesis
-- standalone WebAssembly/WASI emitter with linear-memory strings & arrays (`veyra wasm`), direct zero-toolchain PE32+/ELF64 emission with strings & arrays (`veyra aot --direct`), and multi-arch x86_64/aarch64 native JIT (dynamic `[..]` lists, `Op::SetIndex`, `log2`/`hypot`/`fmod`/`atan2`)
-- rich `gpu_devices` inspection, shared-memory tiled GEMM, causal online FlashAttention, fused Residual+LayerNorm+activation & fused GEMM pipelines (`SPIR-V` + `HLSL`, `gpu_kernel_inspect`, `gpu_fuse`, `gpu_fused_linear`), `f16`/`bf16` casting, 2-generation nursery/old-gen GC + `arena_scope(fn)`/`auto_arena`, flight-recorder profiler (`profile_start`/`profile_stop`/`profile_report`, `veyra profile`), deterministic crash-safe VFS & virtual-clock actor clusters (`sim_fs_*`, `sim_actor_*`, `sim_partition`, `sim_trace`), OTP supervision trees (`supervisor_spawn`), and location-transparent TCP actor RPC (`actor_node_listen`, `actor_remote_send`, `actor_remote_ask`)
-- capability sandboxing (`veyra run --caps`, `cap_current`, `cap_restrict`, `veyra audit`), reproducible `.vypkg.json` bundles, reversible time-travel DAP with forward/reverse data watchpoints (`stepBack`, `reverseContinue`, `setDataBreakpoints`), and reactive topological DAG notebooks (`veyra notebook`, `/api/notebook/dag`, `/api/notebook/export`)
-- dynamic web applications with request headers and arbitrary response headers
-- parameterized SQLite and ORM/query-building foundations
-- dataframe/statistics/plotting/ETL foundations
-- trainable tensors with reverse-mode autograd
-- differentiable division, negation, power, sigmoid/tanh/exp/log, reshape and transpose
-- row-wise softmax, detach/numel helpers, model serialization and Adam optimization
-- HMAC/PBKDF2 security primitives and package integrity auditing
-- federated/local/offline registry (`VEYRA_REGISTRY_URLS`, `VEYRA_OFFLINE=1`), scoped `@org/pkg` packages, monorepo `"workspaces"`, per-platform `"native"` artifacts, and recursive dependency resolution with cycle protection
-- LSP completion/hover/definition/references/rename/symbols/formatting and DAP debugger
-- VS Code Check/Run/Debug/Test/Profile commands
-- cross-platform CI and tagged release artifact workflow
-- 74 Veyra-native packages (including `vyjit`, `vygpu`, `vyplugin`, `vycache`, `vydiff`, `vytemplate`, `vyargparse`, `vydecimal` `0.2.0`, `vycomplex`, `vyitertools`, `vyfunctools`, `vytyping`, `vygraph`, `vysemver`)
-- Multi-architecture x86_64 + aarch64 native JIT compiler (`jit.rs`, with list indexing/slicing and inter-call compilation) and universal Vulkan SPIR-V + Direct3D 11 (`f64`/`f32`) GPU compute backend (`gpu.rs`)
-- Sovereign HMAC-SHA256 signed registry, `.vypkg` bundles, semver resolution, HTTP registry server (`veyra pkg serve`), and `veyra_plugin_v1` native CDylib extension ABI (`plugin.rs`)
+---
 
-Example:
+## Why Veyra Exists
 
-    let tensor = import_package("vytensor");
-    let autograd = import_package("vyautograd");
-    let optim = import_package("vyoptim");
+Shipping real AI + systems software usually forces teams to glue together **5–7 separate toolchains**: Python for iteration, Rust/C++ for binaries, CUDA/HLSL for GPU compute, TLA+/Dafny/manual tests for invariants, Erlang/FoundationDB-style harnesses for fault injection, and another toolchain for WebAssembly.
 
-    let w = tensor.create([[0]], true);
-    let x = tensor.create([[1],[2],[3],[4]], false);
-    let y = tensor.create([[2],[4],[6],[8]], false);
+**Veyra collapses those boundaries into one self-hosted native language platform:**
+- Write clean, high-level syntax (full OOP with C3 MRO/`@property`/metaclasses, `match`/`case`, async/await, tensors).
+- Prove contracts, taint sanitization, linear resource moves, and loop invariants statically (`veyra verify`).
+- Simulate hard power crashes & partitions deterministically (`sim_fs_crash`, `sim_partition`, `actor_node_listen`).
+- Execute on bytecode VM + superinstructions, in-memory `x86_64`/`aarch64` JIT, portable `SPIR-V`/`HLSL` GPU shaders, standalone `.wasm`, or direct zero-linker PE32+/ELF64 binaries (`veyra aot --direct`).
 
-    let epoch = 0;
-    while epoch < 40 {
-        let pred = tensor.matmul(x, w);
-        let diff = tensor.sub(pred, y);
-        let loss = tensor.mean(tensor.mul(diff, diff));
-        autograd.backward(loss);
-        optim.step(w, 0.05);
-        optim.zero_grad(w);
-        epoch = epoch + 1;
-    }
+---
 
-The default execution path does not require Python.
+## 15-Second Tour (`@verify` + Crash Simulation + TCP Actors)
 
-See [STATUS.md](STATUS.md) for the current release state and known gaps,
-[CHANGELOG.md](CHANGELOG.md) for release history, and docs/REMOTE-REGISTRY.md and
-docs/PACKAGES.md for package details.
+Save as `tour.vy` and run with `veyra verify tour.vy` and `veyra run tour.vy`:
+
+```veyra
+@secret
+fn load_token() -> String { return "sk-live-secret"; }
+
+@verify
+fn safe_budget(limit: Int) -> Int {
+    requires(limit >= 1, "limit >= 1");
+    let step = 0;
+    while step < limit { step += 1; }
+    ensures(step >= 1, "step >= 1");
+    return 1000 / step; // proven non-zero at compile time
+}
+
+// Deterministic fault-injectable crash simulation: keep fsync'd WAL, lose dirty writes
+sim_start(42);
+sim_fs_write("/wal/ckpt.json", "{\"epoch\":1}");
+sim_fs_sync();
+sim_fs_write("/wal/dirty.tmp", "uncommitted");
+let crash = sim_fs_crash();
+print("Clean tok:", sanitize(load_token()), "| Ratio:", safe_budget(10));
+print("Recovered WAL:", sim_fs_read("/wal/ckpt.json"), "| Lost dirty:", crash["lost_dirty"]);
+sim_stop();
+```
+
+---
+
+## Quick Start
+
+### Option A: Prebuilt Native Binary (Recommended)
+1. Download the `v12.0.0-sovereign` binary for Windows/Linux/macOS from [GitHub Releases](https://github.com/RenegadeImmortal-777/Veyra/releases/tag/v12.0.0-sovereign) (or run `.\INSTALL.bat` on Windows from a clone).
+2. Try the built-in demos right away:
+
+```powershell
+# Static formal verifier + taint + linear ownership + auto_arena
+.\bin\veyra-native.exe verify examples\sovereign\01_verify_safety.vy
+.\bin\veyra-native.exe run examples\sovereign\01_verify_safety.vy
+
+# Deterministic crash-safe VFS + location-transparent TCP actors
+.\bin\veyra-native.exe run examples\sovereign\02_crash_sim_actors.vy
+
+# GPU tiled GEMM / causal FlashAttention / bf16 / Autograd + profiler
+.\bin\veyra-native.exe profile examples\sovereign\03_gpu_flash_autograd.vy
+
+# Direct native binary or standalone Wasm emission (zero C toolchain required)
+.\bin\veyra-native.exe aot --direct examples\hello.vy hello.exe
+.\bin\veyra-native.exe wasm examples\hello.vy -o hello.wasm
+```
+
+### Option B: Build from Source (`cargo`)
+```bash
+git clone https://github.com/RenegadeImmortal-777/Veyra.git
+cd Veyra
+cargo build --manifest-path engine-rs/Cargo.toml --release
+cargo test --manifest-path engine-rs/Cargo.toml
+```
+
+---
+
+## Verified Showcase Examples
+
+Every file in [examples/sovereign/](examples/sovereign) is verified directly against [bin/veyra-native.exe](bin/veyra-native.exe):
+
+| Demo | Features Exercised | Command |
+|---|---|---|
+| [01_verify_safety.vy](examples/sovereign/01_verify_safety.vy) | `@verify` loop invariants (`3` proven contracts), `@secret`/`sanitize(...)`, `@linear` resource consume, `auto_arena` escape reclamation | `veyra verify` / `veyra run` |
+| [02_crash_sim_actors.vy](examples/sovereign/02_crash_sim_actors.vy) | Fault-injectable VFS (`sim_fs_sync`/`sim_fs_crash`), supervised OTP actors + TCP RPC (`actor_node_listen`/`actor_remote_ask`) | `veyra run` |
+| [03_gpu_flash_autograd.vy](examples/sovereign/03_gpu_flash_autograd.vy) | `gpu_kernel_inspect` (`tiled_matmul` + `attention_causal` SPIR-V/HLSL), `gpu_fused_layernorm`, `bf16` cast, reverse-mode autograd + Adam, `profile_start`/`profile_stop` | `veyra run` / `veyra profile` |
+
+---
+
+## Platform Capabilities at a Glance
+
+| Pillar | Capabilities Implemented & Tested |
+|---|---|
+| **Language & Parity** | C3 MRO multiple inheritance, `super()`, `@property`, metaclasses, stacked decorators, closures/upvalues, generators, comprehensions, full structural `match`/`case`, async/await + `gather` + channels, `BigInt`/`BigDecimal`/`Complex`/`FFT` |
+| **Formal Safety & Memory** | `@verify` relational difference-bound solver (joins, loop invariants, callee `ensures`, counterexamples), `@secret`/`sanitize(...)` taint flow, `@linear` ownership across branches/actors/remotes, transitive `@pure`/`@effect(...)`, capability sandbox (`--caps`), 2-gen nursery/old-gen GC + write barriers + LIFO `arena_scope(fn)` + compile-time `auto_arena` |
+| **Compilation Targets** | 3-stage self-hosted `.vybc` compiler (`compiler-vy/src/main.vy`), SSA/algebraic/DCE optimizer (`ir.rs`), in-memory `x86_64` & `aarch64` JIT (`jit.rs`), standalone `.wasm`/WASI emitter (`veyra wasm`), direct zero-toolchain PE32+/ELF64 writer (`veyra aot --direct`), full `rustc` native AOT |
+| **GPU, AI & Python Interop** | Vulkan SPIR-V + Direct3D 11 (`cs_5_0` HLSL) compute + multi-threaded CPU fallback, single-pass `gpu_fuse` & `gpu_fused_linear`, workgroup `groupshared` tiled GEMM, causal online FlashAttention, fused Residual+LayerNorm+activation, `f16`/`bf16` casting, N-D autograd tensors + Adam, in-process CPython C-API + PEP 3118 + strided PyCapsule DLPack (`tensor_to_dlpack`/`py_from_dlpack`) |
+| **Fault Simulation & Tooling** | OTP supervision trees (`one_for_one`/`one_for_all`/`rest_for_one`), TCP actor RPC, deterministic SplitMix64 cluster & crash-safe VFS simulation, LSP + time-travel reversible DAP (`stepBack`, forward/reverse data watchpoints), reactive topological DAG notebooks (`veyra notebook`), flight-recorder profiler (`profile_start`/`profile_stop`/`veyra profile`), VS Code extension |
+| **Ecosystem & FFI** | 74 verified packages (`package-matrix.ps1`), HMAC-SHA256 signed bundles (`.vypkg`), semver + workspaces, HTTP registry (`veyra pkg serve`), `veyra_plugin_v1` native `cdylib` ABI, C header struct/enum/`#define` bindgen (`veyra ffi bindgen`), dynamic `x86_64` C-ABI `ffi_call` + bounded `mem_*` buffers |
+
+---
+
+## Verification & Honest Scope
+
+All numbers below come directly from [STATUS.md](STATUS.md) and [gate-report.txt](gate-report.txt) generated on this repo:
+- **`cargo test`:** `130 passed; 0 failed` (VM, JIT, GPU, Formal Safety, Self-Hosted 3-stage fixpoint, Actors, Sim VFS, DLPack, CPython, AOT, Wasm)
+- **Package Matrix:** `74/74` packages checked and executed cleanly
+- **Release Gates:** `8/8` (`cargo fmt --check`, `cargo test`, `--no-default-features`, `clippy -D warnings`, `release` build, `package-matrix`, `ecosystem-gate`, `release-check`)
+
+**Where mature ecosystems still lead:** Python (PyPI), Rust (`crates.io`), and TypeScript (`npm`) carry orders-of-magnitude larger third-party library ecosystems, decades of LLVM micro-architectural tuning, and vendor-tuned cuBLAS/Triton kernels. Veyra is designed to eliminate multi-language glue friction while staying C-ABI and DLPack interoperable when you want external libraries.
+
+---
+
+## Documentation & Contributing
+
+- [STATUS.md](STATUS.md) — Authoritative test/gate report and architecture map
+- [docs/LANGUAGE.md](docs/LANGUAGE.md) — Language syntax, contracts, actors, simulation & profiling guide
+- [docs/index.html](docs/index.html) — Interactive web showcase ([examples/sovereign/](examples/sovereign) snippets)
+- [docs/PACKAGES.md](docs/PACKAGES.md) & [docs/REMOTE-REGISTRY.md](docs/REMOTE-REGISTRY.md) — Package ecosystem & registry protocol
+- [CHANGELOG.md](CHANGELOG.md) — Complete release history (`4.0` -> `12.0 Sovereign`)
+- [CONTRIBUTING.md](CONTRIBUTING.md) — How to test, build, and contribute

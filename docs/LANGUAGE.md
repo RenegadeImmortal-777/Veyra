@@ -58,11 +58,14 @@ Built-in types include Int, Float, Number, String, Bool, List, Map, Function, Nu
 
 ## Distributed Actors, Crash-Safe Simulation & Profiling
 
-    let listener = actor_node_listen("127.0.0.1:0", fn(msg, state) {
-        return {"state": state + 1, "reply": msg};
-    }, 0);
-    let reply = actor_remote_ask(listener.addr, "ping", 2000);
-    actor_node_stop(listener.id);
+    fn counter_svc(state: Int, msg: Int) -> Map {
+        return {"state": state + msg, "reply": state + msg};
+    }
+    let aid = actor_spawn(counter_svc, {"init": 100});
+    let node = actor_node_listen(aid, 0);
+    let reply = actor_remote_ask(node["addr"], 23, 2000);
+    actor_node_stop(node);
+    actor_stop(aid);
 
     sim_start(42);
     sim_fs_write("/wal/entry", "committed");
