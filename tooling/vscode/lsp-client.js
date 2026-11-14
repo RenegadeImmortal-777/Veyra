@@ -39,24 +39,24 @@ function createRpcParser(onMessage) {
 
 function resolveExecutable(configuredPath, workspaceFolders) {
   if (configuredPath && configuredPath.trim()) return configuredPath.trim();
-  if (process.env.VEYRA_EXECUTABLE) return process.env.VEYRA_EXECUTABLE;
+  if (process.env.KOVREK_EXECUTABLE) return process.env.KOVREK_EXECUTABLE;
   const fs = require('fs');
   if (Array.isArray(workspaceFolders)) {
     for (const folder of workspaceFolders) {
       const root = typeof folder === 'string' ? folder : folder && folder.uri && folder.uri.fsPath;
       if (!root) continue;
-      const candidate = path.join(root, 'bin', process.platform === 'win32' ? 'veyra-native.exe' : 'veyra');
+      const candidate = path.join(root, 'bin', process.platform === 'win32' ? 'kovrek-native.exe' : 'kovrek');
       if (fs.existsSync(candidate)) return candidate;
     }
   }
   if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
-    const installed = path.join(process.env.LOCALAPPDATA, 'Veyra', 'veyra.bat');
+    const installed = path.join(process.env.LOCALAPPDATA, 'Kovrek', 'kovrek.bat');
     if (fs.existsSync(installed)) return installed;
   }
-  return 'veyra';
+  return 'kovrek';
 }
 
-class VeyraLspClient {
+class KovrekLspClient {
   constructor(commandResolver, onNotification) {
     this.commandResolver = commandResolver;
     this.onNotification = onNotification;
@@ -82,7 +82,7 @@ class VeyraLspClient {
     proc.on('exit', () => {
       for (const entry of this.pending.values()) {
         clearTimeout(entry.timer);
-        entry.reject(new Error('Veyra LSP process exited'));
+        entry.reject(new Error('Kovrek LSP process exited'));
       }
       this.pending.clear();
       this.proc = null;
@@ -91,7 +91,7 @@ class VeyraLspClient {
     proc.on('error', () => {
       for (const entry of this.pending.values()) {
         clearTimeout(entry.timer);
-        entry.reject(new Error('Failed to start Veyra LSP'));
+        entry.reject(new Error('Failed to start Kovrek LSP'));
       }
       this.pending.clear();
       this.proc = null;
@@ -171,7 +171,7 @@ class VeyraLspClient {
     await this.ensureStarted();
     this.openedUris.set(uri, version);
     this.notify('textDocument/didOpen', {
-      textDocument: { uri, languageId: 'veyra', version, text },
+      textDocument: { uri, languageId: 'kovrek', version, text },
     });
   }
 
@@ -214,5 +214,5 @@ module.exports = {
   encodeRpcMessage,
   createRpcParser,
   resolveExecutable,
-  VeyraLspClient,
+  KovrekLspClient,
 };

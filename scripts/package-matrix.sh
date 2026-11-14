@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
 set -eu
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-if [ -f "$ROOT/engine-rs/target/release/veyra" ]; then
-  EXE="$ROOT/engine-rs/target/release/veyra"
+if [ -f "$ROOT/engine-rs/target/release/kovrek" ]; then
+  EXE="$ROOT/engine-rs/target/release/kovrek"
 else
-  EXE="$ROOT/engine-rs/target/debug/veyra"
+  EXE="$ROOT/engine-rs/target/debug/kovrek"
 fi
-export VEYRA_HOME="$ROOT"
-TMPBASE="${TMPDIR:-/tmp}/veyra-package-matrix"
+export KOVREK_HOME="$ROOT"
+TMPBASE="${TMPDIR:-/tmp}/kovrek-package-matrix"
 rm -rf "$TMPBASE"
 mkdir -p "$TMPBASE"
 if ! command -v jq >/dev/null 2>&1; then
@@ -23,7 +23,7 @@ for name in $(jq -r '.packages | keys[]' "$ROOT/registry/index.json"); do
   (
     cd "$project" &&
     "$EXE" add "$name" >/dev/null &&
-    printf 'use "%s";\nlet pkg = import_package("%s");\nassert(len(keys(pkg)) > 0);\n' "$name" "$name" > src/main.vy &&
+    printf 'use "%s";\nlet pkg = import_package("%s");\nassert(len(keys(pkg)) > 0);\n' "$name" "$name" > src/main.kvr &&
     "$EXE" check >/dev/null &&
     "$EXE" run >/dev/null
   ) || FAILED=$((FAILED+1))

@@ -14,7 +14,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
 use crate::VERSION;
-use crate::project::{copy_dir_all, project_root, veyra_home};
+use crate::project::{copy_dir_all, kovrek_home, project_root};
 use crate::value::{constant_time_strings_equal, hmac_sha256_hex};
 
 fn cache_key(input: &str) -> String {
@@ -25,15 +25,15 @@ fn cache_key(input: &str) -> String {
 }
 
 fn registry_cache_dir() -> PathBuf {
-    veyra_home().join("cache").join("registries")
+    kovrek_home().join("cache").join("registries")
 }
 
 fn artifact_cache_dir() -> PathBuf {
-    veyra_home().join("cache").join("artifacts")
+    kovrek_home().join("cache").join("artifacts")
 }
 
 fn offline_mode() -> bool {
-    env::var("VEYRA_OFFLINE")
+    env::var("KOVREK_OFFLINE")
         .ok()
         .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
         .unwrap_or(false)
@@ -66,10 +66,10 @@ fn http_get_text(url: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|e| format!("invalid UTF-8 from {url}: {e}"))
 }
 
-/// Ordered registry URLs or local paths from `VEYRA_REGISTRY_URLS`,
-/// `VEYRA_REGISTRY_URL`, or the default local `$VEYRA_HOME/registry/index.json`.
+/// Ordered registry URLs or local paths from `KOVREK_REGISTRY_URLS`,
+/// `KOVREK_REGISTRY_URL`, or the default local `$KOVREK_HOME/registry/index.json`.
 pub(crate) fn registry_sources() -> Vec<String> {
-    if let Ok(urls) = env::var("VEYRA_REGISTRY_URLS") {
+    if let Ok(urls) = env::var("KOVREK_REGISTRY_URLS") {
         let list: Vec<String> = urls
             .split([',', ';'])
             .map(str::trim)
@@ -80,14 +80,14 @@ pub(crate) fn registry_sources() -> Vec<String> {
             return list;
         }
     }
-    if let Ok(url) = env::var("VEYRA_REGISTRY_URL") {
+    if let Ok(url) = env::var("KOVREK_REGISTRY_URL") {
         let trimmed = url.trim();
         if !trimmed.is_empty() {
             return vec![trimmed.to_string()];
         }
     }
     vec![
-        veyra_home()
+        kovrek_home()
             .join("registry")
             .join("index.json")
             .to_string_lossy()
@@ -393,7 +393,7 @@ pub(crate) fn semver_matches(version: &str, constraint: &str) -> bool {
     true
 }
 
-/// Validate an unscoped (`foo`) or scoped (`@org/pkg`) Veyra package name.
+/// Validate an unscoped (`foo`) or scoped (`@org/pkg`) Kovrek package name.
 pub(crate) fn validate_package_name(name: &str) -> Result<(), String> {
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.contains('\\') {
@@ -475,7 +475,7 @@ pub(crate) fn current_platform_key() -> String {
     format!("{}-{}", env::consts::OS, env::consts::ARCH)
 }
 
-/// Select a single native plugin descriptor for the current platform from `veyra.json` / index metadata.
+/// Select a single native plugin descriptor for the current platform from `kovrek.json` / index metadata.
 ///
 /// Accepts either legacy flat objects (`{"library": "...", "source": "..."}`)
 /// or per-platform tables (`{"windows-x86_64": {...}, "linux-x86_64": {...}}`).
@@ -502,7 +502,7 @@ pub(crate) fn select_native_spec(native_val: &JsonValue) -> Option<JsonValue> {
         .cloned()
 }
 
-/// Find the nearest ancestor `veyra.json` directory that declares a `"workspaces"` array.
+/// Find the nearest ancestor `kovrek.json` directory that declares a `"workspaces"` array.
 pub(crate) fn workspace_root(start: &Path) -> Option<PathBuf> {
     let mut cur = if start.is_file() {
         start.parent()?.to_path_buf()
@@ -510,7 +510,7 @@ pub(crate) fn workspace_root(start: &Path) -> Option<PathBuf> {
         start.to_path_buf()
     };
     loop {
-        let manifest_path = cur.join("veyra.json");
+        let manifest_path = cur.join("kovrek.json");
         if manifest_path.is_file() {
             if let Ok(txt) = fs::read_to_string(&manifest_path) {
                 if let Ok(json) = serde_json::from_str::<JsonValue>(&txt) {
@@ -534,7 +534,7 @@ pub(crate) fn workspace_root(start: &Path) -> Option<PathBuf> {
 /// Expand workspace globs (`packages/*` or explicit directories) under `root`.
 pub(crate) fn resolve_workspace_members(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(txt) = fs::read_to_string(root.join("veyra.json")) else {
+    let Ok(txt) = fs::read_to_string(root.join("kovrek.json")) else {
         return out;
     };
     let Ok(manifest) = serde_json::from_str::<JsonValue>(&txt) else {
@@ -557,7 +557,7 @@ pub(crate) fn resolve_workspace_members(root: &Path) -> Vec<PathBuf> {
             if let Ok(entries) = fs::read_dir(parent) {
                 for ent in entries.flatten() {
                     let p = ent.path();
-                    if p.is_dir() && p.join("veyra.json").is_file() && seen.insert(p.clone()) {
+                    if p.is_dir() && p.join("kovrek.json").is_file() && seen.insert(p.clone()) {
                         out.push(p);
                     } else if p.is_dir()
                         && p.file_name()
@@ -569,7 +569,7 @@ pub(crate) fn resolve_workspace_members(root: &Path) -> Vec<PathBuf> {
                             for sub in scoped.flatten() {
                                 let sp = sub.path();
                                 if sp.is_dir()
-                                    && sp.join("veyra.json").is_file()
+                                    && sp.join("kovrek.json").is_file()
                                     && seen.insert(sp.clone())
                                 {
                                     out.push(sp);
@@ -581,7 +581,7 @@ pub(crate) fn resolve_workspace_members(root: &Path) -> Vec<PathBuf> {
             }
         } else if let Ok(rel) = safe_package_relative_path(&norm) {
             let dir = root.join(rel);
-            if dir.is_dir() && dir.join("veyra.json").is_file() && seen.insert(dir.clone()) {
+            if dir.is_dir() && dir.join("kovrek.json").is_file() && seen.insert(dir.clone()) {
                 out.push(dir);
             }
         }
@@ -589,7 +589,7 @@ pub(crate) fn resolve_workspace_members(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Locate a workspace member whose `veyra.json` `"name"` matches `name`.
+/// Locate a workspace member whose `kovrek.json` `"name"` matches `name`.
 pub(crate) fn find_workspace_package(
     project_or_file: &Path,
     name: &str,
@@ -603,7 +603,7 @@ pub(crate) fn find_workspace_package(
     }
     for ws in roots {
         for member_dir in resolve_workspace_members(&ws) {
-            if let Ok(txt) = fs::read_to_string(member_dir.join("veyra.json")) {
+            if let Ok(txt) = fs::read_to_string(member_dir.join("kovrek.json")) {
                 if let Ok(m) = serde_json::from_str::<JsonValue>(&txt) {
                     if m.get("name").and_then(JsonValue::as_str) == Some(name) {
                         return Some((member_dir, m));
@@ -623,7 +623,7 @@ fn copy_package_tree(src: &Path, dest: &Path) -> Result<(), String> {
         let name_str = name.to_string_lossy();
         if matches!(
             name_str.as_ref(),
-            "vendor" | "target" | ".git" | "veyra.lock"
+            "vendor" | "target" | ".git" | "kovrek.lock"
         ) {
             continue;
         }
@@ -658,10 +658,10 @@ pub(crate) fn write_package_lock(root: &Path, manifest: &JsonValue) -> Result<()
             };
             let hash = hash_directory(&pkg_dir)?;
             entry["sha256"] = JsonValue::String(hash);
-            if pkg_dir.join("veyra.sig.json").is_file() {
+            if pkg_dir.join("kovrek.sig.json").is_file() {
                 entry["signed"] = JsonValue::Bool(true);
             }
-            if let Ok(m_txt) = fs::read_to_string(pkg_dir.join("veyra.json")) {
+            if let Ok(m_txt) = fs::read_to_string(pkg_dir.join("kovrek.json")) {
                 if let Ok(m_json) = serde_json::from_str::<JsonValue>(&m_txt) {
                     if m_json.get("native").is_some() {
                         entry["native"] = JsonValue::Bool(true);
@@ -680,7 +680,7 @@ pub(crate) fn write_package_lock(root: &Path, manifest: &JsonValue) -> Result<()
         "packages": JsonValue::Object(locked)
     });
     fs::write(
-        root.join("veyra.lock"),
+        root.join("kovrek.lock"),
         serde_json::to_string_pretty(&lock).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
@@ -730,12 +730,12 @@ fn install_platform_native_artifact(
         }
     }
     fs::write(&target, bytes).map_err(|e| e.to_string())?;
-    let pkg_manifest_path = dest.join("veyra.json");
+    let pkg_manifest_path = dest.join("kovrek.json");
     if !pkg_manifest_path.is_file() {
         let synth = serde_json::json!({
             "name": pkg.get("name").and_then(JsonValue::as_str).unwrap_or("native"),
             "version": pkg.get("version").and_then(JsonValue::as_str).unwrap_or("0.1.0"),
-            "entry": pkg.get("entry").and_then(JsonValue::as_str).unwrap_or("main.vy"),
+            "entry": pkg.get("entry").and_then(JsonValue::as_str).unwrap_or("main.kvr"),
             "native": native_val
         });
         fs::write(
@@ -777,7 +777,7 @@ pub(crate) fn pkg_add_inner_at(
         let entry = ws_manifest
             .get("entry")
             .and_then(JsonValue::as_str)
-            .unwrap_or("src/main.vy")
+            .unwrap_or("src/main.kvr")
             .to_string();
         if let Some(deps) = ws_manifest
             .get("dependencies")
@@ -812,7 +812,7 @@ pub(crate) fn pkg_add_inner_at(
         let pkg = index
             .get("packages")
             .and_then(|x| x.get(name))
-            .ok_or(format!("package '{name}' not found in Veyra registry"))?;
+            .ok_or(format!("package '{name}' not found in Kovrek registry"))?;
         let version = pkg
             .get("version")
             .and_then(JsonValue::as_str)
@@ -828,7 +828,7 @@ pub(crate) fn pkg_add_inner_at(
         let entry = pkg
             .get("entry")
             .and_then(JsonValue::as_str)
-            .unwrap_or("main.vy")
+            .unwrap_or("main.kvr")
             .to_string();
         if let Some(dependencies) = pkg.get("dependencies").and_then(JsonValue::as_array) {
             for dependency in dependencies {
@@ -907,13 +907,13 @@ pub(crate) fn pkg_add_inner_at(
             }
         }
         install_platform_native_artifact(pkg, &pkg_base, &dest)?;
-        if dest.join("veyra.sig.json").is_file() {
+        if dest.join("kovrek.sig.json").is_file() {
             let _ = verify_package_dir_sig(&dest)?;
         }
         (version, entry, false)
     };
 
-    let manifest_path = root.join("veyra.json");
+    let manifest_path = root.join("kovrek.json");
     let mut manifest: JsonValue =
         serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -965,7 +965,7 @@ pub(crate) fn pkg_remove(name: &str) -> Result<(), String> {
             }
         }
     }
-    let manifest_path = root.join("veyra.json");
+    let manifest_path = root.join("kovrek.json");
     let mut manifest: JsonValue =
         serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -987,7 +987,7 @@ pub(crate) fn pkg_remove(name: &str) -> Result<(), String> {
 
 pub(crate) fn pkg_list() -> Result<(), String> {
     let (_, index) = pkg_index()?;
-    println!("Veyra Registry");
+    println!("Kovrek Registry");
     if let Some(pkgs) = index.get("packages").and_then(JsonValue::as_object) {
         for (name, meta) in pkgs {
             let version = meta
@@ -1002,7 +1002,7 @@ pub(crate) fn pkg_list() -> Result<(), String> {
 
 fn install_project_packages(project_dir: &Path) -> Result<(), String> {
     let manifest: JsonValue = serde_json::from_str(
-        &fs::read_to_string(project_dir.join("veyra.json")).map_err(|e| e.to_string())?,
+        &fs::read_to_string(project_dir.join("kovrek.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let mut seen = HashSet::new();
@@ -1027,13 +1027,13 @@ pub(crate) fn pkg_install() -> Result<(), String> {
     for member_dir in resolve_workspace_members(&root) {
         install_project_packages(&member_dir)?;
     }
-    println!("Veyra packages restored");
+    println!("Kovrek packages restored");
     Ok(())
 }
 
 pub(crate) fn pkg_search(term: &str) -> Result<(), String> {
     let (_, index) = pkg_index()?;
-    println!("Veyra Registry search: {term}");
+    println!("Kovrek Registry search: {term}");
     if let Some(pkgs) = index.get("packages").and_then(JsonValue::as_object) {
         for (name, meta) in pkgs {
             if name.to_lowercase().contains(&term.to_lowercase()) {
@@ -1050,7 +1050,7 @@ pub(crate) fn pkg_search(term: &str) -> Result<(), String> {
 
 pub(crate) fn pkg_publish() -> Result<(), String> {
     let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
-    let manifest_path = root.join("veyra.json");
+    let manifest_path = root.join("kovrek.json");
     let manifest: JsonValue =
         serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -1065,9 +1065,9 @@ pub(crate) fn pkg_publish() -> Result<(), String> {
     let entry = manifest
         .get("entry")
         .and_then(JsonValue::as_str)
-        .unwrap_or("src/main.vy");
+        .unwrap_or("src/main.kvr");
 
-    let home = veyra_home();
+    let home = kovrek_home();
     let pkg_root = home.join("packages").join(name);
     if pkg_root.exists() {
         fs::remove_dir_all(&pkg_root).map_err(|e| e.to_string())?;
@@ -1076,9 +1076,12 @@ pub(crate) fn pkg_publish() -> Result<(), String> {
     if root.join("src").is_dir() {
         copy_dir_all(&root.join("src"), &pkg_root.join("src"))?;
     }
-    let _ = fs::copy(&manifest_path, pkg_root.join("veyra.json"));
-    if root.join("veyra.sig.json").is_file() {
-        let _ = fs::copy(root.join("veyra.sig.json"), pkg_root.join("veyra.sig.json"));
+    let _ = fs::copy(&manifest_path, pkg_root.join("kovrek.json"));
+    if root.join("kovrek.sig.json").is_file() {
+        let _ = fs::copy(
+            root.join("kovrek.sig.json"),
+            pkg_root.join("kovrek.sig.json"),
+        );
     }
     let root_entry = root.join(entry);
     if root_entry.is_file() && !root_entry.starts_with(root.join("src")) {
@@ -1092,7 +1095,7 @@ pub(crate) fn pkg_publish() -> Result<(), String> {
     }
     let pkg_sha = hash_directory_excluding_sig(&pkg_root)?;
 
-    if let Ok(remote_url) = env::var("VEYRA_REGISTRY_URL") {
+    if let Ok(remote_url) = env::var("KOVREK_REGISTRY_URL") {
         if remote_url.starts_with("http://") || remote_url.starts_with("https://") {
             #[cfg(feature = "native-services")]
             {
@@ -1163,9 +1166,9 @@ pub(crate) fn pkg_publish() -> Result<(), String> {
 
 pub(crate) fn pkg_audit() -> Result<(), String> {
     let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
-    let lock_path = root.join("veyra.lock");
+    let lock_path = root.join("kovrek.lock");
     if !lock_path.exists() {
-        return Err("veyra.lock not found; run veyra install/add first".into());
+        return Err("kovrek.lock not found; run kovrek install/add first".into());
     }
     let lock: JsonValue =
         serde_json::from_str(&fs::read_to_string(&lock_path).map_err(|e| e.to_string())?)
@@ -1177,7 +1180,7 @@ pub(crate) fn pkg_audit() -> Result<(), String> {
     let mut checked = 0usize;
     let mut signed = 0usize;
     let mut caps_summary = Vec::new();
-    if let Ok(manifest_txt) = fs::read_to_string(root.join("veyra.json"))
+    if let Ok(manifest_txt) = fs::read_to_string(root.join("kovrek.json"))
         && let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_txt)
         && let Some(caps) = manifest_json
             .get("capabilities")
@@ -1202,7 +1205,7 @@ pub(crate) fn pkg_audit() -> Result<(), String> {
         if actual != expected {
             return Err(format!("package integrity mismatch: {name}"));
         }
-        if let Ok(pkg_txt) = fs::read_to_string(pkg_dir.join("veyra.json"))
+        if let Ok(pkg_txt) = fs::read_to_string(pkg_dir.join("kovrek.json"))
             && let Ok(pkg_json) = serde_json::from_str::<JsonValue>(&pkg_txt)
             && let Some(caps) = pkg_json.get("capabilities").and_then(JsonValue::as_array)
         {
@@ -1215,7 +1218,7 @@ pub(crate) fn pkg_audit() -> Result<(), String> {
                 caps_summary.push(format!("{name}=[{}]", names.join(",")));
             }
         }
-        if pkg_dir.join("veyra.sig.json").is_file() {
+        if pkg_dir.join("kovrek.sig.json").is_file() {
             if verify_package_dir_sig(&pkg_dir)? {
                 signed += 1;
             }
@@ -1238,11 +1241,11 @@ pub(crate) fn pkg_audit() -> Result<(), String> {
 }
 
 fn keys_dir() -> PathBuf {
-    veyra_home().join("keys")
+    kovrek_home().join("keys")
 }
 
 fn find_signing_key(key_name: Option<&str>) -> Result<(String, String), String> {
-    if let Ok(secret) = env::var("VEYRA_SIGNING_KEY") {
+    if let Ok(secret) = env::var("KOVREK_SIGNING_KEY") {
         let mut h = Sha256::new();
         h.update(secret.as_bytes());
         let fp = format!("{:x}", h.finalize());
@@ -1280,11 +1283,11 @@ fn find_signing_key(key_name: Option<&str>) -> Result<(String, String), String> 
             }
         }
     }
-    Err("no Veyra signing key found; run 'veyra pkg keygen [name]' first".into())
+    Err("no Kovrek signing key found; run 'kovrek pkg keygen [name]' first".into())
 }
 
 fn find_trusted_secret_by_id(key_id: &str) -> Option<String> {
-    if let Ok(secret) = env::var("VEYRA_SIGNING_KEY") {
+    if let Ok(secret) = env::var("KOVREK_SIGNING_KEY") {
         let mut h = Sha256::new();
         h.update(secret.as_bytes());
         let fp = format!("{:x}", h.finalize());
@@ -1338,7 +1341,7 @@ fn hash_directory_excluding_sig(dir: &Path) -> Result<String, String> {
 fn collect_files_excluding(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     for ent in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let p = ent.map_err(|e| e.to_string())?.path();
-        if p.file_name().and_then(|s| s.to_str()) == Some("veyra.sig.json") {
+        if p.file_name().and_then(|s| s.to_str()) == Some("kovrek.sig.json") {
             continue;
         }
         if p.is_dir() {
@@ -1351,7 +1354,7 @@ fn collect_files_excluding(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Str
 }
 
 fn verify_package_dir_sig(dir: &Path) -> Result<bool, String> {
-    let sig_path = dir.join("veyra.sig.json");
+    let sig_path = dir.join("kovrek.sig.json");
     if !sig_path.is_file() {
         return Ok(false);
     }
@@ -1361,7 +1364,7 @@ fn verify_package_dir_sig(dir: &Path) -> Result<bool, String> {
     let expected_sha = sig
         .get("sha256")
         .and_then(JsonValue::as_str)
-        .ok_or("veyra.sig.json missing sha256")?;
+        .ok_or("kovrek.sig.json missing sha256")?;
     let actual_sha = hash_directory_excluding_sig(dir)?;
     if actual_sha != expected_sha {
         return Err(format!(
@@ -1372,13 +1375,13 @@ fn verify_package_dir_sig(dir: &Path) -> Result<bool, String> {
     let key_id = sig
         .get("key_id")
         .and_then(JsonValue::as_str)
-        .ok_or("veyra.sig.json missing key_id")?;
+        .ok_or("kovrek.sig.json missing key_id")?;
     let signature = sig
         .get("signature")
         .and_then(JsonValue::as_str)
-        .ok_or("veyra.sig.json missing signature")?;
+        .ok_or("kovrek.sig.json missing signature")?;
     if let Some(secret) = find_trusted_secret_by_id(key_id) {
-        let expected_sig = hmac_sha256_hex(&secret, &format!("veyra-pkg-v1:{expected_sha}"));
+        let expected_sig = hmac_sha256_hex(&secret, &format!("kovrek-pkg-v1:{expected_sha}"));
         if !constant_time_strings_equal(&expected_sig, signature) {
             return Err(format!(
                 "invalid HMAC signature in {} (key_id={key_id})",
@@ -1415,7 +1418,7 @@ pub(crate) fn pkg_keygen(name: Option<&str>) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     println!(
-        "Generated Veyra signing key '{key_name}' (key_id={key_id}) -> {}",
+        "Generated Kovrek signing key '{key_name}' (key_id={key_id}) -> {}",
         path.display()
     );
     Ok(())
@@ -1428,8 +1431,8 @@ pub(crate) fn pkg_sign(dir: Option<&Path>, key_name: Option<&str>) -> Result<(),
     };
     let (key_id, secret) = find_signing_key(key_name)?;
     let sha = hash_directory_excluding_sig(&target)?;
-    let signature = hmac_sha256_hex(&secret, &format!("veyra-pkg-v1:{sha}"));
-    let (pkg_name, version) = fs::read_to_string(target.join("veyra.json"))
+    let signature = hmac_sha256_hex(&secret, &format!("kovrek-pkg-v1:{sha}"));
+    let (pkg_name, version) = fs::read_to_string(target.join("kovrek.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
         .map(|m| {
@@ -1455,7 +1458,7 @@ pub(crate) fn pkg_sign(dir: Option<&Path>, key_name: Option<&str>) -> Result<(),
         "signature": signature,
         "signed_at": chrono::Utc::now().to_rfc3339()
     });
-    let sig_path = target.join("veyra.sig.json");
+    let sig_path = target.join("kovrek.sig.json");
     fs::write(
         &sig_path,
         serde_json::to_string_pretty(&sig_obj).map_err(|e| e.to_string())?,
@@ -1506,7 +1509,7 @@ pub(crate) fn pkg_info(name: &str) -> Result<(), String> {
     let meta = index
         .get("packages")
         .and_then(|x| x.get(name))
-        .ok_or_else(|| format!("package '{name}' not found in Veyra registry"))?;
+        .ok_or_else(|| format!("package '{name}' not found in Kovrek registry"))?;
     let version = meta
         .get("version")
         .and_then(JsonValue::as_str)
@@ -1540,9 +1543,9 @@ pub(crate) fn pkg_info(name: &str) -> Result<(), String> {
     println!(
         "Native  : {}",
         if meta.get("native").is_some() {
-            "yes (veyra_plugin_v1)"
+            "yes (kovrek_plugin_v1)"
         } else {
-            "no (pure Veyra / VM)"
+            "no (pure Kovrek / VM)"
         }
     );
     Ok(())
@@ -1551,13 +1554,13 @@ pub(crate) fn pkg_info(name: &str) -> Result<(), String> {
 pub(crate) fn pkg_tree() -> Result<(), String> {
     let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
     let manifest: JsonValue = serde_json::from_str(
-        &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
+        &fs::read_to_string(root.join("kovrek.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let proj_name = manifest
         .get("name")
         .and_then(JsonValue::as_str)
-        .unwrap_or("veyra-app");
+        .unwrap_or("kovrek-app");
     let proj_ver = manifest
         .get("version")
         .and_then(JsonValue::as_str)
@@ -1586,10 +1589,10 @@ pub(crate) fn pkg_tree() -> Result<(), String> {
             .and_then(JsonValue::as_str)
             .unwrap_or("?");
         let mut tags = Vec::new();
-        if pkg_dir.join("veyra.sig.json").is_file() {
+        if pkg_dir.join("kovrek.sig.json").is_file() {
             tags.push("signed");
         }
-        if let Ok(t) = fs::read_to_string(pkg_dir.join("veyra.json")) {
+        if let Ok(t) = fs::read_to_string(pkg_dir.join("kovrek.json")) {
             if serde_json::from_str::<JsonValue>(&t)
                 .ok()
                 .and_then(|j| j.get("native").cloned())
@@ -1641,7 +1644,7 @@ pub(crate) fn pkg_tree() -> Result<(), String> {
 pub(crate) fn pkg_update(target: Option<&str>) -> Result<(), String> {
     let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
     let manifest: JsonValue = serde_json::from_str(
-        &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
+        &fs::read_to_string(root.join("kovrek.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let names: Vec<String> = if let Some(one) = target {
@@ -1663,8 +1666,8 @@ pub(crate) fn pkg_update(target: Option<&str>) -> Result<(), String> {
 
 pub(crate) fn build_package_bundle(dir: &Path) -> Result<JsonValue, String> {
     let manifest: JsonValue = serde_json::from_str(
-        &fs::read_to_string(dir.join("veyra.json")).unwrap_or_else(|_| {
-            serde_json::json!({"name":"package","version":"0.1.0","entry":"src/main.vy"})
+        &fs::read_to_string(dir.join("kovrek.json")).unwrap_or_else(|_| {
+            serde_json::json!({"name":"package","version":"0.1.0","entry":"src/main.kvr"})
                 .to_string()
         }),
     )
@@ -1680,7 +1683,7 @@ pub(crate) fn build_package_bundle(dir: &Path) -> Result<JsonValue, String> {
     let entry = manifest
         .get("entry")
         .and_then(JsonValue::as_str)
-        .unwrap_or("src/main.vy");
+        .unwrap_or("src/main.kvr");
     let mut files = Vec::new();
     collect_files_excluding(dir, &mut files)?;
     files.sort();
@@ -1691,7 +1694,7 @@ pub(crate) fn build_package_bundle(dir: &Path) -> Result<JsonValue, String> {
             .unwrap_or(&p)
             .to_string_lossy()
             .replace('\\', "/");
-        if rel == "veyra.lock" || rel.ends_with(".vypkg.json") {
+        if rel == "kovrek.lock" || rel.ends_with(".kvpkg.json") {
             continue;
         }
         let bytes = fs::read(&p).map_err(|e| e.to_string())?;
@@ -1701,9 +1704,9 @@ pub(crate) fn build_package_bundle(dir: &Path) -> Result<JsonValue, String> {
         );
     }
     let sha256 = hash_directory_excluding_sig(dir)?;
-    let sig = if dir.join("veyra.sig.json").is_file() {
+    let sig = if dir.join("kovrek.sig.json").is_file() {
         serde_json::from_str::<JsonValue>(
-            &fs::read_to_string(dir.join("veyra.sig.json")).map_err(|e| e.to_string())?,
+            &fs::read_to_string(dir.join("kovrek.sig.json")).map_err(|e| e.to_string())?,
         )
         .ok()
     } else {
@@ -1723,7 +1726,7 @@ pub(crate) fn build_package_bundle(dir: &Path) -> Result<JsonValue, String> {
         })
         .unwrap_or_default();
     Ok(serde_json::json!({
-        "format": "veyra.bundle.v1",
+        "format": "kovrek.bundle.v1",
         "name": name,
         "version": version,
         "entry": entry,
@@ -1737,8 +1740,8 @@ pub(crate) fn build_package_bundle(dir: &Path) -> Result<JsonValue, String> {
 }
 
 fn verify_bundle_json(bundle: &JsonValue) -> Result<(), String> {
-    if bundle.get("format").and_then(JsonValue::as_str) != Some("veyra.bundle.v1") {
-        return Err("unsupported .vypkg bundle format".into());
+    if bundle.get("format").and_then(JsonValue::as_str) != Some("kovrek.bundle.v1") {
+        return Err("unsupported .kvpkg bundle format".into());
     }
     let expected = bundle
         .get("sha256")
@@ -1785,7 +1788,7 @@ pub(crate) fn pkg_pack(dir: Option<&Path>, out: Option<&Path>) -> Result<(), Str
     let ver = bundle["version"].as_str().unwrap_or("0.1.0");
     let out_path = out
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| target.join(format!("{name}-{ver}.vypkg.json")));
+        .unwrap_or_else(|| target.join(format!("{name}-{ver}.kvpkg.json")));
     fs::write(
         &out_path,
         serde_json::to_string_pretty(&bundle).map_err(|e| e.to_string())?,
@@ -1815,7 +1818,7 @@ pub(crate) fn unpack_bundle_to_dir(bundle: &JsonValue, dest: &Path) -> Result<()
     }
     if let Some(sig) = bundle.get("signature").filter(|s| !s.is_null()) {
         fs::write(
-            dest.join("veyra.sig.json"),
+            dest.join("kovrek.sig.json"),
             serde_json::to_string_pretty(sig).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
@@ -1846,12 +1849,12 @@ pub(crate) fn pkg_build_plugin(dir: Option<&Path>) -> Result<(), String> {
         None => project_root(&env::current_dir().map_err(|e| e.to_string())?)?,
     };
     let manifest: JsonValue = serde_json::from_str(
-        &fs::read_to_string(target.join("veyra.json")).map_err(|e| e.to_string())?,
+        &fs::read_to_string(target.join("kovrek.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let native_root = manifest
         .get("native")
-        .ok_or("veyra.json has no 'native' plugin configuration")?;
+        .ok_or("kovrek.json has no 'native' plugin configuration")?;
     let native = select_native_spec(native_root).ok_or_else(|| {
         format!(
             "no 'native' plugin config for platform '{}'",
@@ -1861,7 +1864,7 @@ pub(crate) fn pkg_build_plugin(dir: Option<&Path>) -> Result<(), String> {
     let src_rel = native
         .get("source")
         .and_then(JsonValue::as_str)
-        .ok_or("veyra.json 'native.source' is required")?;
+        .ok_or("kovrek.json 'native.source' is required")?;
     let raw_lib = native
         .get("library")
         .and_then(JsonValue::as_str)
@@ -1872,11 +1875,11 @@ pub(crate) fn pkg_build_plugin(dir: Option<&Path>) -> Result<(), String> {
     }
     let src_path = target.join(safe_package_relative_path(src_rel)?);
     let built = crate::plugin::build_rust_plugin(&src_path, &out_path)?;
-    println!("Built Veyra native plugin: {}", built.display());
+    println!("Built Kovrek native plugin: {}", built.display());
     Ok(())
 }
 
-/// Generate a sovereign Veyra bridge package wrapping a Python/PyPI module via CPython C-API.
+/// Generate a sovereign Kovrek bridge package wrapping a Python/PyPI module via CPython C-API.
 pub(crate) fn pkg_py_bridge(
     pypi_name: &str,
     out_dir: Option<&Path>,
@@ -1919,7 +1922,7 @@ pub(crate) fn pkg_py_bridge(
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     let vy_name = format!("py_{sanitized}");
-    let entry_file = format!("{vy_name}.vy");
+    let entry_file = format!("{vy_name}.kvr");
 
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
     let active_project = project_root(&cwd).ok();
@@ -1936,19 +1939,19 @@ pub(crate) fn pkg_py_bridge(
         "name": vy_name,
         "version": "0.1.0",
         "entry": entry_file,
-        "description": format!("Veyra CPython C-API bridge wrapper for Python module '{mod_name}'"),
+        "description": format!("Kovrek CPython C-API bridge wrapper for Python module '{mod_name}'"),
         "python_package": mod_name,
         "python_module": import_name,
         "packages": {}
     });
     fs::write(
-        dest.join("veyra.json"),
+        dest.join("kovrek.json"),
         serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
 
     let vy_source = format!(
-        r#"// Auto-generated by `veyra pkg py-bridge {mod_name}`
+        r#"// Auto-generated by `kovrek pkg py-bridge {mod_name}`
 
 fn available() -> Bool {{
     return py_available();
@@ -2000,7 +2003,7 @@ fn info() -> Map {{
     fs::write(dest.join(&entry_file), vy_source).map_err(|e| e.to_string())?;
 
     if let Some(root) = register_root {
-        let proj_manifest_path = root.join("veyra.json");
+        let proj_manifest_path = root.join("kovrek.json");
         let mut proj_manifest: JsonValue = serde_json::from_str(
             &fs::read_to_string(&proj_manifest_path).map_err(|e| e.to_string())?,
         )

@@ -1,0 +1,2 @@
+use "mathlib.kvr";
+print("12 squared =", square(12));

@@ -1,31 +1,31 @@
 @echo off
 setlocal
-set "VEYRA_HOME=%LOCALAPPDATA%\Veyra"
-if not exist "%VEYRA_HOME%" mkdir "%VEYRA_HOME%"
-if not exist "%VEYRA_HOME%\bin" mkdir "%VEYRA_HOME%\bin"
-if not exist "%VEYRA_HOME%\registry" mkdir "%VEYRA_HOME%\registry"
-if exist "%~dp0bin\veyra-native.exe" (
-    copy /Y "%~dp0bin\veyra-native.exe" "%VEYRA_HOME%\bin\veyra-native.exe" >nul
-    copy /Y "%~dp0bin\veyra-native.exe" "%VEYRA_HOME%\veyra.exe" >nul
+set "KOVREK_HOME=%LOCALAPPDATA%\Kovrek"
+if not exist "%KOVREK_HOME%" mkdir "%KOVREK_HOME%"
+if not exist "%KOVREK_HOME%\bin" mkdir "%KOVREK_HOME%\bin"
+if not exist "%KOVREK_HOME%\registry" mkdir "%KOVREK_HOME%\registry"
+if exist "%~dp0bin\kovrek-native.exe" (
+    copy /Y "%~dp0bin\kovrek-native.exe" "%KOVREK_HOME%\bin\kovrek-native.exe" >nul
+    copy /Y "%~dp0bin\kovrek-native.exe" "%KOVREK_HOME%\kovrek.exe" >nul
 )
 if exist "%~dp0registry\index.json" (
-    copy /Y "%~dp0registry\index.json" "%VEYRA_HOME%\registry\index.json" >nul
+    copy /Y "%~dp0registry\index.json" "%KOVREK_HOME%\registry\index.json" >nul
 )
 if exist "%~dp0packages" (
-    xcopy /E /I /Y "%~dp0packages" "%VEYRA_HOME%\packages" >nul
+    xcopy /E /I /Y "%~dp0packages" "%KOVREK_HOME%\packages" >nul
 )
-copy /Y "%~dp0veyra.py" "%VEYRA_HOME%\veyra.py" >nul
+copy /Y "%~dp0kovrek.py" "%KOVREK_HOME%\kovrek.py" >nul
 (
  echo @echo off
- echo set "VEYRA_HOME=%%LOCALAPPDATA%%\Veyra"
- echo "%%LOCALAPPDATA%%\Veyra\bin\veyra-native.exe" %%*
-) > "%VEYRA_HOME%\veyra.bat"
+ echo set "KOVREK_HOME=%%LOCALAPPDATA%%\Kovrek"
+ echo "%%LOCALAPPDATA%%\Kovrek\bin\kovrek-native.exe" %%*
+) > "%KOVREK_HOME%\kovrek.bat"
 (
  echo @echo off
- echo python "%%LOCALAPPDATA%%\Veyra\veyra.py" %%*
-) > "%VEYRA_HOME%\veyra-py.bat"
-powershell -NoProfile -Command "$p=[Environment]::GetEnvironmentVariable('Path','User'); $v=$env:LOCALAPPDATA+'\Veyra'; if (($p -split ';') -notcontains $v) {[Environment]::SetEnvironmentVariable('Path', (($p.TrimEnd(';')+';'+$v).Trim(';')), 'User')}"
+ echo python "%%LOCALAPPDATA%%\Kovrek\kovrek.py" %%*
+) > "%KOVREK_HOME%\kovrek-py.bat"
+powershell -NoProfile -Command "$p=[Environment]::GetEnvironmentVariable('Path','User'); $v=$env:LOCALAPPDATA+'\Kovrek'; if (($p -split ';') -notcontains $v) {[Environment]::SetEnvironmentVariable('Path', (($p.TrimEnd(';')+';'+$v).Trim(';')), 'User')}"
 echo.
-echo Veyra native engine installed for this Windows user.
-echo Open a NEW terminal and run: veyra --version
+echo Kovrek native engine installed for this Windows user.
+echo Open a NEW terminal and run: kovrek --version
 pause

@@ -1,6 +1,6 @@
 const vscode = require('vscode');
 const cp = require('child_process');
-const { VeyraLspClient, resolveExecutable } = require('./lsp-client');
+const { KovrekLspClient, resolveExecutable } = require('./lsp-client');
 
 const keywords = [
   'let','const','fn','async','class','if','else','while','for','in','return','use',
@@ -36,7 +36,7 @@ const builtins = [
 let lspClient = null;
 
 function executable() {
-  const configured = vscode.workspace.getConfiguration('veyra').get('executablePath');
+  const configured = vscode.workspace.getConfiguration('kovrek').get('executablePath');
   return resolveExecutable(configured, vscode.workspace.workspaceFolders);
 }
 
@@ -69,7 +69,7 @@ function toDocumentSymbol(sym) {
 }
 
 function runInTerminal(args, name) {
-  const terminal = vscode.window.createTerminal(name || 'Veyra');
+  const terminal = vscode.window.createTerminal(name || 'Kovrek');
   terminal.show();
   const exe = executable();
   const quotedExe = exe.includes(' ') ? '"' + exe + '"' : exe;
@@ -122,7 +122,7 @@ function fallbackDocumentSymbols(doc) {
 }
 
 function checkDocumentFallback(doc, diagnostics) {
-  if (doc.languageId !== 'veyra' || doc.isUntitled) return;
+  if (doc.languageId !== 'kovrek' || doc.isUntitled) return;
   cp.execFile(executable(), ['check', doc.fileName], {windowsHide:true}, (err, stdout, stderr) => {
     const items = [];
     if (err) {
@@ -135,10 +135,10 @@ function checkDocumentFallback(doc, diagnostics) {
 }
 
 function activate(context) {
-  const diagnostics = vscode.languages.createDiagnosticCollection('veyra');
+  const diagnostics = vscode.languages.createDiagnosticCollection('kovrek');
   context.subscriptions.push(diagnostics);
 
-  lspClient = new VeyraLspClient(executable, (method, params) => {
+  lspClient = new KovrekLspClient(executable, (method, params) => {
     if (method === 'textDocument/publishDiagnostics' && params && params.uri) {
       const uri = vscode.Uri.parse(params.uri);
       const list = (params.diagnostics || []).map((d) => {
@@ -154,7 +154,7 @@ function activate(context) {
   });
 
   const syncOpen = (doc) => {
-    if (doc.languageId !== 'veyra') return;
+    if (doc.languageId !== 'kovrek') return;
     lspClient.didOpen(doc.uri.toString(), doc.getText(), doc.version)
       .catch(() => checkDocumentFallback(doc, diagnostics));
   };
@@ -162,33 +162,33 @@ function activate(context) {
   vscode.workspace.textDocuments.forEach(syncOpen);
   context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(syncOpen));
   context.subscriptions.push(vscode.workspace.onDidChangeTextDocument((e) => {
-    if (e.document.languageId !== 'veyra') return;
+    if (e.document.languageId !== 'kovrek') return;
     lspClient.didChange(e.document.uri.toString(), e.document.getText(), e.document.version).catch(() => {});
   }));
   context.subscriptions.push(vscode.workspace.onDidSaveTextDocument((doc) => {
-    if (doc.languageId !== 'veyra') return;
+    if (doc.languageId !== 'kovrek') return;
     lspClient.didChange(doc.uri.toString(), doc.getText(), doc.version)
       .catch(() => checkDocumentFallback(doc, diagnostics));
   }));
   context.subscriptions.push(vscode.workspace.onDidCloseTextDocument((doc) => {
-    if (doc.languageId === 'veyra') {
+    if (doc.languageId === 'kovrek') {
       lspClient.didClose(doc.uri.toString());
       diagnostics.delete(doc.uri);
     }
   }));
 
-  context.subscriptions.push(vscode.debug.registerDebugAdapterDescriptorFactory('veyra', {
+  context.subscriptions.push(vscode.debug.registerDebugAdapterDescriptorFactory('kovrek', {
     createDebugAdapterDescriptor() {
       return new vscode.DebugAdapterExecutable(executable(), ['dap']);
     }
   }));
-  context.subscriptions.push(vscode.debug.registerDebugConfigurationProvider('veyra', {
+  context.subscriptions.push(vscode.debug.registerDebugConfigurationProvider('kovrek', {
     resolveDebugConfiguration(folder, config) {
       if (!config.type && !config.request && !config.name) {
         const ed = vscode.window.activeTextEditor;
-        if (ed && ed.document.languageId === 'veyra') {
-          config.type = 'veyra';
-          config.name = 'Debug Current Veyra File';
+        if (ed && ed.document.languageId === 'kovrek') {
+          config.type = 'kovrek';
+          config.name = 'Debug Current Kovrek File';
           config.request = 'launch';
           config.program = ed.document.fileName;
           config.stopOnEntry = false;
@@ -198,38 +198,38 @@ function activate(context) {
     }
   }));
 
-  context.subscriptions.push(vscode.commands.registerCommand('veyra.check', () => {
+  context.subscriptions.push(vscode.commands.registerCommand('kovrek.check', () => {
     const ed = vscode.window.activeTextEditor;
-    if (!ed || ed.document.languageId !== 'veyra') return;
+    if (!ed || ed.document.languageId !== 'kovrek') return;
     ed.document.save().then(() => {
       lspClient.didChange(ed.document.uri.toString(), ed.document.getText(), ed.document.version)
         .catch(() => checkDocumentFallback(ed.document, diagnostics));
     });
   }));
-  context.subscriptions.push(vscode.commands.registerCommand('veyra.run', () => {
+  context.subscriptions.push(vscode.commands.registerCommand('kovrek.run', () => {
     const ed = vscode.window.activeTextEditor;
-    if (ed && ed.document.languageId === 'veyra') runInTerminal(['run', ed.document.fileName], 'Veyra Run');
+    if (ed && ed.document.languageId === 'kovrek') runInTerminal(['run', ed.document.fileName], 'Kovrek Run');
   }));
-  context.subscriptions.push(vscode.commands.registerCommand('veyra.debug', () => {
+  context.subscriptions.push(vscode.commands.registerCommand('kovrek.debug', () => {
     const ed = vscode.window.activeTextEditor;
-    if (!ed || ed.document.languageId !== 'veyra') return;
+    if (!ed || ed.document.languageId !== 'kovrek') return;
     vscode.debug.startDebugging(undefined, {
-      type: 'veyra',
+      type: 'kovrek',
       request: 'launch',
-      name: 'Debug Current Veyra File',
+      name: 'Debug Current Kovrek File',
       program: ed.document.fileName,
       stopOnEntry: true,
     });
   }));
-  context.subscriptions.push(vscode.commands.registerCommand('veyra.profile', () => {
+  context.subscriptions.push(vscode.commands.registerCommand('kovrek.profile', () => {
     const ed = vscode.window.activeTextEditor;
-    if (ed && ed.document.languageId === 'veyra') runInTerminal(['profile', ed.document.fileName], 'Veyra Profile');
+    if (ed && ed.document.languageId === 'kovrek') runInTerminal(['profile', ed.document.fileName], 'Kovrek Profile');
   }));
-  context.subscriptions.push(vscode.commands.registerCommand('veyra.test', () => {
-    runInTerminal(['test'], 'Veyra Tests');
+  context.subscriptions.push(vscode.commands.registerCommand('kovrek.test', () => {
+    runInTerminal(['test'], 'Kovrek Tests');
   }));
 
-  context.subscriptions.push(vscode.languages.registerCompletionItemProvider('veyra', {
+  context.subscriptions.push(vscode.languages.registerCompletionItemProvider('kovrek', {
     async provideCompletionItems(doc, pos) {
       try {
         const items = await lspClient.request('textDocument/completion', {
@@ -252,7 +252,7 @@ function activate(context) {
     }
   }));
 
-  context.subscriptions.push(vscode.languages.registerDefinitionProvider('veyra', {
+  context.subscriptions.push(vscode.languages.registerDefinitionProvider('kovrek', {
     async provideDefinition(doc, pos) {
       try {
         const res = await lspClient.request('textDocument/definition', {
@@ -267,7 +267,7 @@ function activate(context) {
     }
   }));
 
-  context.subscriptions.push(vscode.languages.registerReferenceProvider('veyra', {
+  context.subscriptions.push(vscode.languages.registerReferenceProvider('kovrek', {
     async provideReferences(doc, pos) {
       try {
         const res = await lspClient.request('textDocument/references', {
@@ -282,7 +282,7 @@ function activate(context) {
     }
   }));
 
-  context.subscriptions.push(vscode.languages.registerRenameProvider('veyra', {
+  context.subscriptions.push(vscode.languages.registerRenameProvider('kovrek', {
     async provideRenameEdits(doc, pos, newName) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(newName)) return;
       try {
@@ -313,7 +313,7 @@ function activate(context) {
     }
   }));
 
-  context.subscriptions.push(vscode.languages.registerDocumentSymbolProvider('veyra', {
+  context.subscriptions.push(vscode.languages.registerDocumentSymbolProvider('kovrek', {
     async provideDocumentSymbols(doc) {
       try {
         const res = await lspClient.request('textDocument/documentSymbol', {
@@ -325,7 +325,7 @@ function activate(context) {
     }
   }));
 
-  context.subscriptions.push(vscode.languages.registerHoverProvider('veyra', {
+  context.subscriptions.push(vscode.languages.registerHoverProvider('kovrek', {
     async provideHover(doc, pos) {
       try {
         const res = await lspClient.request('textDocument/hover', {
@@ -339,11 +339,11 @@ function activate(context) {
       const range = doc.getWordRangeAtPosition(pos);
       if (!range) return;
       const w = doc.getText(range);
-      if (keywords.includes(w)) return new vscode.Hover('Veyra keyword: **' + w + '**');
+      if (keywords.includes(w)) return new vscode.Hover('Kovrek keyword: **' + w + '**');
     }
   }));
 
-  context.subscriptions.push(vscode.languages.registerDocumentFormattingEditProvider('veyra', {
+  context.subscriptions.push(vscode.languages.registerDocumentFormattingEditProvider('kovrek', {
     async provideDocumentFormattingEdits(doc) {
       try {
         const edits = await lspClient.request('textDocument/formatting', {

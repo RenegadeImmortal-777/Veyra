@@ -1,4 +1,4 @@
-// Lexer: `.vy` source text to `Tok` stream.
+// Lexer: `.kvr` source text to `Tok` stream.
 //
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 

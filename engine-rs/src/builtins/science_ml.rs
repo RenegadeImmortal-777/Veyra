@@ -783,7 +783,7 @@ impl Vm {
                 };
                 let t = tensor_snapshot(id)?;
                 let body = serde_json::json!({
-                    "format": "veyra.tensor.v1",
+                    "format": "kovrek.tensor.v1",
                     "shape": t.shape,
                     "data": t.data,
                     "requires_grad": t.requires_grad
@@ -806,7 +806,7 @@ impl Vm {
                 let body: JsonValue =
                     serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
                         .map_err(|e| e.to_string())?;
-                if body.get("format").and_then(JsonValue::as_str) != Some("veyra.tensor.v1") {
+                if body.get("format").and_then(JsonValue::as_str) != Some("kovrek.tensor.v1") {
                     return Err("unsupported tensor file format".into());
                 }
                 let shape = body
@@ -1237,7 +1237,7 @@ impl Vm {
                     );
                 }
                 let body = serde_json::json!({
-                    "format": "veyra.checkpoint.v1",
+                    "format": "kovrek.checkpoint.v1",
                     "tensors": entries
                 });
                 fs::write(path, serde_json::to_vec(&body).map_err(|e| e.to_string())?)
@@ -1255,7 +1255,7 @@ impl Vm {
                 let body: JsonValue =
                     serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
                         .map_err(|e| e.to_string())?;
-                if body.get("format").and_then(JsonValue::as_str) != Some("veyra.checkpoint.v1") {
+                if body.get("format").and_then(JsonValue::as_str) != Some("kovrek.checkpoint.v1") {
                     return Err("unsupported checkpoint format".into());
                 }
                 let entries = body

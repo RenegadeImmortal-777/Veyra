@@ -1,4 +1,4 @@
-// Programmatic SPIR-V 1.0 binary compute shader assembler for Veyra's Vulkan backend.
+// Programmatic SPIR-V 1.0 binary compute shader assembler for Kovrek's Vulkan backend.
 // Produces self-contained, spec-compliant compute kernels using DescriptorSet 0
 // storage buffers (bindings 0=A, 1=B, 2=Out via SPIR-V 1.0 BufferBlock) and
 // PushConstant parameters so no external shader compiler binary is required.

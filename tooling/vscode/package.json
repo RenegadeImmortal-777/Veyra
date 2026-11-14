@@ -1,30 +1,30 @@
 {
-  "name": "veyra-language",
-  "displayName": "Veyra Language",
-  "description": "LSP and DAP Language support for Veyra",
+  "name": "kovrek-language",
+  "displayName": "Kovrek Language",
+  "description": "LSP and DAP Language support for Kovrek",
   "version": "12.0.0",
-  "publisher": "veyra",
+  "publisher": "kovrek",
   "engines": {"vscode": "^1.80.0"},
   "categories": ["Programming Languages", "Linters", "Debuggers"],
-  "activationEvents": ["onLanguage:veyra", "onDebugInitialConfigurations", "onDebugResolve:veyra"],
+  "activationEvents": ["onLanguage:kovrek", "onDebugInitialConfigurations", "onDebugResolve:kovrek"],
   "main": "./extension.js",
   "contributes": {
-    "languages": [{"id":"veyra","aliases":["Veyra","veyra"],"extensions":[".vy"],"configuration":"./language-configuration.json"}],
-    "grammars": [{"language":"veyra","scopeName":"source.veyra","path":"./syntaxes/veyra.tmLanguage.json"}],
-    "snippets": [{"language":"veyra","path":"./snippets/veyra.json"}],
-    "breakpoints": [{"language": "veyra"}],
+    "languages": [{"id":"kovrek","aliases":["Kovrek","kovrek"],"extensions":[".kvr"],"configuration":"./language-configuration.json"}],
+    "grammars": [{"language":"kovrek","scopeName":"source.kovrek","path":"./syntaxes/kovrek.tmLanguage.json"}],
+    "snippets": [{"language":"kovrek","path":"./snippets/kovrek.json"}],
+    "breakpoints": [{"language": "kovrek"}],
     "debuggers": [
       {
-        "type": "veyra",
-        "label": "Veyra Debug",
-        "languages": ["veyra"],
+        "type": "kovrek",
+        "label": "Kovrek Debug",
+        "languages": ["kovrek"],
         "configurationAttributes": {
           "launch": {
             "required": ["program"],
             "properties": {
               "program": {
                 "type": "string",
-                "description": "Absolute path to a Veyra .vy entry file",
+                "description": "Absolute path to a Kovrek .kvr entry file",
                 "default": "${file}"
               },
               "stopOnEntry": {
@@ -37,9 +37,9 @@
         },
         "initialConfigurations": [
           {
-            "type": "veyra",
+            "type": "kovrek",
             "request": "launch",
-            "name": "Debug Current Veyra File",
+            "name": "Debug Current Kovrek File",
             "program": "${file}",
             "stopOnEntry": false
           }
@@ -47,21 +47,21 @@
       }
     ],
     "configuration": {
-      "title": "Veyra",
+      "title": "Kovrek",
       "properties": {
-        "veyra.executablePath": {
+        "kovrek.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Optional path to the native Veyra executable"
+          "description": "Optional path to the native Kovrek executable"
         }
       }
     },
     "commands": [
-      {"command":"veyra.check","title":"Veyra: Check Current File"},
-      {"command":"veyra.run","title":"Veyra: Run Current File"},
-      {"command":"veyra.debug","title":"Veyra: Debug Current File"},
-      {"command":"veyra.test","title":"Veyra: Test Project"},
-      {"command":"veyra.profile","title":"Veyra: Profile Current File"}
+      {"command":"kovrek.check","title":"Kovrek: Check Current File"},
+      {"command":"kovrek.run","title":"Kovrek: Run Current File"},
+      {"command":"kovrek.debug","title":"Kovrek: Debug Current File"},
+      {"command":"kovrek.test","title":"Kovrek: Test Project"},
+      {"command":"kovrek.profile","title":"Kovrek: Profile Current File"}
     ]
   }
 }

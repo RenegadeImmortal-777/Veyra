@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 
-use crate::pipeline::{compile_to_vybc, load_source, run_source};
+use crate::pipeline::{compile_to_kvbc, load_source, run_source};
 
 pub(crate) fn fmt_source(src: &str) -> String {
     let mut out = String::new();
@@ -84,22 +84,22 @@ pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
 pub(crate) fn project_root(start: &Path) -> Result<PathBuf, String> {
     let mut p = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     loop {
-        if p.join("veyra.json").exists() {
+        if p.join("kovrek.json").exists() {
             return Ok(p);
         }
         if !p.pop() {
-            return Err("veyra.json not found".into());
+            return Err("kovrek.json not found".into());
         }
     }
 }
 
-pub(crate) fn veyra_home() -> PathBuf {
-    if let Ok(v) = env::var("VEYRA_HOME") {
+pub(crate) fn kovrek_home() -> PathBuf {
+    if let Ok(v) = env::var("KOVREK_HOME") {
         return PathBuf::from(v);
     }
     if cfg!(target_os = "windows") {
         if let Ok(v) = env::var("LOCALAPPDATA") {
-            return PathBuf::from(v).join("Veyra");
+            return PathBuf::from(v).join("Kovrek");
         }
     }
     env::current_exe()
@@ -111,10 +111,10 @@ pub(crate) fn veyra_home() -> PathBuf {
 pub(crate) fn project_packages() -> Result<(), String> {
     let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
     let manifest: JsonValue = serde_json::from_str(
-        &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
+        &fs::read_to_string(root.join("kovrek.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    println!("Installed Veyra packages");
+    println!("Installed Kovrek packages");
     if let Some(pkgs) = manifest.get("packages").and_then(JsonValue::as_object) {
         for (name, meta) in pkgs {
             let version = meta
@@ -130,13 +130,13 @@ pub(crate) fn project_packages() -> Result<(), String> {
 pub(crate) fn project_entry() -> Result<PathBuf, String> {
     let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
     let manifest: JsonValue = serde_json::from_str(
-        &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
+        &fs::read_to_string(root.join("kovrek.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let entry = manifest
         .get("entry")
         .and_then(JsonValue::as_str)
-        .unwrap_or("src/main.vy");
+        .unwrap_or("src/main.kvr");
     Ok(root.join(entry))
 }
 
@@ -176,7 +176,7 @@ pub(crate) fn build_project(native: bool) -> Result<(), String> {
 }
 
 pub(crate) fn build_project_at(root: &Path, native: bool) -> Result<(), String> {
-    let manifest_path = root.join("veyra.json");
+    let manifest_path = root.join("kovrek.json");
     let manifest: JsonValue =
         serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -197,16 +197,16 @@ pub(crate) fn build_project_at(root: &Path, native: bool) -> Result<(), String> 
     if root.join("vendor").exists() {
         copy_dir_all(&root.join("vendor"), &dist.join("vendor"))?;
     }
-    fs::copy(&manifest_path, dist.join("veyra.json")).map_err(|e| e.to_string())?;
+    fs::copy(&manifest_path, dist.join("kovrek.json")).map_err(|e| e.to_string())?;
     let entry_rel = manifest
         .get("entry")
         .and_then(JsonValue::as_str)
-        .unwrap_or("src/main.vy");
+        .unwrap_or("src/main.kvr");
     let entry_path = root.join(entry_rel);
     if entry_path.exists() {
         let bundled = load_source(entry_path.to_string_lossy().as_ref())?;
-        let vybc = compile_to_vybc(&bundled)?;
-        fs::write(dist.join("app.vybc"), vybc).map_err(|e| e.to_string())?;
+        let kvbc = compile_to_kvbc(&bundled)?;
+        fs::write(dist.join("app.kvbc"), kvbc).map_err(|e| e.to_string())?;
         if native {
             let bin_name = if cfg!(target_os = "windows") {
                 format!("{name}.exe")
@@ -222,9 +222,9 @@ pub(crate) fn build_project_at(root: &Path, native: bool) -> Result<(), String> 
     fs::copy(
         &exe,
         dist.join(if cfg!(target_os = "windows") {
-            "veyra.exe"
+            "kovrek.exe"
         } else {
-            "veyra"
+            "kovrek"
         }),
     )
     .map_err(|e| e.to_string())?;

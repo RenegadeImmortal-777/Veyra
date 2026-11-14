@@ -31,7 +31,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
 use crate::bytecode::{ClassDef, FunctionDef, ObjectData, Op};
-use crate::pipeline::{compile_source, compile_to_vybc, load_source, run_vybc};
+use crate::pipeline::{compile_source, compile_to_kvbc, load_source, run_kvbc};
 use crate::project::project_root;
 use crate::runtime::{
     CHANNEL_IDS, FUNCTION_IDS, GENERATOR_IDS, OBJECT_IDS, TASK_IDS, channels,
@@ -117,25 +117,25 @@ impl Vm {
                 let report = crate::pipeline::optimize_source_stats(src)?;
                 json_to_val(&report)
             }
-            "vybc_compile" => {
+            "kvbc_compile" => {
                 if a.len() != 1 {
-                    return Err("vybc_compile expects source String".into());
+                    return Err("kvbc_compile expects source String".into());
                 }
                 let src = match &a[0] {
                     Val::Str(s) => s,
-                    _ => return Err("vybc_compile expects String".into()),
+                    _ => return Err("kvbc_compile expects String".into()),
                 };
-                Val::Str(compile_to_vybc(src)?)
+                Val::Str(compile_to_kvbc(src)?)
             }
-            "vybc_run" => {
+            "kvbc_run" => {
                 if a.len() != 1 {
-                    return Err("vybc_run expects vybc String".into());
+                    return Err("kvbc_run expects kvbc String".into());
                 }
                 let bc = match &a[0] {
                     Val::Str(s) => s,
-                    _ => return Err("vybc_run expects String".into()),
+                    _ => return Err("kvbc_run expects String".into()),
                 };
-                run_vybc(bc)?;
+                run_kvbc(bc)?;
                 Val::Null
             }
             "import_package" => {
@@ -149,7 +149,7 @@ impl Vm {
                 let cwd = env::current_dir().map_err(|e| e.to_string())?;
                 let root = project_root(&cwd)?;
                 let manifest: JsonValue = serde_json::from_str(
-                    &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
+                    &fs::read_to_string(root.join("kovrek.json")).map_err(|e| e.to_string())?,
                 )
                 .map_err(|e| e.to_string())?;
                 let vdir = crate::registry::vendor_pkg_dir(&root, &package);
@@ -172,13 +172,13 @@ impl Vm {
                     ),
                     None => (vdir, None),
                 };
-                let pkg_manifest_path = pkg_dir.join("veyra.json");
+                let pkg_manifest_path = pkg_dir.join("kovrek.json");
                 let entry_owned = manifest_meta
                     .and_then(|m| m.get("entry"))
                     .and_then(JsonValue::as_str)
                     .map(str::to_string)
                     .or(ws_entry)
-                    .unwrap_or_else(|| "main.vy".to_string());
+                    .unwrap_or_else(|| "main.kvr".to_string());
                 let entry = entry_owned.as_str();
                 let path = pkg_dir.join(entry);
                 let module_vm = if path.is_file() {
@@ -244,8 +244,8 @@ impl Vm {
                         exports.push((Val::Str(name), value));
                     }
                 }
-                // Bind any native `veyra_plugin_v1` shared library declared by package veyra.json
-                let pkg_manifest_path = pkg_dir.join("veyra.json");
+                // Bind any native `kovrek_plugin_v1` shared library declared by package kovrek.json
+                let pkg_manifest_path = pkg_dir.join("kovrek.json");
                 if pkg_manifest_path.is_file() {
                     if let Ok(pkg_txt) = fs::read_to_string(&pkg_manifest_path) {
                         if let Ok(pkg_json) = serde_json::from_str::<JsonValue>(&pkg_txt) {

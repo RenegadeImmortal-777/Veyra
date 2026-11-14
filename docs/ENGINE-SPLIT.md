@@ -126,7 +126,7 @@ below).
 
 ### Phase 3 — a library target — **complete 2026-11-08**
 
-Added `engine-rs/src/lib.rs` exposing `VERSION`, `run_cli`, `load_source`, `run_source`, and `disasm_source`, with `engine-rs/src/main.rs` reduced to a 5-line binary entry point calling `veyra::run_cli()`.
+Added `engine-rs/src/lib.rs` exposing `VERSION`, `run_cli`, `load_source`, `run_source`, and `disasm_source`, with `engine-rs/src/main.rs` reduced to a 5-line binary entry point calling `kovrek::run_cli()`.
 
 ## What this does not buy
 

@@ -96,12 +96,12 @@ pub(crate) fn load_source_with_lines(
                 }
                 let mut is_pkg = false;
                 let mut native_only_pkg = false;
-                let is_pkg_spec = !rel.ends_with(".vy")
+                let is_pkg_spec = !rel.ends_with(".kvr")
                     && !rel.contains('\\')
                     && (!rel.contains('/') || rel.starts_with('@'));
                 let target = if is_pkg_spec {
                     if let Ok(root) = project_root(base) {
-                        let manifest_path = root.join("veyra.json");
+                        let manifest_path = root.join("kovrek.json");
                         let manifest: JsonValue = serde_json::from_str(
                             &fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?,
                         )
@@ -128,9 +128,9 @@ pub(crate) fn load_source_with_lines(
                                 .get("entry")
                                 .and_then(JsonValue::as_str)
                                 .or(ws_entry.as_deref())
-                                .unwrap_or("main.vy");
+                                .unwrap_or("main.kvr");
                             let candidate = pkg_dir.join(entry);
-                            if !candidate.is_file() && pkg_dir.join("veyra.json").is_file() {
+                            if !candidate.is_file() && pkg_dir.join("kovrek.json").is_file() {
                                 native_only_pkg = true;
                             }
                             candidate
@@ -141,15 +141,15 @@ pub(crate) fn load_source_with_lines(
                             let entry = ws_manifest
                                 .get("entry")
                                 .and_then(JsonValue::as_str)
-                                .unwrap_or("main.vy");
+                                .unwrap_or("main.kvr");
                             let candidate = ws_dir.join(entry);
-                            if !candidate.is_file() && ws_dir.join("veyra.json").is_file() {
+                            if !candidate.is_file() && ws_dir.join("kovrek.json").is_file() {
                                 native_only_pkg = true;
                             }
                             candidate
                         } else {
                             let pkg_manifest =
-                                crate::registry::vendor_pkg_dir(&root, rel).join("veyra.json");
+                                crate::registry::vendor_pkg_dir(&root, rel).join("kovrek.json");
                             if pkg_manifest.is_file() {
                                 is_pkg = true;
                                 native_only_pkg = true;
@@ -3378,12 +3378,12 @@ pub fn run_source(src: &str) -> Result<(), String> {
     Vm::new(compile_source(src)?).run()
 }
 
-pub fn compile_to_vybc(src: &str) -> Result<String, String> {
+pub fn compile_to_kvbc(src: &str) -> Result<String, String> {
     encode_bytecode(&compile_source(src)?)
 }
 
-pub fn run_vybc(vybc_text: &str) -> Result<(), String> {
-    Vm::new(decode_bytecode(vybc_text)?).run()
+pub fn run_kvbc(kvbc_text: &str) -> Result<(), String> {
+    Vm::new(decode_bytecode(kvbc_text)?).run()
 }
 
 pub fn disasm_source(src: &str) -> Result<(), String> {

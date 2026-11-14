@@ -1,4 +1,4 @@
-# Veyra 12 Scope
+# Kovrek 12 Scope
 
 Nexus (11.0) has no successor defined. Two candidate targets have been carried in
 every milestone document's "remaining gaps" list since Apex: a **self-hosted
@@ -54,7 +54,7 @@ in Apex/Zenith pays off or costs.
 
 ## Option B: self-hosted compiler
 
-Path: stage0 (Rust) compiles a stage1 compiler written in Veyra; stage1 compiles the
+Path: stage0 (Rust) compiles a stage1 compiler written in Kovrek; stage1 compiles the
 compiler again into stage2; stage1 and stage2 must agree.
 
 **Why it is attractive.** It is the strongest possible demonstration that the

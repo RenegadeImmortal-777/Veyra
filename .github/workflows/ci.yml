@@ -1,4 +1,4 @@
-name: Veyra CI
+name: Kovrek CI
 
 on:
   push:

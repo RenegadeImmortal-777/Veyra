@@ -1,15 +1,16 @@
 # Changelog
 
-Consolidated release history for Veyra, distilled from the milestone documents that
+Consolidated release history for Kovrek, distilled from the milestone documents that
 previously each lived in their own root-level file. Those files are retained for
-provenance and are marked historical.
+provenance and are marked historical. Previously developed under the working name
+*Veyra* prior to the 12.0 Sovereign Kovrek (`.kvr`, `.kvbc`) rebrand.
 
 Two execution paths exist in this repository and are tracked separately below:
 
 - **Native Horizon engine** — the Rust compiler/VM in `engine-rs/`, shipped as
-  `bin/veyra-native.exe`. This is the default path.
-- **Convergence runtime** — the Python compatibility layer (`veyra.py`,
-  `veyra_cli.py`). This is the legacy/interop path and the one that exposes
+  `bin/kovrek-native.exe`. This is the default path.
+- **Convergence runtime** — the Python compatibility layer (`kovrek.py`,
+  `kovrek_cli.py`). This is the legacy/interop path and the one that exposes
   `py_import`.
 
 Release numbering below follows the native engine. Only Zenith and Nexus record a
@@ -27,18 +28,18 @@ Release gate verified **2026-11-14** (**130/130** unit tests, **74/74** packages
 - **Relational `@verify` Prover, `@linear` Move Enforcement & Auto-Arena Escape Analysis (`ir.rs`, `pipeline.rs`, `vm.rs`)**:
   - Upgraded `@verify` to a relational difference-bound solver with `if`/`else` lattice joins, half-bounded interval arithmetic, loop invariant + post-loop negation reasoning, callee `ensures` propagation, and concrete counterexample witnesses.
   - Extended `@linear` move checking into actor/channel/remote boundaries (`actor_send`, `actor_ask`, `actor_remote_send`, `actor_remote_ask`, `chan_send`) and added compile-time escape-analysis `auto_arena` reclamation.
-- **Distributed TCP Actors, Crash-Safe Virtual FS, Flight-Recorder Profiler & Self-Hosted Peephole (`sim_actor.rs`, `vm.rs`, `tooling.rs`, `compiler-vy/src/main.vy`)**:
+- **Distributed TCP Actors, Crash-Safe Virtual FS, Flight-Recorder Profiler & Self-Hosted Peephole (`sim_actor.rs`, `vm.rs`, `tooling.rs`, `compiler-kvr/src/main.kvr`)**:
   - Added location-transparent TCP actor RPC (`actor_node_listen`, `actor_node_stop`, `actor_remote_send`, `actor_remote_ask`) and deterministic crash-safe fault-injectable VFS (`sim_fs_write`, `sim_fs_read`, `sim_fs_delete`, `sim_fs_list`, `sim_fs_sync`, `sim_fs_crash`, `sim_fs_snapshot`).
-  - Added a zero-when-disabled production flight-recorder profiler (`profile_start`, `profile_stop`, `profile_report`) instrumenting both VM frames and JIT calls alongside upgraded `veyra profile` GC/auto-arena reporting, plus pure-Veyra arithmetic constant folding in `compiler-vy/src/main.vy` (preserving 3-stage bootstrap fixpoint).
+  - Added a zero-when-disabled production flight-recorder profiler (`profile_start`, `profile_stop`, `profile_report`) instrumenting both VM frames and JIT calls alongside upgraded `kovrek profile` GC/auto-arena reporting, plus pure-Kovrek arithmetic constant folding in `compiler-kvr/src/main.kvr` (preserving 3-stage bootstrap fixpoint).
 
 - **IR Optimizer, Formal Taint, Linear Ownership & Interval Verifier (`ir.rs`, `pipeline.rs`)**:
   - Added SSA copy/constant propagation, algebraic identities, dead code elimination (`ir_stats`), formal `@secret`/`sanitize(...)` information-flow taint verification, `@linear`/`linear_consume(...)` ownership analysis across branches, and `@verify` static interval/bounds proofs.
 - **WebAssembly/WASI & Direct Zero-Toolchain Native Binaries (`native_codegen.rs`, `cli.rs`)**:
-  - Added standalone `.wasm` emission, disassembly, and stack VM execution with WASI linear-memory string & array lowering (`veyra wasm [file.vy] [-o out.wasm] [--disasm] [--run <fn> [args...]]`, `wasm_compile`, `wasm_disasm`, `wasm_run`).
-  - Added direct zero-toolchain PE32+ and ELF64 x86_64 executable emission supporting heap/linear strings & arrays (`veyra aot [--direct] [--elf|--pe]`).
+  - Added standalone `.wasm` emission, disassembly, and stack VM execution with WASI linear-memory string & array lowering (`kovrek wasm [file.kvr] [-o out.wasm] [--disasm] [--run <fn> [args...]]`, `wasm_compile`, `wasm_disasm`, `wasm_run`).
+  - Added direct zero-toolchain PE32+ and ELF64 x86_64 executable emission supporting heap/linear strings & arrays (`kovrek aot [--direct] [--elf|--pe]`).
 - **Contracts, Static Effects & Capability Security (`pipeline.rs`, `runtime.rs`, `registry.rs`)**:
   - Added runtime `requires`/`ensures` contracts (`ContractError`) and transitive call-graph static effect verification for `@pure` and `@effect(...)`.
-  - Added runtime capability sandboxing (`veyra run --caps c1,c2`, `cap_current`, `cap_restrict`, manifest `"capabilities"`, `veyra audit`) and reproducible `.vypkg.json` bundles.
+  - Added runtime capability sandboxing (`kovrek run --caps c1,c2`, `cap_current`, `cap_restrict`, manifest `"capabilities"`, `kovrek audit`) and reproducible `.kvpkg.json` bundles.
 - **Heterogeneous Fused GPU Shaders, Fused Linear & Strided DLPack Interop (`spirv.rs`, `gpu.rs`, `py_bridge.rs`)**:
   - Extended `gpu_fuse` & `gpu_fuse_inspect` (`div`, `silu`, `clamp`, `pow_scalar`, `recip`), added single-pass fused GEMM+bias+activation (`gpu_fused_linear`) in SPIR-V & HLSL `cs_5_0`, and added `gpu_devices` hardware/software adapter reporting.
   - Added contiguous + arbitrary strided/non-contiguous PyCapsule `DLManagedTensor` / `DLManagedTensorVersioned` zero-copy tensor interop (`tensor_to_dlpack`, `py_from_dlpack`), verified with NumPy and PyTorch.
@@ -46,16 +47,16 @@ Release gate verified **2026-11-14** (**130/130** unit tests, **74/74** packages
   - Upgraded object GC to 2-generation nursery/old-gen with remembered-set write barriers (`gc_collect("minor"|"major")`, `gc_stats`, `gc_pause`, `gc_resume`) and deterministic LIFO `arena_scope(fn)`.
   - Added SplitMix64 virtual-clock discrete-event actor clusters (`sim_actor_spawn`, `sim_actor_send`, `sim_step`, `sim_run_until`, `sim_partition`, `sim_actor_state`, `sim_trace`) and OTP-style supervision trees (`supervisor_spawn` with `"one_for_one"`, `"one_for_all"`, `"rest_for_one"`, `supervisor_status`, `actor_mailbox_len`).
 - **FFI Struct Bindgen, Dynamic C-ABI, Reversible DAP Watchpoints, DAG Notebooks & Native JIT (`plugin.rs`, `dap.rs`, `server.rs`, `jit.rs`)**:
-  - Added C header `struct`/`enum`/`#define` bindgen (`veyra ffi bindgen`), dynamic multi-arg x86_64 C-ABI calls (`ffi_call`), and bounded `mem_*` linear heap buffers.
+  - Added C header `struct`/`enum`/`#define` bindgen (`kovrek ffi bindgen`), dynamic multi-arg x86_64 C-ABI calls (`ffi_call`), and bounded `mem_*` linear heap buffers.
   - Added time-travel reversible DAP with forward & reverse data watchpoints (`stepBack`, `reverseContinue`, `dataBreakpointInfo`, `setDataBreakpoints`), AST dependency-driven topological DAG notebooks with cycle detection + `/api/notebook/dag` + `/api/notebook/export`, and native JIT dynamic `[..]` lists + `log2`/`hypot`/`fmod`/`atan2` + `Op::SetIndex` + `NumList` returns.
 
-- **Self-Hosted Compiler (`compiler-vy/src/main.vy`) & `.vybc` Bytecode**:
-  - Added portable `veyra-bc-v1` (`.vybc`) bytecode serialization with SHA-256 tamper
-    detection (`encode_bytecode`, `decode_bytecode`, `compile_to_vybc`, `run_vybc`,
-    `vybc_compile`, `vybc_run`, and `.vybc` CLI execution/output).
-  - Implemented a 100% pure-Veyra tokenizer, recursive-descent parser, and `.vybc`
-    bytecode generator in `compiler-vy/src/main.vy`, verified to a 3-stage bootstrap
-    fixpoint (`Stage 2 .vybc == Stage 3 .vybc`).
+- **Self-Hosted Compiler (`compiler-kvr/src/main.kvr`) & `.kvbc` Bytecode**:
+  - Added portable `kovrek-bc-v1` (`.kvbc`) bytecode serialization with SHA-256 tamper
+    detection (`encode_bytecode`, `decode_bytecode`, `compile_to_kvbc`, `run_kvbc`,
+    `kvbc_compile`, `kvbc_run`, and `.kvbc` CLI execution/output).
+  - Implemented a 100% pure-Kovrek tokenizer, recursive-descent parser, and `.kvbc`
+    bytecode generator in `compiler-kvr/src/main.kvr`, verified to a 3-stage bootstrap
+    fixpoint (`Stage 2 .kvbc == Stage 3 .kvbc`).
 - **Engine Architecture & Builtin Decomposition (`Phase 1`)**:
   - Decomposed `engine-rs/src/vm.rs` (4,716 lines → ~780 lines) by extracting all
     210+ built-ins into `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
@@ -85,17 +86,17 @@ Release gate verified **2026-11-14** (**130/130** unit tests, **74/74** packages
     truncation in `load_source`, and `import_package` function reference sharing.
   - Upgraded `INSTALL.bat` to install the native Horizon binary, upgraded
     `scripts/package-matrix.ps1` and `scripts/package-matrix.sh` to execute all 60
-    packages, added `examples/zenith/autograd_adam.vy` and
-    `examples/nexus/security_and_data.vy`, and achieved 72/72 unit tests and 8/8
+    packages, added `examples/zenith/autograd_adam.kvr` and
+    `examples/nexus/security_and_data.kvr`, and achieved 72/72 unit tests and 8/8
     passing release gates.
 
 ## 11.0 Nexus
 
 Ecosystem-focused successor to Zenith. Release gate reported **2026-09-21**.
 
-- Registry expanded 52 → **60 native packages**; added vyarray, vyvalidate, vyauth,
-  vyquery, vyserde, vyetl, vymodel, vyapi.
-- Hosted registry support via `VEYRA_REGISTRY_URL`, with HTTP download for
+- Registry expanded 52 → **60 native packages**; added kvarray, kvvalidate, kvauth,
+  kvquery, kvserde, kvetl, kvmodel, kvapi.
+- Hosted registry support via `KOVREK_REGISTRY_URL`, with HTTP download for
   single-file and multi-file packages.
 - Recursive package dependencies with cycle protection, plus path-traversal
   protection on downloaded files. Local/offline registry remains the default.
@@ -113,7 +114,7 @@ Ecosystem-focused successor to Zenith. Release gate reported **2026-09-21**.
 Reported gate result: fmt, 57/57 tests, portable-core check, clippy with warnings
 denied, release build, 60/60 package matrix, hosted-registry gate, remote run with
 SHA-256 audit, HTTP header gate, installed CLI `11.0.0-nexus`, installed extension
-`veyra.veyra-language@11.0.0`, package tamper detection and restore.
+`kovrek.kovrek-language@11.0.0`, package tamper detection and restore.
 
 Independently re-verified **2026-10-10** with `cargo`/`rustc` 1.93.1 on Windows at
 git `d92996b`: all eight gates in `scripts/gate-report.ps1` pass — fmt, 57/57 tests,
@@ -123,7 +124,7 @@ checks in the list above were not part of that re-run. See [STATUS.md](STATUS.md
 
 ## 10.0 Zenith
 
-Declared the Veyra 10 engineered roadmap complete. Release gate reported **2026-09-21**.
+Declared the Kovrek 10 engineered roadmap complete. Release gate reported **2026-09-21**.
 
 - Typed functions, recursion, closures, escaping function objects.
 - Classes, inheritance, runtime type enforcement.
@@ -159,7 +160,7 @@ Depth-focused release rather than surface syntax.
   objects; namespaced method dispatch prevents global symbol collisions.
 - Native tensor runtime with shapes, values and trainable parameters; reverse-mode
   autograd for add/sub/mul/ReLU/sum/mean/matmul; verified matmul gradients;
-  gradient-descent updates and `zero_grad`; full tiny-model training inside Veyra.
+  gradient-descent updates and `zero_grad`; full tiny-model training inside Kovrek.
 - Parameterized SQLite exec/query primitives; ORM packages upgraded for bound
   parameters.
 - HMAC-SHA256, PBKDF2-SHA256, constant-time equality.
@@ -177,7 +178,7 @@ reported separately.
 
 - `async fn` and async methods; `await` + `gather`.
 - `with`/`as` context management; decorator syntax; `try`/`catch`/`finally`.
-- Parameterized web routes and query parameters; request/response helpers in vyweb.
+- Parameterized web routes and query parameters; request/response helpers in kvweb.
 - Dataframe head/tail, drop/fill nulls, left joins.
 - ML workflow metrics: accuracy, precision, recall, F1, confusion counts,
   train/test split.
@@ -224,7 +225,7 @@ Linux/macOS/ARM hardware.
 - Lexical semantic checking for undefined names and duplicate declarations;
   lexical captures for nested functions.
 - `try`/`catch`/`throw`; general iteration over lists and strings; `break`/`continue`.
-- Native `await` over Veyra tasks; background tasks via `spawn`/`task_done`/
+- Native `await` over Kovrek tasks; background tasks via `spawn`/`task_done`/
   `await_task`; message-passing channels.
 - Direct C ABI dynamic-library calls for i32/i64/f64; CPU-count and sleep primitives.
 - Static, routed and dynamic web applications; stateful objects across requests;
@@ -249,13 +250,13 @@ The 50%-class practical capability milestone, measured per category.
   data/scientific ~55%, AI/ML ~50% (introductory foundation), web ~50%
   (small-app/server foundation), GUI ~50% (utility dialogs, not a widget toolkit),
   database ~55%, package ecosystem ~55% (infrastructure, not catalogue size).
-- Seeded packages: vymath, vystats, vyalgo, vycollections, vytext, vytest, vyhello,
-  vyscience, vyml, vydata, vyplot, vyweb, vygui.
+- Seeded packages: kvmath, kvstats, kvalgo, kvcollections, kvtext, kvtest, kvhello,
+  kvscience, kvml, kvdata, kvplot, kvweb, kvgui.
 
 ## 4.0 Sovereign
 
 The 50% independent-ecosystem milestone: roughly half of the previously
-Python-dependent platform categories gained a usable Veyra-owned path.
+Python-dependent platform categories gained a usable Kovrek-owned path.
 
 - Native Windows executable, lexer/parser/AST, bytecode compiler, stack VM,
   user functions and recursion, constants, control flow, lists, maps, indexing,
@@ -265,21 +266,21 @@ Python-dependent platform categories gained a usable Veyra-owned path.
   SHA-256, SQLite.
 - Project tooling: creation, manifests, checking, formatting, test runner,
   distribution builds, disassembly, REPL.
-- Package ecosystem: Veyra-owned registry, search/list, add/remove, vendoring,
+- Package ecosystem: Kovrek-owned registry, search/list, add/remove, vendoring,
   lockfiles, restore/install, local publishing, package-name module resolution,
   seven seeded packages.
 - Editor path switched to the native executable rather than Python.
 
 Verified by running a built distribution with Python absent from `PATH`:
-`Veyra 4.0.0-sovereign`, native package checks passing, `ECOSYSTEM_OK`, exit 0. The
+`Kovrek 4.0.0-sovereign`, native package checks passing, `ECOSYSTEM_OK`, exit 0. The
 package lifecycle was verified end to end (publish → search → add → use by name →
 run → delete vendor → restore → run → build).
 
 ## Convergence runtime (Python path)
 
 The Python compatibility layer carries its own version string, currently
-`3.2.0-convergence`, in both `veyra.py` and `veyra_cli.py`. `veyra_cli.py` imports
-`veyra` explicitly as `legacy` and shells out to `bin/veyra-native.exe` for native
+`3.2.0-convergence`, in both `kovrek.py` and `kovrek_cli.py`. `kovrek_cli.py` imports
+`kovrek` explicitly as `legacy` and shells out to `bin/kovrek-native.exe` for native
 commands.
 
 Measurements recorded against this path while it was the primary runtime:

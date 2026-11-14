@@ -5,4 +5,4 @@ cargo fmt --check
 cargo test
 cargo check --no-default-features
 cargo build --release
-echo "Veyra release checks passed."
+echo "Kovrek release checks passed."

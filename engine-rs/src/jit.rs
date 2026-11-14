@@ -1,4 +1,4 @@
-// Veyra native JIT compiler: translates hot numeric & numeric-list bytecode
+// Kovrek native JIT compiler: translates hot numeric & numeric-list bytecode
 // functions (including inter-function calls and mutual recursion) into
 // in-memory executable x86_64 or ARM64 (aarch64) machine code with W^X memory
 // protection and clean interpreted VM fallback on unsupported ops or guards.
@@ -266,7 +266,7 @@ pub(crate) fn jit_is_enabled() -> bool {
     if !jit_available() {
         return false;
     }
-    if let Ok(val) = std::env::var("VEYRA_JIT") {
+    if let Ok(val) = std::env::var("KOVREK_JIT") {
         let lower = val.trim().to_ascii_lowercase();
         if matches!(lower.as_str(), "0" | "false" | "off" | "no") {
             return false;
@@ -281,7 +281,7 @@ pub(crate) fn jit_set_enabled(enabled: bool) -> bool {
 }
 
 pub(crate) fn jit_warmup_threshold() -> u32 {
-    if let Ok(v) = std::env::var("VEYRA_JIT_THRESHOLD") {
+    if let Ok(v) = std::env::var("KOVREK_JIT_THRESHOLD") {
         if let Ok(n) = v.trim().parse::<u32>() {
             return n.max(1);
         }

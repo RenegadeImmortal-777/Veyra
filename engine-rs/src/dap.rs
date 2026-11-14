@@ -1,7 +1,7 @@
 // Debug Adapter Protocol (DAP) server and VM debug session controller.
 //
 // Communicates over stdio using JSON-RPC `Content-Length` framing when invoked
-// via `veyra dap`, and wires line breakpoints, stepping, stack traces, scopes,
+// via `kovrek dap`, and wires line breakpoints, stepping, stack traces, scopes,
 // variable inspection, and expression evaluation into `Vm`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -756,7 +756,7 @@ impl DebugSession {
                 "id": f.id,
                 "name": f.name,
                 "source": {
-                    "name": f.source.file_name().and_then(|s| s.to_str()).unwrap_or("main.vy"),
+                    "name": f.source.file_name().and_then(|s| s.to_str()).unwrap_or("main.kvr"),
                     "path": f.source.to_string_lossy()
                 },
                 "line": f.line.max(1),

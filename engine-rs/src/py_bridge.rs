@@ -1,8 +1,8 @@
-// Unified Python 3 runtime bridge for Veyra's Horizon engine:
+// Unified Python 3 runtime bridge for Kovrek's Horizon engine:
 // 1. In-process CPython C-API hosting via `libloading` (`python3XX.dll` / `libpython3*.so`)
 //    with GIL management and PEP 3118 `Py_buffer` zero-copy array <-> Tensor exchange.
 // 2. Persistent out-of-process JSON-RPC stdio worker (`PyWorker`) fallback when no shared
-//    libpython library is present or `VEYRA_PYTHON_BRIDGE=subprocess` is requested.
+//    libpython library is present or `KOVREK_PYTHON_BRIDGE=subprocess` is requested.
 
 use std::{
     cell::RefCell,
@@ -331,7 +331,7 @@ fn discover_python_dll() -> Option<(PathBuf, Vec<PathBuf>)> {
     let mut dll_candidates: Vec<PathBuf> = Vec::new();
     let mut site_paths: Vec<PathBuf> = Vec::new();
 
-    if let Ok(explicit) = env::var("VEYRA_PYTHON_DLL") {
+    if let Ok(explicit) = env::var("KOVREK_PYTHON_DLL") {
         let p = PathBuf::from(explicit);
         if p.is_file() {
             dll_candidates.push(p);
@@ -437,7 +437,7 @@ fn inproc_python_result() -> &'static Result<PyCapi, String> {
 
 fn inproc_python() -> Option<&'static PyCapi> {
     if matches!(
-        env::var("VEYRA_PYTHON_BRIDGE").ok().as_deref(),
+        env::var("KOVREK_PYTHON_BRIDGE").ok().as_deref(),
         Some("subprocess")
     ) {
         return None;
@@ -448,13 +448,13 @@ fn inproc_python() -> Option<&'static PyCapi> {
 impl PyCapi {
     /// Initializes CPython once on a persistent host thread so `Py_InitializeEx` and all
     /// `PyThreadState` / C-extension TLS state stay bound to a live thread across arbitrary
-    /// Veyra worker threads.
+    /// Kovrek worker threads.
     fn try_init() -> Result<Self, String> {
         let (tx, rx) = mpsc::sync_channel::<PyHostJob>(0);
         let (init_tx, init_rx) =
             mpsc::sync_channel::<Result<(String, String, Arc<AtomicUsize>), String>>(1);
         std::thread::Builder::new()
-            .name("veyra-cpython-host".to_string())
+            .name("kovrek-cpython-host".to_string())
             .spawn(move || match PyCapiInner::try_init() {
                 Ok(inner) => {
                     let meta = (
@@ -615,7 +615,7 @@ impl PyCapiInner {
             unsafe {
                 init_ex(0);
                 // Release the initial GIL held by the initializing thread so arbitrary
-                // Veyra worker threads (e.g. cargo test threads) can acquire/release it safely.
+                // Kovrek worker threads (e.g. cargo test threads) can acquire/release it safely.
                 let _ = eval_save_thread();
             }
         }
@@ -1049,7 +1049,7 @@ impl PyCapiInner {
         Ok(n)
     }
 
-    /// Converts a Veyra `Val` to a new owned `*mut PyObject`.
+    /// Converts a Kovrek `Val` to a new owned `*mut PyObject`.
     fn val_to_py(&self, val: &Val) -> Result<*mut PyObject, String> {
         if let Some(id) = py_handle_id(val) {
             let ptr = self.lookup_handle(id)?;
@@ -1417,7 +1417,7 @@ impl PyCapiInner {
         let _gil = GilGuard::acquire(self);
         let cexpr = CString::new(expr).map_err(|e| e.to_string())?;
         let code = unsafe {
-            (self.compile_string)(cexpr.as_ptr(), c"<veyra-eval>".as_ptr(), PY_EVAL_INPUT)
+            (self.compile_string)(cexpr.as_ptr(), c"<kovrek-eval>".as_ptr(), PY_EVAL_INPUT)
         };
         if code.is_null() {
             return Err(self.take_error());
@@ -1455,7 +1455,7 @@ impl PyCapiInner {
         let _gil = GilGuard::acquire(self);
         let csrc = CString::new(src).map_err(|e| e.to_string())?;
         let code = unsafe {
-            (self.compile_string)(csrc.as_ptr(), c"<veyra-exec>".as_ptr(), PY_FILE_INPUT)
+            (self.compile_string)(csrc.as_ptr(), c"<kovrek-exec>".as_ptr(), PY_FILE_INPUT)
         };
         if code.is_null() {
             return Err(self.take_error());
@@ -1880,7 +1880,7 @@ impl PyCapiInner {
         }
         let strides: Box<[i64]> = strides_vec.into_boxed_slice();
 
-        let boxed = Box::new(VeyraDlManaged {
+        let boxed = Box::new(KovrekDlManaged {
             managed: DLManagedTensor {
                 dl_tensor: DLTensor {
                     data: data.as_ptr() as *mut c_void,
@@ -1899,7 +1899,7 @@ impl PyCapiInner {
                     byte_offset: 0,
                 },
                 manager_ctx: std::ptr::null_mut(),
-                deleter: Some(veyra_dl_managed_deleter),
+                deleter: Some(kovrek_dl_managed_deleter),
             },
             _data: data,
             _shape: shape,
@@ -1914,17 +1914,18 @@ impl PyCapiInner {
             )
         };
         if cap.is_null() {
-            unsafe { drop(Box::from_raw(raw_managed as *mut VeyraDlManaged)) };
+            unsafe { drop(Box::from_raw(raw_managed as *mut KovrekDlManaged)) };
             return Err(self.take_error());
         }
 
-        // Ensure helper wrapper class `_VeyraDLPack` exists in Python module env dict.
-        let cls_key = unsafe { (self.unicode_from_str)(c"_VeyraDLPack".as_ptr()) };
+        // Ensure helper wrapper class `_KovrekDLPack` exists in Python module env dict.
+        let cls_key = unsafe { (self.unicode_from_str)(c"_KovrekDLPack".as_ptr()) };
         let existing = unsafe { (self.dict_get_item)(self.env_dict, cls_key) };
         if existing.is_null() {
-            let def_src = c"class _VeyraDLPack:\n    def __init__(self, cap):\n        self._cap = cap\n    def __dlpack__(self, stream=None, max_version=None, dl_device=None, copy=None):\n        cap = self._cap\n        if cap is None:\n            raise BufferError('DLPack capsule already consumed')\n        self._cap = None\n        return cap\n    def __dlpack_device__(self):\n        return (1, 0)\n";
-            let code_obj =
-                unsafe { (self.compile_string)(def_src.as_ptr(), c"<veyra-dlpack>".as_ptr(), 257) };
+            let def_src = c"class _KovrekDLPack:\n    def __init__(self, cap):\n        self._cap = cap\n    def __dlpack__(self, stream=None, max_version=None, dl_device=None, copy=None):\n        cap = self._cap\n        if cap is None:\n            raise BufferError('DLPack capsule already consumed')\n        self._cap = None\n        return cap\n    def __dlpack_device__(self):\n        return (1, 0)\n";
+            let code_obj = unsafe {
+                (self.compile_string)(def_src.as_ptr(), c"<kovrek-dlpack>".as_ptr(), 257)
+            };
             if code_obj.is_null() {
                 unsafe {
                     (self.py_dec_ref)(cls_key);
@@ -1947,7 +1948,7 @@ impl PyCapiInner {
         unsafe { (self.py_dec_ref)(cls_key) };
         if cls_obj.is_null() {
             unsafe { (self.py_dec_ref)(cap) };
-            return Err("failed to define _VeyraDLPack helper class".into());
+            return Err("failed to define _KovrekDLPack helper class".into());
         }
         let args = unsafe { (self.tuple_new)(1) };
         unsafe { (self.tuple_set_item)(args, 0, cap) }; // steals ref to `cap`
@@ -2117,16 +2118,16 @@ struct DLManagedTensorVersioned {
 }
 
 #[repr(C)]
-struct VeyraDlManaged {
+struct KovrekDlManaged {
     managed: DLManagedTensor,
     _data: Box<[f64]>,
     _shape: Box<[i64]>,
     _strides: Box<[i64]>,
 }
 
-unsafe extern "C" fn veyra_dl_managed_deleter(ptr: *mut DLManagedTensor) {
+unsafe extern "C" fn kovrek_dl_managed_deleter(ptr: *mut DLManagedTensor) {
     if !ptr.is_null() {
-        unsafe { drop(Box::from_raw(ptr as *mut VeyraDlManaged)) };
+        unsafe { drop(Box::from_raw(ptr as *mut KovrekDlManaged)) };
     }
 }
 
@@ -2417,7 +2418,7 @@ pub(crate) fn py_info_val() -> Val {
     } else if detect_python().is_some() {
         let init_err = match inproc_python_result() {
             Err(e) => e.clone(),
-            Ok(_) => "disabled by VEYRA_PYTHON_BRIDGE=subprocess".into(),
+            Ok(_) => "disabled by KOVREK_PYTHON_BRIDGE=subprocess".into(),
         };
         Val::Map(vec![
             (Val::Str("available".into()), Val::Bool(true)),

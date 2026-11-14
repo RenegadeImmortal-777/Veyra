@@ -218,30 +218,30 @@ fn decode_val(j: &JsonValue) -> Result<Val, String> {
     let t = j
         .get("t")
         .and_then(JsonValue::as_str)
-        .ok_or("vybc: missing value type")?;
+        .ok_or("kvbc: missing value type")?;
     match t {
         "null" => Ok(Val::Null),
         "bool" => Ok(Val::Bool(
             j.get("v")
                 .and_then(JsonValue::as_bool)
-                .ok_or("vybc: invalid bool")?,
+                .ok_or("kvbc: invalid bool")?,
         )),
         "num" => Ok(Val::Num(
             j.get("v")
                 .and_then(JsonValue::as_f64)
-                .ok_or("vybc: invalid num")?,
+                .ok_or("kvbc: invalid num")?,
         )),
         "str" => Ok(Val::Str(
             j.get("v")
                 .and_then(JsonValue::as_str)
-                .ok_or("vybc: invalid str")?
+                .ok_or("kvbc: invalid str")?
                 .to_string(),
         )),
         "list" => {
             let arr = j
                 .get("v")
                 .and_then(JsonValue::as_array)
-                .ok_or("vybc: invalid list")?;
+                .ok_or("kvbc: invalid list")?;
             arr.iter()
                 .map(decode_val)
                 .collect::<Result<Vec<_>, _>>()
@@ -251,12 +251,12 @@ fn decode_val(j: &JsonValue) -> Result<Val, String> {
             let arr = j
                 .get("v")
                 .and_then(JsonValue::as_array)
-                .ok_or("vybc: invalid map")?;
+                .ok_or("kvbc: invalid map")?;
             let mut pairs = Vec::with_capacity(arr.len());
             for item in arr {
-                let pair = item.as_array().ok_or("vybc: invalid map entry")?;
+                let pair = item.as_array().ok_or("kvbc: invalid map entry")?;
                 if pair.len() != 2 {
-                    return Err("vybc: map entry must have 2 elements".into());
+                    return Err("kvbc: map entry must have 2 elements".into());
                 }
                 pairs.push((decode_val(&pair[0])?, decode_val(&pair[1])?));
             }
@@ -265,10 +265,10 @@ fn decode_val(j: &JsonValue) -> Result<Val, String> {
         "fn" => Ok(Val::Function(
             j.get("v")
                 .and_then(JsonValue::as_str)
-                .ok_or("vybc: invalid fn")?
+                .ok_or("kvbc: invalid fn")?
                 .to_string(),
         )),
-        _ => Err(format!("vybc: unsupported value tag '{t}'")),
+        _ => Err(format!("kvbc: unsupported value tag '{t}'")),
     }
 }
 
@@ -356,14 +356,14 @@ fn encode_ops(code: &[Op]) -> JsonValue {
 }
 
 fn decode_params(j: &JsonValue) -> Result<Vec<(String, Option<String>)>, String> {
-    let arr = j.as_array().ok_or("vybc: invalid params")?;
+    let arr = j.as_array().ok_or("kvbc: invalid params")?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         if let Some(pair) = item.as_array() {
             let name = pair
                 .first()
                 .and_then(JsonValue::as_str)
-                .ok_or("vybc: invalid param name")?
+                .ok_or("kvbc: invalid param name")?
                 .to_string();
             let ty = pair
                 .get(1)
@@ -374,7 +374,7 @@ fn decode_params(j: &JsonValue) -> Result<Vec<(String, Option<String>)>, String>
             let name = obj
                 .get("name")
                 .and_then(JsonValue::as_str)
-                .ok_or("vybc: invalid param name")?
+                .ok_or("kvbc: invalid param name")?
                 .to_string();
             let ty = obj
                 .get("type")
@@ -382,7 +382,7 @@ fn decode_params(j: &JsonValue) -> Result<Vec<(String, Option<String>)>, String>
                 .map(ToString::to_string);
             out.push((name, ty));
         } else {
-            return Err("vybc: invalid param pair".into());
+            return Err("kvbc: invalid param pair".into());
         }
     }
     Ok(out)
@@ -395,27 +395,27 @@ fn json_as_usize(v: &JsonValue) -> Option<usize> {
 }
 
 fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
-    let arr = j.as_array().ok_or("vybc: ops must be an array")?;
+    let arr = j.as_array().ok_or("kvbc: ops must be an array")?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let tag = item
             .get("op")
             .and_then(JsonValue::as_str)
-            .ok_or("vybc: missing op tag")?;
+            .ok_or("kvbc: missing op tag")?;
         let op = match tag {
             "Const" => Op::Const(decode_val(
-                item.get("val").ok_or("vybc: Const missing val")?,
+                item.get("val").ok_or("kvbc: Const missing val")?,
             )?),
             "Load" => Op::Load(
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: Load missing name")?
+                    .ok_or("kvbc: Load missing name")?
                     .to_string(),
             ),
             "Define" => Op::Define(
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: Define missing name")?
+                    .ok_or("kvbc: Define missing name")?
                     .to_string(),
                 item.get("const")
                     .and_then(JsonValue::as_bool)
@@ -427,18 +427,18 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
             "Store" => Op::Store(
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: Store missing name")?
+                    .ok_or("kvbc: Store missing name")?
                     .to_string(),
             ),
             "LoadLocal" => Op::LoadLocal(
                 item.get("slot")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: LoadLocal missing slot")?,
+                    .ok_or("kvbc: LoadLocal missing slot")?,
             ),
             "DefineLocal" => Op::DefineLocal(
                 item.get("slot")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: DefineLocal missing slot")?,
+                    .ok_or("kvbc: DefineLocal missing slot")?,
                 item.get("const")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false),
@@ -449,7 +449,7 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
             "StoreLocal" => Op::StoreLocal(
                 item.get("slot")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: StoreLocal missing slot")?,
+                    .ok_or("kvbc: StoreLocal missing slot")?,
             ),
             "Pop" => Op::Pop,
             "Add" => Op::Add,
@@ -471,62 +471,62 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
             "GetMember" => Op::GetMember(
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: GetMember missing name")?
+                    .ok_or("kvbc: GetMember missing name")?
                     .to_string(),
             ),
             "SetMember" => Op::SetMember(
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: SetMember missing name")?
+                    .ok_or("kvbc: SetMember missing name")?
                     .to_string(),
             ),
             "Call" => Op::Call(
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: Call missing name")?
+                    .ok_or("kvbc: Call missing name")?
                     .to_string(),
                 item.get("argc")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: Call missing argc")?,
+                    .ok_or("kvbc: Call missing argc")?,
             ),
             "CallExpr" => Op::CallExpr(
                 item.get("argc")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: CallExpr missing argc")?,
+                    .ok_or("kvbc: CallExpr missing argc")?,
             ),
             "CallMethod" => Op::CallMethod(
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: CallMethod missing name")?
+                    .ok_or("kvbc: CallMethod missing name")?
                     .to_string(),
                 item.get("argc")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: CallMethod missing argc")?,
+                    .ok_or("kvbc: CallMethod missing argc")?,
             ),
             "CallExt" => {
                 let kind = item
                     .get("kind")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: CallExt missing kind")? as u8;
+                    .ok_or("kvbc: CallExt missing kind")? as u8;
                 let name = item
                     .get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: CallExt missing name")?
+                    .ok_or("kvbc: CallExt missing name")?
                     .to_string();
                 let specs_arr = item
                     .get("specs")
                     .and_then(JsonValue::as_array)
-                    .ok_or("vybc: CallExt missing specs")?;
+                    .ok_or("kvbc: CallExt missing specs")?;
                 let mut specs = Vec::with_capacity(specs_arr.len());
                 for s in specs_arr {
-                    let pair = s.as_array().ok_or("vybc: CallExt bad spec")?;
+                    let pair = s.as_array().ok_or("kvbc: CallExt bad spec")?;
                     if pair.len() != 2 {
-                        return Err("vybc: CallExt spec length != 2".into());
+                        return Err("kvbc: CallExt spec length != 2".into());
                     }
-                    let tag = json_as_usize(&pair[0]).ok_or("vybc: CallExt bad tag")? as u8;
+                    let tag = json_as_usize(&pair[0]).ok_or("kvbc: CallExt bad tag")? as u8;
                     let kw = pair[1]
                         .as_str()
-                        .ok_or("vybc: CallExt bad kw name")?
+                        .ok_or("kvbc: CallExt bad kw name")?
                         .to_string();
                     specs.push((tag, kw));
                 }
@@ -535,41 +535,41 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
             "FunctionRef" => Op::FunctionRef(
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: FunctionRef missing name")?
+                    .ok_or("kvbc: FunctionRef missing name")?
                     .to_string(),
             ),
             "Def" => Op::Def(
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: Def missing name")?
+                    .ok_or("kvbc: Def missing name")?
                     .to_string(),
-                decode_params(item.get("params").ok_or("vybc: Def missing params")?)?,
+                decode_params(item.get("params").ok_or("kvbc: Def missing params")?)?,
                 item.get("ret")
                     .and_then(JsonValue::as_str)
                     .map(ToString::to_string),
                 item.get("async")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false),
-                decode_ops(item.get("body").ok_or("vybc: Def missing body")?)?,
+                decode_ops(item.get("body").ok_or("kvbc: Def missing body")?)?,
             ),
             "BuildClass" => {
                 let name = item
                     .get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: BuildClass missing name")?
+                    .ok_or("kvbc: BuildClass missing name")?
                     .to_string();
                 let base_count = item
                     .get("base_count")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: BuildClass missing base_count")?;
-                let body = decode_ops(item.get("body").ok_or("vybc: BuildClass missing body")?)?;
+                    .ok_or("kvbc: BuildClass missing base_count")?;
+                let body = decode_ops(item.get("body").ok_or("kvbc: BuildClass missing body")?)?;
                 Op::BuildClass(name, base_count, body)
             }
             "DefClass" => {
                 let name = item
                     .get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: DefClass missing name")?
+                    .ok_or("kvbc: DefClass missing name")?
                     .to_string();
                 let parent = item
                     .get("parent")
@@ -578,20 +578,20 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
                 let methods_arr = item
                     .get("methods")
                     .and_then(JsonValue::as_array)
-                    .ok_or("vybc: DefClass missing methods")?;
+                    .ok_or("kvbc: DefClass missing methods")?;
                 let mut methods = Vec::with_capacity(methods_arr.len());
                 for m in methods_arr {
                     methods.push((
                         m.get("name")
                             .and_then(JsonValue::as_str)
-                            .ok_or("vybc: method missing name")?
+                            .ok_or("kvbc: method missing name")?
                             .to_string(),
-                        decode_params(m.get("params").ok_or("vybc: method missing params")?)?,
+                        decode_params(m.get("params").ok_or("kvbc: method missing params")?)?,
                         m.get("ret")
                             .and_then(JsonValue::as_str)
                             .map(ToString::to_string),
                         m.get("async").and_then(JsonValue::as_bool).unwrap_or(false),
-                        decode_ops(m.get("body").ok_or("vybc: method missing body")?)?,
+                        decode_ops(m.get("body").ok_or("kvbc: method missing body")?)?,
                     ));
                 }
                 Op::DefClass(name, parent, methods)
@@ -601,10 +601,10 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
             "PushHandler" => Op::PushHandler(
                 item.get("target")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: PushHandler missing target")?,
+                    .ok_or("kvbc: PushHandler missing target")?,
                 item.get("name")
                     .and_then(JsonValue::as_str)
-                    .ok_or("vybc: PushHandler missing name")?
+                    .ok_or("kvbc: PushHandler missing name")?
                     .to_string(),
             ),
             "PopHandler" => Op::PopHandler,
@@ -612,15 +612,15 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
             "JumpIfFalse" => Op::JumpIfFalse(
                 item.get("target")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: JumpIfFalse missing target")?,
+                    .ok_or("kvbc: JumpIfFalse missing target")?,
             ),
             "Jump" => Op::Jump(
                 item.get("target")
                     .and_then(json_as_usize)
-                    .ok_or("vybc: Jump missing target")?,
+                    .ok_or("kvbc: Jump missing target")?,
             ),
             "Halt" => Op::Halt,
-            other => return Err(format!("vybc: unknown opcode '{other}'")),
+            other => return Err(format!("kvbc: unknown opcode '{other}'")),
         };
         out.push(op);
     }
@@ -632,7 +632,7 @@ pub(crate) fn encode_bytecode(code: &[Op]) -> Result<String, String> {
     let canonical_ops = serde_json::to_string(&ops).map_err(|e| e.to_string())?;
     let sha = format!("{:x}", Sha256::digest(canonical_ops.as_bytes()));
     let doc = json!({
-        "format": "veyra-bc-v1",
+        "format": "kovrek-bc-v1",
         "sha256": sha,
         "ops": ops,
     });
@@ -641,24 +641,24 @@ pub(crate) fn encode_bytecode(code: &[Op]) -> Result<String, String> {
 
 pub(crate) fn decode_bytecode(text: &str) -> Result<Vec<Op>, String> {
     let doc: JsonValue =
-        serde_json::from_str(text).map_err(|e| format!("invalid vybc JSON: {e}"))?;
+        serde_json::from_str(text).map_err(|e| format!("invalid kvbc JSON: {e}"))?;
     let fmt = doc
         .get("format")
         .and_then(JsonValue::as_str)
-        .ok_or("vybc: missing format header")?;
-    if fmt != "veyra-bc-v1" {
-        return Err(format!("vybc: unsupported format '{fmt}'"));
+        .ok_or("kvbc: missing format header")?;
+    if fmt != "kovrek-bc-v1" {
+        return Err(format!("kvbc: unsupported format '{fmt}'"));
     }
     let expected_sha = doc
         .get("sha256")
         .and_then(JsonValue::as_str)
-        .ok_or("vybc: missing sha256")?;
-    let ops = doc.get("ops").ok_or("vybc: missing ops array")?;
+        .ok_or("kvbc: missing sha256")?;
+    let ops = doc.get("ops").ok_or("kvbc: missing ops array")?;
     let canonical_ops = serde_json::to_string(ops).map_err(|e| e.to_string())?;
     let actual_sha = format!("{:x}", Sha256::digest(canonical_ops.as_bytes()));
     if actual_sha != expected_sha {
         return Err(format!(
-            "vybc checksum mismatch: expected {expected_sha}, got {actual_sha}"
+            "kvbc checksum mismatch: expected {expected_sha}, got {actual_sha}"
         ));
     }
     decode_ops(ops)

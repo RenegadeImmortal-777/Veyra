@@ -1,11 +1,11 @@
-# Veyra Language Guide
+# Kovrek Language Guide
 
-File extension: .vy
+File extension: .kvr
 
 ## Variables
 
     let age: Int = 20;
-    const name: String = "Veyra";
+    const name: String = "Kovrek";
 
 Built-in types include Int, Float, Number, String, Bool, List, Map, Function, Null and Any.
 
@@ -79,4 +79,4 @@ Built-in types include Int, Float, Number, String, Bool, List, Map, Function, Nu
 
 ## Modules
 
-    use "other.vy";
+    use "other.kvr";

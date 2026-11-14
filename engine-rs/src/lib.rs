@@ -62,7 +62,7 @@ use crate::lsp::{lsp_definition, lsp_diagnostics, lsp_references, lsp_rename};
 use crate::pipeline::compile_source;
 #[cfg(test)]
 use crate::pipeline::compile_source_unoptimized;
-pub use crate::pipeline::{compile_to_vybc, disasm_source, load_source, run_source, run_vybc};
+pub use crate::pipeline::{compile_to_kvbc, disasm_source, load_source, run_kvbc, run_source};
 use crate::project::{build_project, fmt_source, project_entry, project_packages, test_project};
 use crate::registry::{
     pkg_add, pkg_audit, pkg_build_plugin, pkg_info, pkg_install, pkg_keygen, pkg_list, pkg_pack,
@@ -73,16 +73,16 @@ use crate::registry::{
 use crate::runtime::export_function_object;
 #[cfg(test)]
 use crate::server::resolve_static_path;
-use crate::server::{serve_directory, serve_registry, serve_routes, serve_veyra_app};
+use crate::server::{serve_directory, serve_kovrek_app, serve_registry, serve_routes};
 use crate::tooling::{
     ast_file, bench_file, debug_file, doc_file, lint_file, profile_file, symbols_file,
 };
 #[cfg(test)]
 use crate::vm::Vm;
 
-const BUNDLE_MAGIC: &[u8; 8] = b"VEYRABC1";
+const BUNDLE_MAGIC: &[u8; 8] = b"KOVREKBC";
 
-pub fn extract_embedded_vybc(bytes: &[u8]) -> Option<String> {
+pub fn extract_embedded_kvbc(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 16 {
         return None;
     }
@@ -101,7 +101,7 @@ pub fn extract_embedded_vybc(bytes: &[u8]) -> Option<String> {
 
 pub fn bundle_executable(script_path: &Path, out_path: Option<&Path>) -> Result<PathBuf, String> {
     let source = load_source(script_path.to_string_lossy().as_ref())?;
-    let vybc = compile_to_vybc(&source)?;
+    let kvbc = compile_to_kvbc(&source)?;
     let exe_path = env::current_exe().map_err(|e| e.to_string())?;
     let mut base_bytes = fs::read(&exe_path).map_err(|e| e.to_string())?;
     if base_bytes.len() >= 16 && &base_bytes[base_bytes.len() - 8..] == BUNDLE_MAGIC {
@@ -113,7 +113,7 @@ pub fn bundle_executable(script_path: &Path, out_path: Option<&Path>) -> Result<
             }
         }
     }
-    let payload = vybc.as_bytes();
+    let payload = kvbc.as_bytes();
     base_bytes.extend_from_slice(payload);
     base_bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     base_bytes.extend_from_slice(BUNDLE_MAGIC);
@@ -123,7 +123,7 @@ pub fn bundle_executable(script_path: &Path, out_path: Option<&Path>) -> Result<
             let stem = script_path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("veyra-app");
+                .unwrap_or("kovrek-app");
             if cfg!(windows) {
                 script_path.with_file_name(format!("{stem}.exe"))
             } else {
@@ -147,11 +147,11 @@ pub fn bundle_executable(script_path: &Path, out_path: Option<&Path>) -> Result<
 pub fn run_cli() -> ExitCode {
     if let Ok(exe) = env::current_exe() {
         if let Ok(bytes) = fs::read(&exe) {
-            if let Some(embedded_vybc) = extract_embedded_vybc(&bytes) {
-                return match run_vybc(&embedded_vybc) {
+            if let Some(embedded_kvbc) = extract_embedded_kvbc(&bytes) {
+                return match run_kvbc(&embedded_kvbc) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
-                        eprintln!("veyra: {e}");
+                        eprintln!("kovrek: {e}");
                         ExitCode::FAILURE
                     }
                 };
@@ -161,13 +161,13 @@ pub fn run_cli() -> ExitCode {
     let a: Vec<String> = env::args().collect();
     let r: Result<(), String> = match a.get(1).map(String::as_str) {
         Some("--version") | Some("version") => {
-            println!("Veyra {VERSION}");
+            println!("Kovrek {VERSION}");
             Ok(())
         }
         Some("bundle") => {
             let script = a
                 .get(2)
-                .ok_or("usage: veyra bundle <script.vy> [output]".to_string());
+                .ok_or("usage: kovrek bundle <script.kvr> [output]".to_string());
             script.and_then(|s| {
                 let out = a.get(3).map(Path::new);
                 let built = bundle_executable(Path::new(s), out)?;
@@ -228,7 +228,7 @@ pub fn run_cli() -> ExitCode {
                 let dir = a
                     .get(3)
                     .map(PathBuf::from)
-                    .unwrap_or_else(crate::project::veyra_home);
+                    .unwrap_or_else(crate::project::kovrek_home);
                 let port = a.get(4).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8787);
                 serve_registry(&dir, port)
             }
@@ -245,7 +245,7 @@ pub fn run_cli() -> ExitCode {
                 .ok_or("missing package name".into())
                 .and_then(|n| pkg_remove(n)),
             _ => Err(
-                "usage: veyra pkg <list|search|info|tree|installed|install|update|publish|keygen|sign|verify|pack|unpack|build-plugin|py-bridge|serve|add|remove> [args]"
+                "usage: kovrek pkg <list|search|info|tree|installed|install|update|publish|keygen|sign|verify|pack|unpack|build-plugin|py-bridge|serve|add|remove> [args]"
                     .into(),
             ),
         },
@@ -324,7 +324,7 @@ pub fn run_cli() -> ExitCode {
                     file_arg = Some(PathBuf::from(&a[idx]));
                     idx += 1;
                 } else {
-                    return Err("usage: veyra run [--caps cap1,cap2] [file.vy]".into());
+                    return Err("usage: kovrek run [--caps cap1,cap2] [file.kvr]".into());
                 }
             }
             let p = match file_arg {
@@ -334,7 +334,7 @@ pub fn run_cli() -> ExitCode {
             let manifest_caps: Option<Vec<String>> = caps_arg.or_else(|| {
                 let cwd = env::current_dir().ok()?;
                 let root = crate::project::project_root(&cwd).ok()?;
-                let txt = fs::read_to_string(root.join("veyra.json")).ok()?;
+                let txt = fs::read_to_string(root.join("kovrek.json")).ok()?;
                 let j: serde_json::Value = serde_json::from_str(&txt).ok()?;
                 let arr = j.get("capabilities")?.as_array()?;
                 Some(
@@ -344,9 +344,9 @@ pub fn run_cli() -> ExitCode {
                 )
             });
             let exec = || {
-                if p.extension().and_then(|e| e.to_str()) == Some("vybc") {
+                if p.extension().and_then(|e| e.to_str()) == Some("kvbc") {
                     let bc = fs::read_to_string(&p).map_err(|e| e.to_string())?;
-                    run_vybc(&bc)
+                    run_kvbc(&bc)
                 } else {
                     load_source(p.to_string_lossy().as_ref()).and_then(|s| run_source(&s))
                 }
@@ -439,7 +439,7 @@ pub fn run_cli() -> ExitCode {
                     output_arg = Some(PathBuf::from(&a[idx]));
                     idx += 1;
                 } else {
-                    return Err("usage: veyra aot [--direct] [--elf|--pe] [file.vy] [out_exe]".into());
+                    return Err("usage: kovrek aot [--direct] [--elf|--pe] [file.kvr] [out_exe]".into());
                 }
             }
             let input = match input_arg {
@@ -496,7 +496,7 @@ pub fn run_cli() -> ExitCode {
                         input_arg = Some(PathBuf::from(&a[idx]));
                         idx += 1;
                     }
-                    _ => return Err("usage: veyra wasm [--wasi] <file.vy> [-o out.wasm] [--disasm] [--run <fn> [args...]]".into()),
+                    _ => return Err("usage: kovrek wasm [--wasi] <file.kvr> [-o out.wasm] [--disasm] [--run <fn> [args...]]".into()),
                 }
             }
             let input = match input_arg {
@@ -561,8 +561,8 @@ pub fn run_cli() -> ExitCode {
         Some("ffi") => (|| -> Result<(), String> {
             match a.get(2).map(String::as_str) {
                 Some("bindgen") => {
-                    let header_path = a.get(3).ok_or("usage: veyra ffi bindgen <header.h> <lib_path> [-o out.vy]")?;
-                    let lib_path = a.get(4).ok_or("usage: veyra ffi bindgen <header.h> <lib_path> [-o out.vy]")?;
+                    let header_path = a.get(3).ok_or("usage: kovrek ffi bindgen <header.h> <lib_path> [-o out.kvr]")?;
+                    let lib_path = a.get(4).ok_or("usage: kovrek ffi bindgen <header.h> <lib_path> [-o out.kvr]")?;
                     let out_path = if a.get(5).map(String::as_str) == Some("-o") {
                         Some(a.get(6).ok_or("missing path after -o")?.clone())
                     } else {
@@ -578,7 +578,7 @@ pub fn run_cli() -> ExitCode {
                     }
                     Ok(())
                 }
-                _ => Err("usage: veyra ffi bindgen <header.h> <lib_path> [-o out.vy]".into()),
+                _ => Err("usage: kovrek ffi bindgen <header.h> <lib_path> [-o out.kvr]".into()),
             }
         })(),
         Some("web") => a.get(2).ok_or("missing routes.json".into()).and_then(|p| {
@@ -586,12 +586,12 @@ pub fn run_cli() -> ExitCode {
             serve_routes(Path::new(p), port)
         }),
         Some("app") => {
-            let app = a.get(2).ok_or("missing app.vy".into());
+            let app = a.get(2).ok_or("missing app.kvr".into());
             let routes = a.get(3).ok_or("missing routes.json".into());
             match (app, routes) {
                 (Ok(app), Ok(routes)) => {
                     let port = a.get(4).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8080);
-                    serve_veyra_app(Path::new(app), Path::new(routes), port)
+                    serve_kovrek_app(Path::new(app), Path::new(routes), port)
                 }
                 (Err(e), _) | (_, Err(e)) => Err(e),
             }
@@ -608,12 +608,12 @@ pub fn run_cli() -> ExitCode {
             let s = fs::read_to_string(p).map_err(|e| e.to_string())?;
             fs::write(p, fmt_source(&s)).map_err(|e| e.to_string())
         }),
-        Some(x) if x.ends_with(".vy") => fs::read_to_string(x)
+        Some(x) if x.ends_with(".kvr") => fs::read_to_string(x)
             .map_err(|e| e.to_string())
             .and_then(|s| run_source(&s)),
-        Some(x) if x.ends_with(".vybc") => fs::read_to_string(x)
+        Some(x) if x.ends_with(".kvbc") => fs::read_to_string(x)
             .map_err(|e| e.to_string())
-            .and_then(|s| run_vybc(&s)),
+            .and_then(|s| run_kvbc(&s)),
         _ => {
             usage();
             Ok(())
@@ -622,7 +622,7 @@ pub fn run_cli() -> ExitCode {
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("veyra: {e}");
+            eprintln!("kovrek: {e}");
             ExitCode::FAILURE
         }
     }
@@ -682,12 +682,12 @@ mod tests {
     #[test]
     fn native_json_regex_hash() {
         assert!(run_source(
-            "let j=json_parse(\"{\\\"a\\\":7}\"); let x=get(j,\"a\"); let m=regex_findall(\"[0-9]+\",\"a12b34\"); let h=sha256(\"veyra\");"
+            "let j=json_parse(\"{\\\"a\\\":7}\"); let x=get(j,\"a\"); let m=regex_findall(\"[0-9]+\",\"a12b34\"); let h=sha256(\"kovrek\");"
         ).is_ok());
     }
     #[test]
     fn native_file_io() {
-        let p = env::temp_dir().join("veyra_native_io_test.txt");
+        let p = env::temp_dir().join("kovrek_native_io_test.txt");
         let s = format!(
             "write_file(\"{}\",\"hello\"); let x=read_file(\"{}\");",
             p.to_string_lossy().replace('\\', "\\\\"),
@@ -710,7 +710,7 @@ mod tests {
     }
     #[test]
     fn native_csv() {
-        let p = env::temp_dir().join("veyra_native_data.csv");
+        let p = env::temp_dir().join("kovrek_native_data.csv");
         fs::write(&p, "x,y\n1,2\n3,4\n").unwrap();
         let s = format!(
             "let rows=csv_read(\"{}\"); let x=rows[0][\"x\"];",
@@ -721,7 +721,7 @@ mod tests {
     }
     #[test]
     fn native_table_plot() {
-        let p = env::temp_dir().join("veyra_native_plot.svg");
+        let p = env::temp_dir().join("kovrek_native_plot.svg");
         let s = format!(
             "let rows=[{{\"x\":1,\"g\":\"a\"}},{{\"x\":3,\"g\":\"b\"}}]; let c=table_column(rows,\"x\"); let d=table_describe(rows,\"x\"); let f=table_filter_eq(rows,\"g\",\"a\"); plot_svg(\"{}\",[1,2,3],[2,4,3]);",
             p.to_string_lossy().replace('\\', "\\\\")
@@ -853,15 +853,15 @@ mod tests {
     #[test]
     fn lsp_navigation_helpers() {
         let src = "fn add(x: Int)->Int{return x+1;} let y=add(4); let z=add(y);";
-        let def = lsp_definition(src, "file:///test.vy", "add");
+        let def = lsp_definition(src, "file:///test.kvr", "add");
         assert!(!def.is_null());
-        let refs = lsp_references(src, "file:///test.vy", "add");
+        let refs = lsp_references(src, "file:///test.kvr", "add");
         assert!(refs.as_array().map(|x| x.len()).unwrap_or(0) >= 3);
     }
     #[test]
     fn grouped_data_and_plotting() {
-        let scatter = env::temp_dir().join("veyra_scatter.svg");
-        let bars = env::temp_dir().join("veyra_bars.svg");
+        let scatter = env::temp_dir().join("kovrek_scatter.svg");
+        let bars = env::temp_dir().join("kovrek_bars.svg");
         let src = format!(
             "let rows=[{{\"g\":\"a\",\"x\":1}},{{\"g\":\"a\",\"x\":3}},{{\"g\":\"b\",\"x\":4}}]; let sums=table_group_sum(rows,\"g\",\"x\"); let means=table_group_mean(rows,\"g\",\"x\"); let h=histogram([1,1,2,3,4,4],3); scatter_svg(\"{}\",[1,2,3],[3,2,5]); bar_svg(\"{}\",[\"a\",\"b\"],[4,5]);",
             scatter.to_string_lossy().replace('\\', "\\\\"),
@@ -919,7 +919,7 @@ mod tests {
     }
     #[test]
     fn path_and_text_services() {
-        let src = "assert(starts_with(\"veyra\",\"vey\")); assert(ends_with(\"veyra\",\"yra\")); assert(replace_text(\"a-b\",\"-\",\"+\")==\"a+b\"); let p=path_join(\"a\",\"b.txt\"); assert(path_name(p)==\"b.txt\"); assert(path_extension(p)==\"txt\");";
+        let src = "assert(starts_with(\"kovrek\",\"kov\")); assert(ends_with(\"kovrek\",\"rek\")); assert(replace_text(\"a-b\",\"-\",\"+\")==\"a+b\"); let p=path_join(\"a\",\"b.txt\"); assert(path_name(p)==\"b.txt\"); assert(path_extension(p)==\"txt\");";
         assert!(run_source(src).is_ok());
     }
     #[test]
@@ -965,7 +965,7 @@ mod tests {
     }
     #[test]
     fn tensor_serialization_round_trip() {
-        let path = env::temp_dir().join("veyra_tensor_round_trip.json");
+        let path = env::temp_dir().join("kovrek_tensor_round_trip.json");
         let escaped = path.to_string_lossy().replace('\\', "\\\\");
         let src = format!(
             "let x=tensor([[1,2],[3,4]],true); tensor_save(x,\"{escaped}\"); let y=tensor_load(\"{escaped}\"); let sh=tensor_shape(y); let v=tensor_values(y); assert(sh[0]==2 and sh[1]==2); assert(v[0]==1 and v[3]==4);"
@@ -981,10 +981,10 @@ mod tests {
     #[test]
     fn lsp_rename_helper() {
         let src = "fn add(x:Int)->Int{return x+1;} let a=add(1); let b=add(a);";
-        let edit = lsp_rename(src, "file:///test.vy", "add", "increment");
+        let edit = lsp_rename(src, "file:///test.kvr", "add", "increment");
         let changes = edit
             .get("changes")
-            .and_then(|x| x.get("file:///test.vy"))
+            .and_then(|x| x.get("file:///test.kvr"))
             .and_then(JsonValue::as_array)
             .map(|x| x.len())
             .unwrap_or(0);
@@ -998,17 +998,17 @@ mod tests {
     #[cfg(feature = "native-services")]
     #[test]
     fn sqlite_parameter_binding() {
-        let db = env::temp_dir().join("veyra_params_test.sqlite");
+        let db = env::temp_dir().join("kovrek_params_test.sqlite");
         let escaped = db.to_string_lossy().replace('\\', "\\\\");
         let src = format!(
-            "sqlite_exec(\"{escaped}\",\"CREATE TABLE IF NOT EXISTS items(id INTEGER,name TEXT)\"); sqlite_exec(\"{escaped}\",\"DELETE FROM items\"); sqlite_exec_params(\"{escaped}\",\"INSERT INTO items(id,name) VALUES (?,?)\",[7,\"veyra\"]); let rows=sqlite_query_params(\"{escaped}\",\"SELECT id,name FROM items WHERE id=?\",[7]); assert(len(rows)==1); assert(rows[0][\"name\"]==\"veyra\");"
+            "sqlite_exec(\"{escaped}\",\"CREATE TABLE IF NOT EXISTS items(id INTEGER,name TEXT)\"); sqlite_exec(\"{escaped}\",\"DELETE FROM items\"); sqlite_exec_params(\"{escaped}\",\"INSERT INTO items(id,name) VALUES (?,?)\",[7,\"kovrek\"]); let rows=sqlite_query_params(\"{escaped}\",\"SELECT id,name FROM items WHERE id=?\",[7]); assert(len(rows)==1); assert(rows[0][\"name\"]==\"kovrek\");"
         );
         assert!(run_source(&src).is_ok());
         let _ = fs::remove_file(db);
     }
     #[test]
     fn static_server_rejects_path_traversal() {
-        let root = env::temp_dir().join("veyra_static_traversal_test");
+        let root = env::temp_dir().join("kovrek_static_traversal_test");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let index = root.join("index.html");
@@ -1021,20 +1021,20 @@ mod tests {
     }
     #[test]
     fn use_preserves_trailing_statements_on_same_line() {
-        let dir = env::temp_dir().join("veyra_inline_use_test");
+        let dir = env::temp_dir().join("kovrek_inline_use_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let mod_a = dir.join("a.vy");
-        let mod_b = dir.join("b.vy");
-        let main_vy = dir.join("main.vy");
+        let mod_a = dir.join("a.kvr");
+        let mod_b = dir.join("b.kvr");
+        let main_kvr = dir.join("main.kvr");
         fs::write(&mod_a, "fn fa() -> Int { return 10; }").unwrap();
         fs::write(&mod_b, "fn fb() -> Int { return 20; }").unwrap();
         fs::write(
-            &main_vy,
-            "use \"a.vy\"; use \"b.vy\"; assert(fa() + fb() == 30);",
+            &main_kvr,
+            "use \"a.kvr\"; use \"b.kvr\"; assert(fa() + fb() == 30);",
         )
         .unwrap();
-        let loaded = load_source(main_vy.to_string_lossy().as_ref()).unwrap();
+        let loaded = load_source(main_kvr.to_string_lossy().as_ref()).unwrap();
         assert!(loaded.contains("assert(fa() + fb() == 30);"));
         assert!(run_source(&loaded).is_ok());
         let _ = fs::remove_dir_all(&dir);
@@ -1159,10 +1159,10 @@ mod tests {
     fn bytecode_optimizer_folds_constants_and_preserves_semantics() {
         let src = "
             let x = 2 + 3 * 4 + 2 ** 3;
-            let s = 'vey' + 'ra';
+            let s = 'kov' + 'rek';
             let ok = (10 > 5) and (not false);
             assert(x == 22);
-            assert(s == 'veyra');
+            assert(s == 'kovrek');
             assert(ok == true);
         ";
         let unopt = compile_source_unoptimized(src).unwrap();
@@ -1249,7 +1249,7 @@ mod tests {
         assert!(run_source(src).is_ok());
     }
     #[test]
-    fn vybc_round_trip_and_checksum_tamper_detection() {
+    fn kvbc_round_trip_and_checksum_tamper_detection() {
         let src = "
             fn square(n: Int) -> Int { return n * n; }
             let total = 0;
@@ -1258,40 +1258,40 @@ mod tests {
             }
             assert(total == 30);
         ";
-        let vybc = compile_to_vybc(src).unwrap();
-        assert!(run_vybc(&vybc).is_ok());
-        let tampered = vybc.replace("\"Add\"", "\"Sub\"");
-        assert!(run_vybc(&tampered).is_err());
+        let kvbc = compile_to_kvbc(src).unwrap();
+        assert!(run_kvbc(&kvbc).is_ok());
+        let tampered = kvbc.replace("\"Add\"", "\"Sub\"");
+        assert!(run_kvbc(&tampered).is_err());
     }
     #[test]
     fn self_hosted_compiler_three_stage_fixpoint() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let compiler_path = root.join("compiler-vy").join("src").join("main.vy");
+        let compiler_path = root.join("compiler-kvr").join("src").join("main.kvr");
         let compiler_src = fs::read_to_string(&compiler_path).unwrap();
-        assert!(!compiler_src.contains("vybc_compile"));
+        assert!(!compiler_src.contains("kvbc_compile"));
 
-        // Stage 0 (Rust Horizon engine) compiles compiler-vy into stage1.vybc
-        let stage1_vybc = compile_to_vybc(&compiler_src).unwrap();
-        assert!(run_vybc(&stage1_vybc).is_ok());
+        // Stage 0 (Rust Horizon engine) compiles compiler-kvr into stage1.kvbc
+        let stage1_kvbc = compile_to_kvbc(&compiler_src).unwrap();
+        assert!(run_kvbc(&stage1_kvbc).is_ok());
 
-        // Stage 1 executes compiler-vy to compile a full Veyra program (functions, loops, branches, lists, maps)
-        // into .vybc AND compiles compiler-vy itself (Stage 1 -> Stage 2) and then runs Stage 2 to compile
-        // compiler-vy again (Stage 2 -> Stage 3), verifying Stage 2 == Stage 3 fixpoint equality.
+        // Stage 1 executes compiler-kvr to compile a full Kovrek program (functions, loops, branches, lists, maps)
+        // into .kvbc AND compiles compiler-kvr itself (Stage 1 -> Stage 2) and then runs Stage 2 to compile
+        // compiler-kvr again (Stage 2 -> Stage 3), verifying Stage 2 == Stage 3 fixpoint equality.
         let compiler_path_str = compiler_path.to_string_lossy().replace('\\', "/");
         let stage3_tmp = std::env::temp_dir()
-            .join("veyra_stage3_fixpoint.vybc")
+            .join("kovrek_stage3_fixpoint.kvbc")
             .to_string_lossy()
             .replace('\\', "/");
         let driver = format!(
             "{compiler_src}\n\
             let prog = \"fn fib(n: Int) -> Int {{ if n <= 1 {{ return n; }} return fib(n - 1) + fib(n - 2); }} let acc = 0; for x in [1, 2, 3, 4, 5, 6] {{ acc += fib(x); }} let m = {{\\\"sum\\\": acc}}; assert(m[\\\"sum\\\"] == 20);\";\n\
-            let target_bc = compile_veyra_to_vybc(prog);\n\
-            vybc_run(target_bc);\n\
+            let target_bc = compile_kovrek_to_kvbc(prog);\n\
+            kvbc_run(target_bc);\n\
             let self_src = read_file(\"{compiler_path_str}\");\n\
             let stage2_bc = bootstrap_compile_self(self_src);\n\
             let stage2_driver = self_src + \"\\nlet s = read_file(\\\"{compiler_path_str}\\\");\\nlet stage3_bc = bootstrap_compile_self(s);\\nwrite_file(\\\"{stage3_tmp}\\\", stage3_bc);\\n\";\n\
-            let stage2_runner_bc = compile_veyra_to_vybc(stage2_driver);\n\
-            vybc_run(stage2_runner_bc);\n\
+            let stage2_runner_bc = compile_kovrek_to_kvbc(stage2_driver);\n\
+            kvbc_run(stage2_runner_bc);\n\
             let stage3_bc = read_file(\"{stage3_tmp}\");\n\
             assert(stage2_bc == stage3_bc);\n\
             assert(sha256(stage2_bc) == sha256(stage3_bc));\n"
@@ -1320,10 +1320,10 @@ mod tests {
     fn python_parity_fstrings_slicing_methods_and_destructuring() {
         let src = r#"
             # 1. F-strings & expressions inside interpolation
-            let name = "veyra"
+            let name = "kovrek"
             let score = 95
             let greeting = f"Hello {name.upper()}, score={score + 5}!"
-            assert(greeting == "Hello VEYRA, score=100!")
+            assert(greeting == "Hello KOVREK, score=100!")
 
             # 2. Negative indexing & Python slicing [start:stop:step]
             let nums = [10, 20, 30, 40, 50]
@@ -1448,14 +1448,14 @@ mod tests {
     }
     #[test]
     fn standalone_bundle_round_trip() {
-        let payload = compile_to_vybc("let x = 40 + 2; assert(x == 42);").unwrap();
+        let payload = compile_to_kvbc("let x = 40 + 2; assert(x == 42);").unwrap();
         let mut fake_exe = b"MZ_FAKE_PE_HEADER".to_vec();
         fake_exe.extend_from_slice(payload.as_bytes());
         fake_exe.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         fake_exe.extend_from_slice(BUNDLE_MAGIC);
-        let extracted = extract_embedded_vybc(&fake_exe).expect("should extract embedded vybc");
+        let extracted = extract_embedded_kvbc(&fake_exe).expect("should extract embedded kvbc");
         assert_eq!(extracted, payload);
-        assert!(run_vybc(&extracted).is_ok());
+        assert!(run_kvbc(&extracted).is_ok());
     }
     #[test]
     fn ml_layers_forward_and_autograd() {
@@ -1549,7 +1549,7 @@ mod tests {
     }
     #[test]
     fn ml_checkpoint_save_and_load() {
-        let path = env::temp_dir().join("veyra_ml_checkpoint_test.json");
+        let path = env::temp_dir().join("kovrek_ml_checkpoint_test.json");
         let escaped = path.to_string_lossy().replace('\\', "\\\\");
         let src = format!(
             r#"
@@ -1572,7 +1572,7 @@ mod tests {
     fn lsp_async_fn_definition_and_completion_include_ml() {
         let src =
             "async fn fetch_data(x: Int) -> Int {\n    return x + 1;\n}\nlet y = fetch_data(2);";
-        let def = lsp_definition(src, "file:///test.vy", "fetch_data");
+        let def = lsp_definition(src, "file:///test.kvr", "fetch_data");
         assert_eq!(
             def.pointer("/range/start/line").and_then(|v| v.as_u64()),
             Some(0)
@@ -1638,7 +1638,7 @@ mod tests {
             }
         }
 
-        let prog = env::temp_dir().join("veyra_dap_test.vy");
+        let prog = env::temp_dir().join("kovrek_dap_test.kvr");
         fs::write(
             &prog,
             "fn add_step(x, y) {\n    let z = x + y;\n    return z * 2;\n}\nlet a = 3;\nlet b = 4;\nlet res = add_step(a, b);\nprint(\"res\", res);\nassert(res == 14);\n",
@@ -1717,7 +1717,7 @@ mod tests {
             }
         }
 
-        send_req("initialize", serde_json::json!({"adapterID": "veyra"}));
+        send_req("initialize", serde_json::json!({"adapterID": "kovrek"}));
         let _ = recv_resp(&mut client_reader, &mut events, "initialize");
         let _ = wait_event(&mut client_reader, &mut events, "initialized");
 
@@ -1890,7 +1890,7 @@ mod tests {
     }
 
     #[test]
-    fn phase3b_flat_frames_indexed_locals_and_vybc_roundtrip() {
+    fn phase3b_flat_frames_indexed_locals_and_kvbc_roundtrip() {
         let src = r#"
 fn recurse(n: Int) -> Int {
     if n <= 0 {
@@ -1949,8 +1949,8 @@ assert(sum_loop(100) == 4950);
 "#;
         assert_eq!(run_source(src), Ok(()));
 
-        let vybc = compile_to_vybc(src).unwrap();
-        let decoded = crate::bytecode::decode_bytecode(&vybc).unwrap();
+        let kvbc = compile_to_kvbc(src).unwrap();
+        let decoded = crate::bytecode::decode_bytecode(&kvbc).unwrap();
         let mut saw_local_op = false;
         for op in &decoded {
             if let Op::Def(_, _, _, _, body) = op {
@@ -1963,7 +1963,7 @@ assert(sum_loop(100) == 4950);
             }
         }
         assert!(saw_local_op);
-        assert_eq!(run_vybc(&vybc), Ok(()));
+        assert_eq!(run_kvbc(&kvbc), Ok(()));
     }
 
     #[test]
@@ -2111,9 +2111,9 @@ print("AOT_OUT", res);
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("veyra_aot_test_{stamp}"));
+        let dir = env::temp_dir().join(format!("kovrek_aot_test_{stamp}"));
         fs::create_dir_all(&dir).unwrap();
-        let src_path = dir.join("prog.vy");
+        let src_path = dir.join("prog.kvr");
         let exe_path = dir.join(if cfg!(target_os = "windows") {
             "prog.exe"
         } else {
@@ -2143,12 +2143,12 @@ print("AOT_OUT", res);
         let proj_dir = dir.join("proj");
         fs::create_dir_all(proj_dir.join("src")).unwrap();
         fs::write(
-            proj_dir.join("veyra.json"),
-            r#"{"name":"sample","version":"0.1.0","entry":"src/main.vy"}"#,
+            proj_dir.join("kovrek.json"),
+            r#"{"name":"sample","version":"0.1.0","entry":"src/main.kvr"}"#,
         )
         .unwrap();
         fs::write(
-            proj_dir.join("src/main.vy"),
+            proj_dir.join("src/main.kvr"),
             "fn sq(x: Int) -> Int { return x * x; }\nprint(\"PROJ\", sq(9));\n",
         )
         .unwrap();
@@ -2306,8 +2306,8 @@ cnt["w"] = 7;
 assert(cnt["w"] == 7);
 assert(cnt.most_common(1)[0][0] == "w" or cnt.most_common(1)[0][0] == "x");
 
-py_exec("class VyTestBox:\n    def __init__(self, v):\n        self.v = v\n    def bump(self, delta=1):\n        return self.v + delta\n");
-let box = py_eval("VyTestBox(10)");
+py_exec("class KvTestBox:\n    def __init__(self, v):\n        self.v = v\n    def bump(self, delta=1):\n        return self.v + delta\n");
+let box = py_eval("KvTestBox(10)");
 assert(box.v == 10);
 box.v = 25;
 assert(box.v == 25);
@@ -2362,9 +2362,9 @@ assert(py_free(th));
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("veyra_use_py_{stamp}"));
+        let dir = env::temp_dir().join(format!("kovrek_use_py_{stamp}"));
         fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("main.vy");
+        let script = dir.join("main.kvr");
         fs::write(
             &script,
             r#"use "py:math";
@@ -2459,14 +2459,14 @@ print("PARITY_OUT", async_vals, aw_res, make_mul(4)(5), (lambda z: z + 1)(41), g
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("veyra_parity_aot_{stamp}"));
+        let dir = env::temp_dir().join(format!("kovrek_parity_aot_{stamp}"));
         fs::create_dir_all(&dir).unwrap();
         let exe_path = dir.join(if cfg!(target_os = "windows") {
             "parity.exe"
         } else {
             "parity"
         });
-        let src_path = dir.join("parity.vy");
+        let src_path = dir.join("parity.kvr");
         fs::write(&src_path, src).unwrap();
 
         let built = crate::aot::compile_file_to_native(&src_path, Some(&exe_path)).unwrap();
@@ -2937,22 +2937,22 @@ assert(gpu_set_backend("auto") == "auto");
         );
         assert_eq!(run_source(&src), Ok(()));
 
-        // Also test vygpu package wrapper end-to-end via run_file
+        // Also test kvgpu package wrapper end-to-end via run_file
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let vygpu_vy = repo_root
+        let kvgpu_kvr = repo_root
             .join("packages")
-            .join("vygpu")
-            .join("vygpu.vy")
+            .join("kvgpu")
+            .join("kvgpu.kvr")
             .to_string_lossy()
             .replace('\\', "/");
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let tmp_vy = env::temp_dir().join(format!("veyra_vygpu_pkg_{stamp}.vy"));
+        let tmp_kvr = env::temp_dir().join(format!("kovrek_vygpu_pkg_{stamp}.kvr"));
         let pkg_src = format!(
             r#"
-use "{vygpu_vy}";
+use "{kvgpu_kvr}";
 let b = backends();
 assert(len(b) >= 1);
 let g = gelu([0.0, 1.0]);
@@ -2962,20 +2962,20 @@ assert(abs(ln[0][1]) < 0.001);
 assert(precision() == "f32");
 "#
         );
-        fs::write(&tmp_vy, pkg_src).unwrap();
-        let loaded = load_source(tmp_vy.to_string_lossy().as_ref());
-        let _ = fs::remove_file(&tmp_vy);
+        fs::write(&tmp_kvr, pkg_src).unwrap();
+        let loaded = load_source(tmp_kvr.to_string_lossy().as_ref());
+        let _ = fs::remove_file(&tmp_kvr);
         let res = loaded.and_then(|s| run_source(&s));
         assert_eq!(res, Ok(()));
     }
 
     #[test]
-    fn native_veyra_plugin_abi_and_package_import() {
+    fn native_kovrek_plugin_abi_and_package_import() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("veyra_plugin_test_{stamp}"));
+        let dir = env::temp_dir().join(format!("kovrek_plugin_test_{stamp}"));
         let proj = dir.join("proj");
         let pkg_dir = proj.join("vendor").join("nmath");
         fs::create_dir_all(proj.join("src")).unwrap();
@@ -2988,17 +2988,17 @@ use std::os::raw::c_char;
 static MANIFEST: &[u8] = b"{\"abi_version\":1,\"name\":\"nmath\",\"version\":\"0.1.0\",\"functions\":[{\"name\":\"vadd_f64\",\"symbol\":\"vadd_f64\",\"kind\":\"f64\",\"arity\":2},{\"name\":\"vscale_slice\",\"symbol\":\"vscale_slice\",\"kind\":\"f64_slice\",\"arity\":1},{\"name\":\"vgreet_json\",\"symbol\":\"vgreet_json\",\"kind\":\"json\",\"arity\":1}]}\0";
 
 #[no_mangle]
-pub extern "C" fn veyra_plugin_abi_version() -> u32 {
+pub extern "C" fn kovrek_plugin_abi_version() -> u32 {
     1
 }
 
 #[no_mangle]
-pub extern "C" fn veyra_plugin_manifest() -> *const c_char {
+pub extern "C" fn kovrek_plugin_manifest() -> *const c_char {
     MANIFEST.as_ptr() as *const c_char
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn veyra_plugin_free(ptr: *mut c_char) {
+pub unsafe extern "C" fn kovrek_plugin_free(ptr: *mut c_char) {
     if !ptr.is_null() {
         drop(unsafe { CString::from_raw(ptr) });
     }
@@ -3045,7 +3045,7 @@ assert(abs(s - 42.0) < 0.00001);
 let sc = plugin_call(p["id"], "vscale_slice", [[2.0, 4.0, 6.0]]);
 assert(abs(sc[0] - 5.0) < 0.00001);
 assert(abs(sc[2] - 15.0) < 0.00001);
-let gr = plugin_call(p["id"], "vgreet_json", ["veyra"]);
+let gr = plugin_call(p["id"], "vgreet_json", ["kovrek"]);
 assert(starts_with(gr, "plugin-ok:"));
 assert(len(plugin_list()) >= 1);
 "#,
@@ -3054,18 +3054,18 @@ assert(len(plugin_list()) >= 1);
         assert_eq!(run_source(&direct_src), Ok(()));
 
         fs::write(
-            proj.join("veyra.json"),
-            r#"{"name":"plugapp","version":"0.1.0","entry":"src/main.vy","packages":{"nmath":{"version":"0.1.0","entry":"nmath.vy"}}}"#,
+            proj.join("kovrek.json"),
+            r#"{"name":"plugapp","version":"0.1.0","entry":"src/main.kvr","packages":{"nmath":{"version":"0.1.0","entry":"nmath.kvr"}}}"#,
         )
         .unwrap();
         fs::write(
-            pkg_dir.join("veyra.json"),
+            pkg_dir.join("kovrek.json"),
             r#"{"name":"nmath","version":"0.1.0","native":{"library":"nmath"}}"#,
         )
         .unwrap();
-        let main_vy = proj.join("src/main.vy");
+        let main_kvr = proj.join("src/main.kvr");
         fs::write(
-            &main_vy,
+            &main_kvr,
             r#"
 use "nmath";
 assert(abs(nmath.vadd_f64(11.0, 31.0) - 42.0) < 0.00001);
@@ -3079,7 +3079,7 @@ assert(starts_with(gr, "plugin-ok:"));
         .unwrap();
 
         let _guard = EnvCwdGuard::enter(&proj, &[]);
-        let loaded = load_source(main_vy.to_string_lossy().as_ref()).unwrap();
+        let loaded = load_source(main_kvr.to_string_lossy().as_ref()).unwrap();
         assert_eq!(run_source(&loaded), Ok(()));
         drop(_guard);
 
@@ -3099,9 +3099,9 @@ assert(starts_with(gr, "plugin-ok:"));
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = env::temp_dir().join(format!("veyra_reg_test_{stamp}"));
+        let root = env::temp_dir().join(format!("kovrek_reg_test_{stamp}"));
         let home = root.join("home");
-        let pkg_src = root.join("vy_pkg_a");
+        let pkg_src = root.join("kv_pkg_a");
         let consumer = root.join("consumer");
         let unpacked = root.join("unpacked");
         fs::create_dir_all(home.join("registry")).unwrap();
@@ -3114,23 +3114,23 @@ assert(starts_with(gr, "plugin-ok:"));
         )
         .unwrap();
         fs::write(
-            pkg_src.join("veyra.json"),
-            r#"{"name":"vy_pkg_a","version":"1.2.4","entry":"vy_pkg_a.vy"}"#,
+            pkg_src.join("kovrek.json"),
+            r#"{"name":"kv_pkg_a","version":"1.2.4","entry":"kv_pkg_a.kvr"}"#,
         )
         .unwrap();
         fs::write(
-            pkg_src.join("vy_pkg_a.vy"),
+            pkg_src.join("kv_pkg_a.kvr"),
             "fn answer() -> Int { return 42; }\n",
         )
         .unwrap();
         fs::write(
-            consumer.join("veyra.json"),
-            r#"{"name":"consumer","version":"0.1.0","entry":"src/main.vy"}"#,
+            consumer.join("kovrek.json"),
+            r#"{"name":"consumer","version":"0.1.0","entry":"src/main.kvr"}"#,
         )
         .unwrap();
         fs::write(
-            consumer.join("src/main.vy"),
-            "use \"vy_pkg_a\";\nassert(vy_pkg_a.answer() == 42);\n",
+            consumer.join("src/main.kvr"),
+            "use \"kv_pkg_a\";\nassert(kv_pkg_a.answer() == 42);\n",
         )
         .unwrap();
 
@@ -3138,9 +3138,9 @@ assert(starts_with(gr, "plugin-ok:"));
         let _guard = EnvCwdGuard::enter(
             &pkg_src,
             &[
-                ("VEYRA_HOME", Some(&home_str)),
-                ("VEYRA_SIGNING_KEY", None),
-                ("VEYRA_REGISTRY_URL", None),
+                ("KOVREK_HOME", Some(&home_str)),
+                ("KOVREK_SIGNING_KEY", None),
+                ("KOVREK_REGISTRY_URL", None),
             ],
         );
 
@@ -3148,12 +3148,12 @@ assert(starts_with(gr, "plugin-ok:"));
         assert!(home.join("keys/ci_key.json").is_file());
 
         crate::registry::pkg_sign(Some(&pkg_src), Some("ci_key")).unwrap();
-        assert!(pkg_src.join("veyra.sig.json").is_file());
+        assert!(pkg_src.join("kovrek.sig.json").is_file());
         crate::registry::pkg_verify(Some(pkg_src.to_string_lossy().as_ref())).unwrap();
 
         // Tamper detection
         fs::write(
-            pkg_src.join("vy_pkg_a.vy"),
+            pkg_src.join("kv_pkg_a.kvr"),
             "fn answer() -> Int { return 99; }\n",
         )
         .unwrap();
@@ -3161,19 +3161,19 @@ assert(starts_with(gr, "plugin-ok:"));
 
         // Restore & re-sign
         fs::write(
-            pkg_src.join("vy_pkg_a.vy"),
+            pkg_src.join("kv_pkg_a.kvr"),
             "fn answer() -> Int { return 42; }\n",
         )
         .unwrap();
         crate::registry::pkg_sign(Some(&pkg_src), Some("ci_key")).unwrap();
 
         // Pack & verify & unpack
-        let bundle = root.join("vy_pkg_a.vypkg");
+        let bundle = root.join("kv_pkg_a.kvpkg");
         crate::registry::pkg_pack(Some(&pkg_src), Some(&bundle)).unwrap();
         crate::registry::pkg_verify(Some(bundle.to_string_lossy().as_ref())).unwrap();
         crate::registry::pkg_unpack(&bundle, Some(&unpacked)).unwrap();
         assert_eq!(
-            fs::read_to_string(unpacked.join("vy_pkg_a.vy")).unwrap(),
+            fs::read_to_string(unpacked.join("kv_pkg_a.kvr")).unwrap(),
             "fn answer() -> Int { return 42; }\n"
         );
 
@@ -3197,7 +3197,7 @@ assert(starts_with(gr, "plugin-ok:"));
             }
             assert!(ready, "registry server failed to listen on {url}");
 
-            unsafe { env::set_var("VEYRA_REGISTRY_URL", &url) };
+            unsafe { env::set_var("KOVREK_REGISTRY_URL", &url) };
             crate::registry::pkg_publish().unwrap();
 
             let body = reqwest::blocking::get(format!("{url}/index.json"))
@@ -3206,21 +3206,21 @@ assert(starts_with(gr, "plugin-ok:"));
                 .unwrap();
             let idx: JsonValue = serde_json::from_str(&body).unwrap();
             assert_eq!(
-                idx["packages"]["vy_pkg_a"]["version"].as_str(),
+                idx["packages"]["kv_pkg_a"]["version"].as_str(),
                 Some("1.2.4")
             );
-            assert!(idx["packages"]["vy_pkg_a"]["sha256"].as_str().is_some());
+            assert!(idx["packages"]["kv_pkg_a"]["sha256"].as_str().is_some());
 
             env::set_current_dir(&consumer).unwrap();
-            crate::registry::pkg_add("vy_pkg_a").unwrap();
-            crate::registry::pkg_info("vy_pkg_a").unwrap();
+            crate::registry::pkg_add("kv_pkg_a").unwrap();
+            crate::registry::pkg_info("kv_pkg_a").unwrap();
             crate::registry::pkg_tree().unwrap();
             crate::registry::pkg_audit().unwrap();
 
-            let lock_txt = fs::read_to_string(consumer.join("veyra.lock")).unwrap();
+            let lock_txt = fs::read_to_string(consumer.join("kovrek.lock")).unwrap();
             let lock: JsonValue = serde_json::from_str(&lock_txt).unwrap();
             assert_eq!(lock["format"].as_u64(), Some(3));
-            assert_eq!(lock["packages"]["vy_pkg_a"]["signed"].as_bool(), Some(true));
+            assert_eq!(lock["packages"]["kv_pkg_a"]["signed"].as_bool(), Some(true));
         }
 
         drop(_guard);
@@ -3237,11 +3237,11 @@ assert(starts_with(gr, "plugin-ok:"));
             .parent()
             .unwrap()
             .to_path_buf();
-        let proj = env::temp_dir().join(format!("veyra_8pkgs_test_{stamp}"));
+        let proj = env::temp_dir().join(format!("kovrek_8pkgs_test_{stamp}"));
         fs::create_dir_all(proj.join("src")).unwrap();
         fs::write(
-            proj.join("veyra.json"),
-            r#"{"name":"eightpkgs","version":"0.1.0","entry":"src/main.vy"}"#,
+            proj.join("kovrek.json"),
+            r#"{"name":"eightpkgs","version":"0.1.0","entry":"src/main.kvr"}"#,
         )
         .unwrap();
 
@@ -3249,36 +3249,36 @@ assert(starts_with(gr, "plugin-ok:"));
         let _guard = EnvCwdGuard::enter(
             &proj,
             &[
-                ("VEYRA_HOME", Some(&home_str)),
-                ("VEYRA_REGISTRY_URL", None),
+                ("KOVREK_HOME", Some(&home_str)),
+                ("KOVREK_REGISTRY_URL", None),
             ],
         );
 
         for name in [
-            "vyjit",
-            "vygpu",
-            "vyplugin",
-            "vycache",
-            "vydiff",
-            "vytemplate",
-            "vyargparse",
-            "vydecimal",
+            "kvjit",
+            "kvgpu",
+            "kvplugin",
+            "kvcache",
+            "kvdiff",
+            "kvtemplate",
+            "kvargparse",
+            "kvdecimal",
         ] {
             crate::registry::pkg_add(name).unwrap();
         }
 
-        let main_vy = proj.join("src/main.vy");
+        let main_kvr = proj.join("src/main.kvr");
         fs::write(
-            &main_vy,
+            &main_kvr,
             r#"
-use "vyjit";
-use "vygpu";
-use "vyplugin";
-use "vycache";
-use "vydiff";
-use "vytemplate";
-use "vyargparse";
-use "vydecimal";
+use "kvjit";
+use "kvgpu";
+use "kvplugin";
+use "kvcache";
+use "kvdiff";
+use "kvtemplate";
+use "kvargparse";
+use "kvdecimal";
 
 fn sq_loop(n) {
     let s = 0.0;
@@ -3289,49 +3289,49 @@ fn sq_loop(n) {
     }
     return s;
 }
-assert(vyjit.available() == cfg_is_x64());
-let jr = vyjit.bench(sq_loop, 10.0, 20);
+assert(kvjit.available() == cfg_is_x64());
+let jr = kvjit.bench(sq_loop, 10.0, 20);
 assert(abs(jr["last"] - 45.0) < 0.0001);
 
-let gm = vygpu.matmul([[1.0, 2.0], [3.0, 4.0]], [[2.0, 0.0], [1.0, 2.0]]);
+let gm = kvgpu.matmul([[1.0, 2.0], [3.0, 4.0]], [[2.0, 0.0], [1.0, 2.0]]);
 assert(abs(gm[0][0] - 4.0) < 0.001);
-assert(len(vygpu.backends()) >= 1);
-assert(abs(vygpu.gelu([1.0])[0] - 0.841192) < 0.001);
-assert(abs(vygpu.layernorm([[1.0, 2.0, 3.0]])[0][1]) < 0.001);
-assert(vyplugin.abi_version() == 1);
+assert(len(kvgpu.backends()) >= 1);
+assert(abs(kvgpu.gelu([1.0])[0] - 0.841192) < 0.001);
+assert(abs(kvgpu.layernorm([[1.0, 2.0, 3.0]])[0][1]) < 0.001);
+assert(kvplugin.abi_version() == 1);
 
-let c = vycache.create(2);
-c = vycache.put(c, "k1", 100);
-c = vycache.put(c, "k2", 200);
-c = vycache.put(c, "k3", 300);
-assert(vycache.get(c, "k1", null) == null);
-assert(vycache.get(c, "k3", null) == 300);
+let c = kvcache.create(2);
+c = kvcache.put(c, "k1", 100);
+c = kvcache.put(c, "k2", 200);
+c = kvcache.put(c, "k3", 300);
+assert(kvcache.get(c, "k1", null) == null);
+assert(kvcache.get(c, "k3", null) == 300);
 
-let ops = vydiff.diff_lines("a\nb\nc", "a\nx\nc\nd");
+let ops = kvdiff.diff_lines("a\nb\nc", "a\nx\nc\nd");
 assert(len(ops) >= 4);
-assert(vydiff.ratio("same\nline", "same\nline") == 1.0);
+assert(kvdiff.ratio("same\nline", "same\nline") == 1.0);
 
-let rendered = vytemplate.render("Hi {{user}}{{#if ok}}!{{/if}}", {"user": "<V>", "ok": true});
+let rendered = kvtemplate.render("Hi {{user}}{{#if ok}}!{{/if}}", {"user": "<V>", "ok": true});
 assert(rendered == "Hi &lt;V&gt;!");
 
-let pspec = vyargparse.spec("cli", "Test");
-pspec = vyargparse.add_flag(pspec, "verbose", "v", "Verbose");
-pspec = vyargparse.add_option(pspec, "port", "p", "8080", "Port");
-let parsed = vyargparse.parse(pspec, ["-v", "-p", "9090", "run.vy"]);
+let pspec = kvargparse.spec("cli", "Test");
+pspec = kvargparse.add_flag(pspec, "verbose", "v", "Verbose");
+pspec = kvargparse.add_option(pspec, "port", "p", "8080", "Port");
+let parsed = kvargparse.parse(pspec, ["-v", "-p", "9090", "run.kvr"]);
 assert(parsed["values"]["verbose"] == true);
 assert(parsed["values"]["port"] == "9090");
-assert(parsed["positionals"][0] == "run.vy");
+assert(parsed["positionals"][0] == "run.kvr");
 
-let d1 = vydecimal.from_str("0.1", 2);
-let d2 = vydecimal.from_str("0.2", 2);
-assert(vydecimal.format(vydecimal.add(d1, d2)) == "0.30");
-assert(vydecimal.format(vydecimal.mul(vydecimal.from_str("1.25", 2), vydecimal.from_str("0.40", 2))) == "0.50");
+let d1 = kvdecimal.from_str("0.1", 2);
+let d2 = kvdecimal.from_str("0.2", 2);
+assert(kvdecimal.format(kvdecimal.add(d1, d2)) == "0.30");
+assert(kvdecimal.format(kvdecimal.mul(kvdecimal.from_str("1.25", 2), kvdecimal.from_str("0.40", 2))) == "0.50");
 "#,
         )
         .unwrap();
 
         // Normalize cfg_is_x64() without inventing a builtin!
-        let code = fs::read_to_string(&main_vy).unwrap().replace(
+        let code = fs::read_to_string(&main_kvr).unwrap().replace(
             "cfg_is_x64()",
             if cfg!(target_arch = "x86_64") {
                 "true"
@@ -3339,9 +3339,9 @@ assert(vydecimal.format(vydecimal.mul(vydecimal.from_str("1.25", 2), vydecimal.f
                 "false"
             },
         );
-        fs::write(&main_vy, &code).unwrap();
+        fs::write(&main_kvr, &code).unwrap();
 
-        let loaded = load_source(main_vy.to_string_lossy().as_ref()).unwrap();
+        let loaded = load_source(main_kvr.to_string_lossy().as_ref()).unwrap();
         assert_eq!(run_source(&loaded), Ok(()));
         drop(_guard);
 
@@ -3405,7 +3405,7 @@ while i < len(sig7) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("veyra_bigint_aot_{stamp}"));
+        let dir = env::temp_dir().join(format!("kovrek_bigint_aot_{stamp}"));
         fs::create_dir_all(&dir).unwrap();
         let exe_path = dir.join(if cfg!(target_os = "windows") {
             "bigint_aot.exe"
@@ -3646,7 +3646,7 @@ assert(svc.port == 8080 and svc.meta_tagged == true and type(svc) == Service);
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("veyra_oop_aot_{stamp}"));
+        let dir = env::temp_dir().join(format!("kovrek_oop_aot_{stamp}"));
         fs::create_dir_all(&dir).unwrap();
         let exe_path = dir.join(if cfg!(target_os = "windows") {
             "oop_aot.exe"
@@ -3673,7 +3673,7 @@ class Bad(Z1, Z2) {}
         let vm_err = run_source(bad_mro).unwrap_err();
         assert!(vm_err.contains("MRO"), "expected MRO error, got: {vm_err}");
 
-        let dir2 = env::temp_dir().join(format!("veyra_bad_mro_aot_{stamp}"));
+        let dir2 = env::temp_dir().join(format!("kovrek_bad_mro_aot_{stamp}"));
         fs::create_dir_all(&dir2).unwrap();
         let exe2 = dir2.join(if cfg!(target_os = "windows") {
             "bad_mro.exe"
@@ -3806,7 +3806,7 @@ assert(top_res == "neg5");
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("veyra_match_aot_{stamp}"));
+        let dir = env::temp_dir().join(format!("kovrek_match_aot_{stamp}"));
         fs::create_dir_all(&dir).unwrap();
         let exe_path = dir.join(if cfg!(target_os = "windows") {
             "match_aot.exe"
@@ -3841,11 +3841,11 @@ assert(top_res == "neg5");
             "expected at least 74 registered packages"
         );
 
-        let proj = env::temp_dir().join(format!("veyra_new6pkgs_{stamp}"));
+        let proj = env::temp_dir().join(format!("kovrek_new6pkgs_{stamp}"));
         fs::create_dir_all(proj.join("src")).unwrap();
         fs::write(
-            proj.join("veyra.json"),
-            r#"{"name":"new6pkgs","version":"0.1.0","entry":"src/main.vy"}"#,
+            proj.join("kovrek.json"),
+            r#"{"name":"new6pkgs","version":"0.1.0","entry":"src/main.kvr"}"#,
         )
         .unwrap();
 
@@ -3853,114 +3853,114 @@ assert(top_res == "neg5");
         let _guard = EnvCwdGuard::enter(
             &proj,
             &[
-                ("VEYRA_HOME", Some(&home_str)),
-                ("VEYRA_REGISTRY_URL", None),
+                ("KOVREK_HOME", Some(&home_str)),
+                ("KOVREK_REGISTRY_URL", None),
             ],
         );
 
         for name in [
-            "vydecimal",
-            "vycomplex",
-            "vyitertools",
-            "vyfunctools",
-            "vytyping",
-            "vygraph",
-            "vysemver",
+            "kvdecimal",
+            "kvcomplex",
+            "kvitertools",
+            "kvfunctools",
+            "kvtyping",
+            "kvgraph",
+            "kvsemver",
         ] {
             crate::registry::pkg_add(name).unwrap();
         }
 
-        let main_vy = proj.join("src/main.vy");
+        let main_kvr = proj.join("src/main.kvr");
         fs::write(
-            &main_vy,
+            &main_kvr,
             r#"
-use "vydecimal";
-use "vycomplex";
-use "vyitertools";
-use "vyfunctools";
-use "vytyping";
-use "vygraph";
-use "vysemver";
+use "kvdecimal";
+use "kvcomplex";
+use "kvitertools";
+use "kvfunctools";
+use "kvtyping";
+use "kvgraph";
+use "kvsemver";
 
-// 1. Upgraded vydecimal (arbitrary precision + Decimal OOP class)
-let da = vydecimal.parse("0.1");
-let db = vydecimal.parse("0.2");
-assert(vydecimal.format(vydecimal.add(da, db)) == "0.3");
-let one_third = vydecimal.div(vydecimal.parse("1"), vydecimal.parse("3"), 30);
-assert(starts_with(vydecimal.format(one_third), "0.33333333333333333333"));
-let sq2 = vydecimal.sqrt(vydecimal.parse("2"), 20);
-assert(starts_with(vydecimal.format(sq2), "1.414213562373095"));
-let d_obj = vydecimal.Decimal("1.25") + vydecimal.Decimal("2.75");
+// 1. Upgraded kvdecimal (arbitrary precision + Decimal OOP class)
+let da = kvdecimal.parse("0.1");
+let db = kvdecimal.parse("0.2");
+assert(kvdecimal.format(kvdecimal.add(da, db)) == "0.3");
+let one_third = kvdecimal.div(kvdecimal.parse("1"), kvdecimal.parse("3"), 30);
+assert(starts_with(kvdecimal.format(one_third), "0.33333333333333333333"));
+let sq2 = kvdecimal.sqrt(kvdecimal.parse("2"), 20);
+assert(starts_with(kvdecimal.format(sq2), "1.414213562373095"));
+let d_obj = kvdecimal.Decimal("1.25") + kvdecimal.Decimal("2.75");
 assert(d_obj.str() == "4");
 
-// 2. vycomplex
-let z1 = vycomplex.make(3, 4);
-let z2 = vycomplex.Complex(1, -2);
-let z3 = vycomplex.Complex(2, 5);
+// 2. kvcomplex
+let z1 = kvcomplex.make(3, 4);
+let z2 = kvcomplex.Complex(1, -2);
+let z3 = kvcomplex.Complex(2, 5);
 let zsum = z2 + z3;
 assert(zsum.__str__() == "3+3j");
-assert(vycomplex.abs_val(z1) == 5.0);
-assert(vycomplex.pow_int(vycomplex.make(0, 1), 2) == [-1.0, 0.0]);
+assert(kvcomplex.abs_val(z1) == 5.0);
+assert(kvcomplex.pow_int(kvcomplex.make(0, 1), 2) == [-1.0, 0.0]);
 
-// 3. vyitertools
-assert(vyitertools.chain([[1, 2], [3], [4, 5]]) == [1, 2, 3, 4, 5]);
-assert(vyitertools.batched([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]);
-assert(vyitertools.pairwise([10, 20, 30]) == [[10, 20], [20, 30]]);
-assert(vyitertools.accumulate([1, 2, 3, 4], fn(a, b) { return a + b; }) == [1, 3, 6, 10]);
-assert(len(vyitertools.combinations([1, 2, 3, 4], 2)) == 6);
-assert(len(vyitertools.permutations([1, 2, 3], 2)) == 6);
+// 3. kvitertools
+assert(kvitertools.chain([[1, 2], [3], [4, 5]]) == [1, 2, 3, 4, 5]);
+assert(kvitertools.batched([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]);
+assert(kvitertools.pairwise([10, 20, 30]) == [[10, 20], [20, 30]]);
+assert(kvitertools.accumulate([1, 2, 3, 4], fn(a, b) { return a + b; }) == [1, 3, 6, 10]);
+assert(len(kvitertools.combinations([1, 2, 3, 4], 2)) == 6);
+assert(len(kvitertools.permutations([1, 2, 3], 2)) == 6);
 
-// 4. vyfunctools
+// 4. kvfunctools
 let inc = fn(x) { return x + 1; };
 let dbl = fn(x) { return x * 2; };
-let f_comp = vyfunctools.compose(dbl, inc);
+let f_comp = kvfunctools.compose(dbl, inc);
 assert(f_comp(4) == 10);
-assert(vyfunctools.pipe(3, [inc, dbl, inc]) == 9);
-assert(vyfunctools.reduce(fn(a, b) { return a + b; }, [1, 2, 3, 4], 10) == 20);
+assert(kvfunctools.pipe(3, [inc, dbl, inc]) == 9);
+assert(kvfunctools.reduce(fn(a, b) { return a + b; }, [1, 2, 3, 4], 10) == 20);
 let add3 = fn(a, b, c) { return a + b + c; };
-let p5 = vyfunctools.partial(add3, [5]);
+let p5 = kvfunctools.partial(add3, [5]);
 assert(p5(10, 20) == 35);
 let calls = 0;
 let fib_slow = fn(n) {
     calls = calls + 1;
     return n * n;
 };
-let fib_m = vyfunctools.memoize(fib_slow);
+let fib_m = kvfunctools.memoize(fib_slow);
 assert(fib_m(9) == 81 and fib_m(9) == 81 and calls == 1);
-let lru = vyfunctools.lru_cache(2, fib_slow);
+let lru = kvfunctools.lru_cache(2, fib_slow);
 assert(lru(2) == 4 and lru(3) == 9 and lru(2) == 4 and calls == 3);
 
-// 5. vytyping
-let user_schema = vytyping.typed_dict({
+// 5. kvtyping
+let user_schema = kvtyping.typed_dict({
     "name": "str",
-    "age": vytyping.optional("int"),
-    "roles": vytyping.list_of(vytyping.literal_of(["admin", "user"]))
+    "age": kvtyping.optional("int"),
+    "roles": kvtyping.list_of(kvtyping.literal_of(["admin", "user"]))
 });
-assert(vytyping.assert_schema({"name": "Ada", "age": 36, "roles": ["admin"]}, user_schema));
-assert(not vytyping.matches({"name": "Ada", "roles": ["guest"]}, user_schema));
+assert(kvtyping.assert_schema({"name": "Ada", "age": 36, "roles": ["admin"]}, user_schema));
+assert(not kvtyping.matches({"name": "Ada", "roles": ["guest"]}, user_schema));
 
-// 6. vygraph
-let g = vygraph.new_graph(true);
-g = vygraph.add_edge(g, "a", "b", 2);
-g = vygraph.add_edge(g, "a", "c", 5);
-g = vygraph.add_edge(g, "b", "c", 1);
-g = vygraph.add_edge(g, "c", "d", 3);
-assert(vygraph.toposort(g) == ["a", "b", "c", "d"]);
-assert(vygraph.shortest_path(g, "a", "d") == ["a", "b", "c", "d"]);
-assert(vygraph.dijkstra(g, "a")["dist"]["d"] == 6.0);
+// 6. kvgraph
+let g = kvgraph.new_graph(true);
+g = kvgraph.add_edge(g, "a", "b", 2);
+g = kvgraph.add_edge(g, "a", "c", 5);
+g = kvgraph.add_edge(g, "b", "c", 1);
+g = kvgraph.add_edge(g, "c", "d", 3);
+assert(kvgraph.toposort(g) == ["a", "b", "c", "d"]);
+assert(kvgraph.shortest_path(g, "a", "d") == ["a", "b", "c", "d"]);
+assert(kvgraph.dijkstra(g, "a")["dist"]["d"] == 6.0);
 
-// 7. vysemver
-assert(vysemver.compare("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0);
-assert(vysemver.compare("1.0.0-rc.1", "1.0.0") < 0);
-assert(vysemver.satisfies("1.4.2", "^1.2.0"));
-assert(not vysemver.satisfies("2.0.0", "^1.2.0"));
-assert(vysemver.max_satisfying(["1.0.0", "1.4.2", "2.0.0"], ">=1.0.0 <2.0.0") == "1.4.2");
-assert(vysemver.bump_minor("1.4.2") == "1.5.0");
+// 7. kvsemver
+assert(kvsemver.compare("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0);
+assert(kvsemver.compare("1.0.0-rc.1", "1.0.0") < 0);
+assert(kvsemver.satisfies("1.4.2", "^1.2.0"));
+assert(not kvsemver.satisfies("2.0.0", "^1.2.0"));
+assert(kvsemver.max_satisfying(["1.0.0", "1.4.2", "2.0.0"], ">=1.0.0 <2.0.0") == "1.4.2");
+assert(kvsemver.bump_minor("1.4.2") == "1.5.0");
 "#,
         )
         .unwrap();
 
-        let loaded = load_source(main_vy.to_string_lossy().as_ref()).unwrap();
+        let loaded = load_source(main_kvr.to_string_lossy().as_ref()).unwrap();
         assert_eq!(run_source(&loaded), Ok(()));
         drop(_guard);
 
@@ -3999,13 +3999,13 @@ assert(vysemver.bump_minor("1.4.2") == "1.5.0");
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let work = env::temp_dir().join(format!("veyra_pillar5_local_{stamp}"));
+        let work = env::temp_dir().join(format!("kovrek_pillar5_local_{stamp}"));
         let reg_good = work.join("reg_good");
         let reg_pkg_src = work.join("src_scoped_utils");
         let monorepo = work.join("monorepo");
         let ws_core = monorepo.join("packages").join("core");
         let ws_app = monorepo.join("apps").join("web");
-        let home_dir = work.join("veyra_home");
+        let home_dir = work.join("kovrek_home");
 
         fs::create_dir_all(&reg_good).unwrap();
         fs::create_dir_all(&reg_pkg_src).unwrap();
@@ -4015,16 +4015,16 @@ assert(vysemver.bump_minor("1.4.2") == "1.5.0");
 
         // Scoped package stored in secondary federated registry with per-platform native artifact
         fs::write(
-            reg_pkg_src.join("veyra.json"),
-            r#"{"name":"@acme/utils","version":"1.2.3","entry":"utils.vy","packages":{}}"#,
+            reg_pkg_src.join("kovrek.json"),
+            r#"{"name":"@acme/utils","version":"1.2.3","entry":"utils.kvr","packages":{}}"#,
         )
         .unwrap();
         fs::write(
-            reg_pkg_src.join("utils.vy"),
+            reg_pkg_src.join("utils.kvr"),
             "fn triple(x: Int) -> Int {\n    return x * 3;\n}\n",
         )
         .unwrap();
-        let fake_native_bytes = b"veyra-platform-native-stub";
+        let fake_native_bytes = b"kovrek-platform-native-stub";
         fs::write(reg_good.join("native_stub.bin"), fake_native_bytes).unwrap();
         let mut nat_hash = Sha256::new();
         nat_hash.update(fake_native_bytes);
@@ -4034,7 +4034,7 @@ assert(vysemver.bump_minor("1.4.2") == "1.5.0");
             "packages": {
                 "@acme/utils": {
                     "version": "1.2.3",
-                    "entry": "utils.vy",
+                    "entry": "utils.kvr",
                     "source": "../src_scoped_utils",
                     "native": {
                         plat: {
@@ -4054,7 +4054,7 @@ assert(vysemver.bump_minor("1.4.2") == "1.5.0");
 
         // Monorepo workspace root + core package + app consuming both workspace & @acme/utils
         fs::write(
-            monorepo.join("veyra.json"),
+            monorepo.join("kovrek.json"),
             serde_json::json!({
                 "name": "acme-monorepo",
                 "version": "0.1.0",
@@ -4065,21 +4065,21 @@ assert(vysemver.bump_minor("1.4.2") == "1.5.0");
         )
         .unwrap();
         fs::write(
-            ws_core.join("veyra.json"),
-            r#"{"name":"@acme/core","version":"2.0.0","entry":"src/lib.vy","packages":{}}"#,
+            ws_core.join("kovrek.json"),
+            r#"{"name":"@acme/core","version":"2.0.0","entry":"src/lib.kvr","packages":{}}"#,
         )
         .unwrap();
         fs::write(
-            ws_core.join("src").join("lib.vy"),
+            ws_core.join("src").join("lib.kvr"),
             "fn base_val() -> Int {\n    return 14;\n}\n",
         )
         .unwrap();
         fs::write(
-            ws_app.join("veyra.json"),
+            ws_app.join("kovrek.json"),
             serde_json::json!({
                 "name": "web-app",
                 "version": "0.1.0",
-                "entry": "src/main.vy",
+                "entry": "src/main.kvr",
                 "packages": {
                     "@acme/core": "^2.0.0"
                 }
@@ -4087,7 +4087,7 @@ assert(vysemver.bump_minor("1.4.2") == "1.5.0");
             .to_string(),
         )
         .unwrap();
-        let app_main = ws_app.join("src").join("main.vy");
+        let app_main = ws_app.join("src").join("main.kvr");
         fs::write(
             &app_main,
             r#"use "@acme/utils";
@@ -4106,10 +4106,10 @@ assert(u.triple(c.base_val()) == 42);
         let _guard = EnvCwdGuard::enter(
             &ws_app,
             &[
-                ("VEYRA_REGISTRY_URLS", Some(reg_urls.as_str())),
-                ("VEYRA_REGISTRY_URL", None),
-                ("VEYRA_HOME", Some(home_str.as_str())),
-                ("VEYRA_OFFLINE", None),
+                ("KOVREK_REGISTRY_URLS", Some(reg_urls.as_str())),
+                ("KOVREK_REGISTRY_URL", None),
+                ("KOVREK_HOME", Some(home_str.as_str())),
+                ("KOVREK_OFFLINE", None),
             ],
         );
 
@@ -4141,7 +4141,7 @@ assert(u.triple(c.base_val()) == 42);
                 .join("@acme")
                 .join("core")
                 .join("src")
-                .join("lib.vy")
+                .join("lib.kvr")
                 .is_file()
         );
 
@@ -4151,9 +4151,9 @@ assert(u.triple(c.base_val()) == 42);
         // Generate py-bridge wrapper for Python stdlib `math` inside ws_app
         pkg_py_bridge("math", None, false).unwrap();
         let py_math_dir = ws_app.join("vendor").join("py_math");
-        assert!(py_math_dir.join("py_math.vy").is_file());
+        assert!(py_math_dir.join("py_math.kvr").is_file());
         fs::write(
-            ws_app.join("src").join("bridge_check.vy"),
+            ws_app.join("src").join("bridge_check.kvr"),
             r#"use "@acme/utils";
 use "@acme/core";
 use "py_math";
@@ -4173,7 +4173,7 @@ if py_available() {
         let bridge_src = load_source(
             ws_app
                 .join("src")
-                .join("bridge_check.vy")
+                .join("bridge_check.kvr")
                 .to_string_lossy()
                 .as_ref(),
         )
@@ -4197,7 +4197,7 @@ if py_available() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let work = env::temp_dir().join(format!("veyra_pillar5_http_{stamp}"));
+        let work = env::temp_dir().join(format!("kovrek_pillar5_http_{stamp}"));
         let srv_home = work.join("srv_home");
         let client_home = work.join("client_home");
         let app_a = work.join("app_a");
@@ -4210,12 +4210,12 @@ if py_available() {
         fs::create_dir_all(app_b.join("src")).unwrap();
 
         fs::write(
-            srv_home.join("packages").join("fedlib").join("veyra.json"),
-            r#"{"name":"fedlib","version":"1.0.0","entry":"lib.vy","packages":{}}"#,
+            srv_home.join("packages").join("fedlib").join("kovrek.json"),
+            r#"{"name":"fedlib","version":"1.0.0","entry":"lib.kvr","packages":{}}"#,
         )
         .unwrap();
         fs::write(
-            srv_home.join("packages").join("fedlib").join("lib.vy"),
+            srv_home.join("packages").join("fedlib").join("lib.kvr"),
             "fn ping() -> Int {\n    return 99;\n}\n",
         )
         .unwrap();
@@ -4224,7 +4224,7 @@ if py_available() {
                 .unwrap();
         fs::create_dir_all(srv_home.join("bundles")).unwrap();
         fs::write(
-            srv_home.join("bundles").join("fedlib.vypkg.json"),
+            srv_home.join("bundles").join("fedlib.kvpkg.json"),
             serde_json::to_string_pretty(&bundle).unwrap(),
         )
         .unwrap();
@@ -4235,8 +4235,8 @@ if py_available() {
                 "packages": {
                     "fedlib": {
                         "version": "1.0.0",
-                        "entry": "lib.vy",
-                        "bundle_path": "/bundles/fedlib.vypkg.json"
+                        "entry": "lib.kvr",
+                        "bundle_path": "/bundles/fedlib.kvpkg.json"
                     }
                 }
             })
@@ -4267,12 +4267,12 @@ if py_available() {
 
         for app in [&app_a, &app_b] {
             fs::write(
-                app.join("veyra.json"),
-                r#"{"name":"app","version":"0.1.0","entry":"src/main.vy","packages":{}}"#,
+                app.join("kovrek.json"),
+                r#"{"name":"app","version":"0.1.0","entry":"src/main.kvr","packages":{}}"#,
             )
             .unwrap();
             fs::write(
-                app.join("src").join("main.vy"),
+                app.join("src").join("main.kvr"),
                 "use \"fedlib\";\nlet f = import_package(\"fedlib\");\nassert(f.ping() == 99);\n",
             )
             .unwrap();
@@ -4288,29 +4288,41 @@ if py_available() {
         let _guard = EnvCwdGuard::enter(
             &app_a,
             &[
-                ("VEYRA_REGISTRY_URLS", Some(fed_urls.as_str())),
-                ("VEYRA_REGISTRY_URL", None),
-                ("VEYRA_HOME", Some(home_str.as_str())),
-                ("VEYRA_OFFLINE", None),
+                ("KOVREK_REGISTRY_URLS", Some(fed_urls.as_str())),
+                ("KOVREK_REGISTRY_URL", None),
+                ("KOVREK_HOME", Some(home_str.as_str())),
+                ("KOVREK_OFFLINE", None),
             ],
         );
 
         let (_, idx) = pkg_index().unwrap();
         assert!(idx.get("packages").and_then(|p| p.get("fedlib")).is_some());
         pkg_add("fedlib").unwrap();
-        assert!(app_a.join("vendor").join("fedlib").join("lib.vy").is_file());
+        assert!(
+            app_a
+                .join("vendor")
+                .join("fedlib")
+                .join("lib.kvr")
+                .is_file()
+        );
 
-        // Populate offline cache verified under VEYRA_HOME/cache
+        // Populate offline cache verified under KOVREK_HOME/cache
         assert!(client_home.join("cache").join("registries").is_dir());
         assert!(client_home.join("cache").join("artifacts").is_dir());
 
         // Offline mode installs into app_b purely from disk cache
-        unsafe { env::set_var("VEYRA_OFFLINE", "1") };
-        unsafe { env::set_var("VEYRA_REGISTRY_URLS", &srv_url) };
+        unsafe { env::set_var("KOVREK_OFFLINE", "1") };
+        unsafe { env::set_var("KOVREK_REGISTRY_URLS", &srv_url) };
         env::set_current_dir(&app_b).unwrap();
         pkg_add("fedlib").unwrap();
-        let src_b =
-            load_source(app_b.join("src").join("main.vy").to_string_lossy().as_ref()).unwrap();
+        let src_b = load_source(
+            app_b
+                .join("src")
+                .join("main.kvr")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
         assert_eq!(run_source(&src_b), Ok(()));
 
         drop(_guard);
@@ -4346,7 +4358,7 @@ return out;
         assert_eq!(main_res, 64.0);
         assert_eq!(prints, vec!["64".to_string()]);
 
-        // Also test via Veyra VM builtins
+        // Also test via Kovrek VM builtins
         let vy = r#"
 let b = wasm_compile("fn sq(x) { return x * x; } return sq(9);");
 let r = wasm_run(b, "main");
@@ -4383,18 +4395,18 @@ return ans - 25;
         assert_eq!(u16::from_le_bytes([elf[18], elf[19]]), 62); // EM_X86_64
 
         // Verify PE32+ emission and actually execute it live on Windows x86_64!
-        let dir = env::temp_dir().join("veyra_direct_pe_test");
+        let dir = env::temp_dir().join("kovrek_direct_pe_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let vy_path = dir.join("prog.vy");
+        let kvr_path = dir.join("prog.kvr");
         let exe_path = dir.join("prog.exe");
-        fs::write(&vy_path, src).unwrap();
+        fs::write(&kvr_path, src).unwrap();
         let wasm_out = dir.join("prog.wasm");
-        crate::native_codegen::compile_file_to_wasm(&vy_path, &wasm_out).unwrap();
+        crate::native_codegen::compile_file_to_wasm(&kvr_path, &wasm_out).unwrap();
         assert!(wasm_out.is_file());
 
         crate::native_codegen::compile_file_to_direct_native(
-            &vy_path,
+            &kvr_path,
             Some(&exe_path),
             Some(crate::native_codegen::DirectNativeFormat::Pe64),
         )
@@ -4476,7 +4488,7 @@ log_div(21, 5);
         assert!(missing_net.unwrap_err().contains("effect error"));
 
         // 6. AOT parity for @pure and contracts
-        let dir = env::temp_dir().join("veyra_contracts_aot_test");
+        let dir = env::temp_dir().join("kovrek_contracts_aot_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join(if cfg!(target_os = "windows") {
@@ -4502,7 +4514,7 @@ assert(checked(7) == 14);
 
     #[test]
     fn capability_sandbox_and_reproducible_pkg_bundle() {
-        let dir = env::temp_dir().join("veyra_cap_repro_test");
+        let dir = env::temp_dir().join("kovrek_cap_repro_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("src")).unwrap();
         let data_file = dir.join("note.txt");
@@ -4510,7 +4522,7 @@ assert(checked(7) == 14);
         let escaped_file = data_file.to_string_lossy().replace('\\', "\\\\");
 
         // Attenuated capabilities block fs.write & process while permitting fs.read, and cannot escalate!
-        let vy_src = format!(
+        let kvr_src = format!(
             r#"
 assert(cap_current() == "all");
 let ok = cap_restrict(["fs.read"], fn() {{
@@ -4531,15 +4543,15 @@ assert(ok == true);
 assert(cap_current() == "all");
 "#
         );
-        assert_eq!(run_source(&vy_src), Ok(()));
+        assert_eq!(run_source(&kvr_src), Ok(()));
 
-        // Verify reproducible deterministic .vybc and .vypkg.json SHA-256 across rebuilds
+        // Verify reproducible deterministic .kvbc and .kvpkg.json SHA-256 across rebuilds
         fs::write(
-            dir.join("veyra.json"),
-            r#"{"name":"capdemo","version":"1.2.3","entry":"src/main.vy","capabilities":["fs.write","fs.read"]}"#,
+            dir.join("kovrek.json"),
+            r#"{"name":"capdemo","version":"1.2.3","entry":"src/main.kvr","capabilities":["fs.write","fs.read"]}"#,
         )
         .unwrap();
-        fs::write(dir.join("src").join("main.vy"), "let x = 21 * 2;").unwrap();
+        fs::write(dir.join("src").join("main.kvr"), "let x = 21 * 2;").unwrap();
 
         let b1 = crate::registry::build_package_bundle(&dir).unwrap();
         let b2 = crate::registry::build_package_bundle(&dir).unwrap();
@@ -4552,8 +4564,8 @@ assert(cap_current() == "all");
             serde_json::json!(["fs.read", "fs.write"])
         );
 
-        let bc1 = compile_to_vybc("let x = 21 * 2;").unwrap();
-        let bc2 = compile_to_vybc("let x = 21 * 2;").unwrap();
+        let bc1 = compile_to_kvbc("let x = 21 * 2;").unwrap();
+        let bc2 = compile_to_kvbc("let x = 21 * 2;").unwrap();
         assert_eq!(bc1, bc2);
 
         let _ = fs::remove_dir_all(&dir);
@@ -4561,7 +4573,7 @@ assert(cap_current() == "all");
 
     #[test]
     fn gpu_fused_kernel_single_pass_spirv_and_hlsl() {
-        let vy_src = r#"
+        let kvr_src = r#"
 let info_before = gpu_info();
 let before_cnt = info_before["fused_kernels"];
 let ops = ["add", "mul_scalar:2.0", "relu"];
@@ -4588,7 +4600,7 @@ assert(abs(flat[1] - 0.5) < 0.0001);
 let info_after = gpu_info();
 assert(info_after["fused_kernels"] >= before_cnt + 2);
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
@@ -4596,7 +4608,7 @@ assert(info_after["fused_kernels"] >= before_cnt + 2);
         if crate::py_bridge::py_eval("1 + 1", None).is_err() {
             return;
         }
-        let vy_src = r#"
+        let kvr_src = r#"
 let has_np = py_eval("__import__('importlib.util', fromlist=['find_spec']).find_spec('numpy') is not None");
 let has_torch = py_eval("__import__('importlib.util', fromlist=['find_spec']).find_spec('torch') is not None");
 let t = tensor([[1.5, 2.5], [3.5, 4.5]], false);
@@ -4637,12 +4649,12 @@ if has_torch {
     py_free(torch);
 }
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
     fn vm_mark_sweep_cycle_collector() {
-        let vy_src = r#"
+        let kvr_src = r#"
 class Node {
     fn init(self, label: String) -> Null {
         self.label = label;
@@ -4690,12 +4702,12 @@ let rep2 = gc_collect();
 assert(rep2["collected"] >= 2, "expected dropped orphan cycle swept, got " + str(rep2));
 assert(gc_stats()["collections"] >= 2);
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
     fn deterministic_simulation_replay_and_faults() {
-        let vy_src = r#"
+        let kvr_src = r#"
 fn run_trace(seed: Int) -> List {
     sim_start(seed);
     assert(sim_now() == 0);
@@ -4720,12 +4732,12 @@ assert(t1[0] == t2[0] and t1[1] == t2[1]);
 assert(t1[2] == t2[2]);
 assert(t1[0] != t3[0]);
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
     fn supervised_actors_mailbox_state_and_restart() {
-        let vy_src = r#"
+        let kvr_src = r#"
 let counter = actor_spawn(fn(msg, state) {
     if msg["op"] == "add" {
         let next = state + msg["n"];
@@ -4768,7 +4780,7 @@ assert(actor_stop(counter) == true);
 let st2 = actor_status(counter);
 assert(st2["alive"] == false and st2["status"] == "failed");
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
@@ -4780,7 +4792,7 @@ assert(st2["alive"] == false and st2["status"] == "failed");
         {
             return;
         }
-        let dir = env::temp_dir().join("veyra_ffi_bindgen_test");
+        let dir = env::temp_dir().join("kovrek_ffi_bindgen_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let rs_path = dir.join("cmath_abi.rs");
@@ -4869,7 +4881,7 @@ double c_fma_f64(double x, double y, double z);
             }
         }
 
-        let prog = env::temp_dir().join("veyra_dap_timetravel_test.vy");
+        let prog = env::temp_dir().join("kovrek_dap_timetravel_test.kvr");
         fs::write(
             &prog,
             "let x = 1;\nx = 2;\nx = 3;\nx = 4;\nassert(x == 4);\n",
@@ -4948,7 +4960,7 @@ double c_fma_f64(double x, double y, double z);
             }
         }
 
-        send_req("initialize", serde_json::json!({"adapterID": "veyra"}));
+        send_req("initialize", serde_json::json!({"adapterID": "kovrek"}));
         let init_resp = recv_resp(&mut client_reader, &mut events, "initialize");
         assert_eq!(init_resp["body"]["supportsStepBack"].as_bool(), Some(true));
         let _ = wait_event(&mut client_reader, &mut events, "initialized");
@@ -5010,10 +5022,10 @@ double c_fma_f64(double x, double y, double z);
 
     #[test]
     fn notebook_reactive_stateful_session() {
-        let dir = env::temp_dir().join("veyra_notebook_test");
+        let dir = env::temp_dir().join("kovrek_notebook_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let nb_file = dir.join(".veyra-notebook.json");
+        let nb_file = dir.join(".kovrek-notebook.json");
         let mut nb = crate::server::NotebookSession::new(Some(nb_file.clone()));
 
         let r1 = nb.eval_cell(
@@ -5040,7 +5052,7 @@ double c_fma_f64(double x, double y, double z);
 
     #[test]
     fn jit_setindex_and_return_list_native_execution() {
-        let vy_src = r#"
+        let kvr_src = r#"
 fn scale_list(xs: List, factor: Float) -> List {
     let i = 0;
     while i < len(xs) {
@@ -5064,12 +5076,12 @@ if jit_available() {
     assert(after["native_calls"] > before["native_calls"]);
 }
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
     fn ir_ssa_propagation_algebraic_and_dce() {
-        let vy_src = r#"
+        let kvr_src = r#"
 fn compute(x: Int) -> Int {
     let a = 6;
     let b = a * 2 + 1;
@@ -5085,7 +5097,7 @@ assert(stats["constants_folded"] >= 1);
 assert(stats["algebraic_simplified"] >= 1);
 assert(stats["dead_removed"] >= 1);
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
@@ -5187,7 +5199,7 @@ fn bad_idx() -> Int {
     #[test]
     fn ffi_struct_bindgen_mem_and_dynamic_multi_arg_cabi() {
         let dir = std::env::temp_dir().join(format!(
-            "veyra_ffi_sprint2_{}",
+            "kovrek_ffi_sprint2_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -5229,7 +5241,7 @@ pub unsafe extern "C" fn mix_8_args(
         let built = crate::plugin::build_rust_plugin(&rs_path, &dll_path).unwrap();
 
         let header = r#"
-#define VEYRA_FFI_VER 2
+#define KOVREK_FFI_VER 2
 enum Mode { MODE_OFF = 0, MODE_ACTIVE = 5, MODE_TURBO };
 typedef struct {
     int id;
@@ -5241,7 +5253,7 @@ double mix_8_args(int a, double b, long long c, float d, unsigned int e, bool fl
 "#;
         let bindings =
             crate::plugin::ffi_bindgen(header, built.to_string_lossy().as_ref()).unwrap();
-        assert!(bindings.contains("let VEYRA_FFI_VER = 2;"));
+        assert!(bindings.contains("let KOVREK_FFI_VER = 2;"));
         assert!(bindings.contains("let MODE_TURBO = 6;"));
         assert!(bindings.contains("let Packet_SIZE = 24;"));
         assert!(bindings.contains("fn Packet_pack"));
@@ -5249,7 +5261,7 @@ double mix_8_args(int a, double b, long long c, float d, unsigned int e, bool fl
 
         let driver = format!(
             "{bindings}\n\
-assert(VEYRA_FFI_VER == 2);\n\
+assert(KOVREK_FFI_VER == 2);\n\
 assert(MODE_ACTIVE == 5 and MODE_TURBO == 6);\n\
 assert(Packet_SIZE == 24);\n\
 let p = Packet_alloc();\n\
@@ -5258,8 +5270,8 @@ let initial = Packet_unpack(p);\n\
 assert(initial[\"id\"] == 7);\n\
 assert(abs(initial[\"weight\"] - 3.25) < 0.0001);\n\
 assert(abs(initial[\"scale\"] - 1.5) < 0.0001);\n\
-let res = mix_8_args(10, 2.5, 100, 1.5, 4, true, \"veyra\", p);\n\
-assert(abs(res - 143.25) < 0.0001, \"res=\" + str(res));\n\
+let res = mix_8_args(10, 2.5, 100, 1.5, 4, true, \"kovrek\", p);\n\
+assert(abs(res - 144.25) < 0.0001, \"res=\" + str(res));\n\
 let after = Packet_unpack(p);\n\
 assert(abs(after[\"scale\"] - 3.0) < 0.0001);\n\
 let oob_caught = false;\n\
@@ -5280,7 +5292,7 @@ assert(cap_denied);\n"
     #[test]
     fn jit_alloc_list_wasm_wasi_strings_arrays_and_direct_aot_strings() {
         // 1. JIT dynamic [..] list allocation + extended math helpers + List return
-        let jit_vy = r#"
+        let jit_kvr = r#"
 fn build_vec(a: Float, b: Float) -> List {
     let v = [a + b, hypot(a, b), log2(8), fmod(17, 5), log10(1000)];
     v[0] = v[0] * 2;
@@ -5304,7 +5316,7 @@ for i in range(0, 80) {
     assert(empty_len() == 0);
 }
 "#;
-        assert_eq!(run_source(jit_vy), Ok(()));
+        assert_eq!(run_source(jit_kvr), Ok(()));
 
         // 2. WASM + WASI linear memory, string literals, fixed arrays, _start, fd_write
         let wasm_src = r#"
@@ -5313,7 +5325,7 @@ fn calc(k: Int) -> Int {
     arr[1] = 77;
     return arr[1] + arr[-1] + len(arr);
 }
-let greeting = "veyra-wasi";
+let greeting = "kovrek-wasi";
 print(greeting);
 print(len(greeting));
 let res = calc(30);
@@ -5329,11 +5341,11 @@ return res;
         assert!(wat.contains("(export \"_start\""), "{wat}");
         let (_start_res, start_prints) =
             crate::native_codegen::wasm_run(&wasi_bytes, "_start", &[]).unwrap();
-        assert_eq!(start_prints, vec!["veyra-wasi", "10", "110"]);
+        assert_eq!(start_prints, vec!["kovrek-wasi", "11", "110"]);
         let (main_res, _) = crate::native_codegen::wasm_run(&wasi_bytes, "main", &[]).unwrap();
         assert_eq!(main_res, 110.0);
 
-        let wasm_vy = r#"
+        let wasm_kvr = r#"
 let b = wasm_compile("let s = \"hi\"; print(s); return len(s);", true);
 let r = wasm_run(b, "_start");
 assert(len(r["prints"]) == 1);
@@ -5341,7 +5353,7 @@ assert(r["prints"][0] == "hi");
 let m = wasm_run(b, "main");
 assert(m["result"] == 2);
 "#;
-        assert_eq!(run_source(wasm_vy), Ok(()));
+        assert_eq!(run_source(wasm_kvr), Ok(()));
 
         // 3. Direct zero-toolchain PE32+ / ELF64 strings + arrays
         let aot_src = r#"
@@ -5370,7 +5382,7 @@ print(xs[1] + xs[-1]);
         assert_eq!(&pe[0..2], b"MZ");
         #[cfg(target_os = "windows")]
         {
-            let dir = std::env::temp_dir().join("veyra_sprint3_aot_test");
+            let dir = std::env::temp_dir().join("kovrek_sprint3_aot_test");
             let _ = std::fs::create_dir_all(&dir);
             let exe = dir.join("aot_str_arr.exe");
             std::fs::write(&exe, &pe).unwrap();
@@ -5384,7 +5396,7 @@ print(xs[1] + xs[-1]);
 
     #[test]
     fn sim_deterministic_cluster_and_partition_replay() {
-        let vy_src = r#"
+        let kvr_src = r#"
 fn run_cluster(seed: Int) -> Map {
     sim_start(seed);
     let node_a = sim_actor_spawn("nodeA", fn(msg, state) {
@@ -5437,12 +5449,12 @@ assert(r1["a"] == r2["a"] and r1["b"] == r2["b"]);
 assert(r1["tick"] == r2["tick"]);
 assert(len(r1["trace"]) == len(r2["trace"]) and len(r1["trace"]) >= 6);
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
     fn supervised_actors_one_for_all_and_rest_for_one() {
-        let vy_src = r#"
+        let kvr_src = r#"
 fn make_worker() -> Function {
     return fn(msg, state) {
         if msg == "inc" {
@@ -5519,12 +5531,12 @@ assert(supervisor_status(sup_ofa)["restarts"] >= 1);
 
 assert(actor_stop(ofa_ids[0]) and actor_stop(ofa_ids[1]) and actor_stop(ofa_ids[2]));
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
     fn gc_generational_write_barrier_and_arena_scope() {
-        let vy_src = r#"
+        let kvr_src = r#"
 class BoxNode {
     fn init(self, tag: String) -> Null {
         self.tag = tag;
@@ -5579,12 +5591,12 @@ assert(escaped.tag == "escaped_ok");
 let after_arena = gc_stats()["arena_freed"];
 assert(after_arena >= before_arena + 2, "expected arena_scope to free 2 dead temporaries");
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
     fn gpu_extended_fused_ops_linear_and_devices() {
-        let vy_src = r#"
+        let kvr_src = r#"
 let devs = gpu_devices();
 assert(len(devs) >= 1);
 let has_active = false;
@@ -5633,7 +5645,7 @@ let tv = tensor_values(t_silu);
 assert(abs(tv[0] - (0.5 / (1.0 + exp(-0.5)))) < 0.001);
 assert(abs(tv[1] - (2.0 / (1.0 + exp(-2.0)))) < 0.001);
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
@@ -5665,7 +5677,7 @@ assert(abs(tv[1] - (2.0 / (1.0 + exp(-2.0)))) < 0.001);
 
         // 2. Live NumPy transposed + strided slice via DLPack when CPython+NumPy is installed
         if crate::py_bridge::py_eval("1 + 1", None).is_ok() {
-            let vy_src = r#"
+            let kvr_src = r#"
 let has_np = py_eval("__import__('importlib.util', fromlist=['find_spec']).find_spec('numpy') is not None");
 if has_np {
     let np = py_import("numpy");
@@ -5688,16 +5700,16 @@ if has_np {
     py_free(np);
 }
 "#;
-            assert_eq!(run_source(vy_src), Ok(()));
+            assert_eq!(run_source(kvr_src), Ok(()));
         }
     }
 
     #[test]
     fn notebook_reactive_topological_dag_cycle_and_export() {
-        let dir = env::temp_dir().join("veyra_notebook_dag_test");
+        let dir = env::temp_dir().join("kovrek_notebook_dag_test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let nb_file = dir.join(".veyra-notebook.json");
+        let nb_file = dir.join(".kovrek-notebook.json");
         let session = std::sync::Arc::new(std::sync::Mutex::new(
             crate::server::NotebookSession::new(Some(nb_file)),
         ));
@@ -5765,7 +5777,7 @@ if has_np {
         let pos_leaf = order.iter().position(|x| x == "c_leaf").unwrap();
         assert!(pos_base < pos_mid && pos_mid < pos_leaf);
 
-        // Export topological .vy script: c_mid must appear before c_leaf
+        // Export topological .kvr script: c_mid must appear before c_leaf
         let (st_exp, _, exp_text) =
             crate::server::handle_notebook_api_request(&session, "GET", "/api/notebook/export", "");
         assert_eq!(st_exp, 200);
@@ -5832,7 +5844,7 @@ if has_np {
             }
         }
 
-        let prog = env::temp_dir().join("veyra_dap_watchpoint_test.vy");
+        let prog = env::temp_dir().join("kovrek_dap_watchpoint_test.kvr");
         fs::write(
             &prog,
             "let x = 1;\nlet y = 2;\nx = 10;\ny = 99;\nx = 20;\nprint(x + y);\n",
@@ -6020,7 +6032,7 @@ if has_np {
 
     #[test]
     fn gpu_tiled_flash_attention_fused_ln_and_mixed_precision() {
-        let vy_src = r#"
+        let kvr_src = r#"
 // 1. Inspect Workgroup shared-memory tiled GEMM & Flash-style online attention kernels
 let tm = gpu_kernel_inspect("tiled_matmul");
 assert(int(tm["spirv_words"][0]) == 119734787);
@@ -6116,7 +6128,7 @@ let out_t = gpu_attention(qt, kt, vt, true);
 assert(tensor_shape(out_t) == [2, 2]);
 assert(abs(tensor_values(out_t)[0] - 10.0) < 0.0001);
 "#;
-        assert_eq!(run_source(vy_src), Ok(()));
+        assert_eq!(run_source(kvr_src), Ok(()));
     }
 
     #[test]
@@ -6385,7 +6397,7 @@ assert(rep["gc"]["live_objects"] >= 0);
         assert_eq!(run_source(src), Ok(()));
 
         let temp_dir = std::env::temp_dir();
-        let file_path = temp_dir.join("veyra_sprint8_profile_test.vy");
+        let file_path = temp_dir.join("kovrek_sprint8_profile_test.kvr");
         std::fs::write(
             &file_path,
             "fn helper(n) { return n + 1; }\nlet total = 0;\nfor i in range(0, 5) { total = total + helper(i); }\n",
@@ -6399,11 +6411,12 @@ assert(rep["gc"]["live_objects"] >= 0);
     #[test]
     fn self_hosted_compiler_peephole_const_fold() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let compiler_src = fs::read_to_string(root.join("compiler-vy").join("src").join("main.vy"))
-            .expect("read compiler-vy/src/main.vy");
+        let compiler_src =
+            fs::read_to_string(root.join("compiler-kvr").join("src").join("main.kvr"))
+                .expect("read compiler-kvr/src/main.kvr");
         let check_src = format!(
             "{compiler_src}\n\
-            let bc = compile_veyra_to_vybc(\"return (2 + 3 * 4) - 1 + (-2);\");\n\
+            let bc = compile_kovrek_to_kvbc(\"return (2 + 3 * 4) - 1 + (-2);\");\n\
             let parsed = json_parse(bc);\n\
             let ops = parsed[\"ops\"];\n\
             assert(len(ops) == 3);\n\
@@ -6411,9 +6424,9 @@ assert(rep["gc"]["live_objects"] >= 0);
             assert(ops[0][\"val\"][\"v\"] == 11);\n\
             assert(ops[1][\"op\"] == \"Return\");\n\
             assert(ops[2][\"op\"] == \"Halt\");\n\
-            vybc_run(bc);\n\
-            let check_bc = compile_veyra_to_vybc(\"let v = (2 + 3 * 4) - 1 + (-2); assert(v == 11);\");\n\
-            vybc_run(check_bc);\n"
+            kvbc_run(bc);\n\
+            let check_bc = compile_kovrek_to_kvbc(\"let v = (2 + 3 * 4) - 1 + (-2); assert(v == 11);\");\n\
+            kvbc_run(check_bc);\n"
         );
         assert_eq!(run_source(&check_src), Ok(()));
     }

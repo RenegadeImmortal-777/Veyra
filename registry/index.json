@@ -1,373 +1,373 @@
 {
     "packages":  {
-                     "vyalgo":  {
-                                    "entry":  "vyalgo.vy",
-                                    "source":  "../packages/vyalgo",
+                     "kvalgo":  {
+                                    "entry":  "kvalgo.kvr",
+                                    "source":  "../packages/kvalgo",
                                     "version":  "0.1.0"
                                 },
-                     "vycollections":  {
-                                           "entry":  "vycollections.vy",
-                                           "source":  "../packages/vycollections",
+                     "kvcollections":  {
+                                           "entry":  "kvcollections.kvr",
+                                           "source":  "../packages/kvcollections",
                                            "version":  "0.1.0"
                                        },
-                     "vyhello":  {
-                                     "entry":  "src/main.vy",
-                                     "source":  "../packages/vyhello",
+                     "kvhello":  {
+                                     "entry":  "src/main.kvr",
+                                     "source":  "../packages/kvhello",
                                      "version":  "0.1.0"
                                  },
-                     "vymath":  {
-                                    "entry":  "vymath.vy",
-                                    "source":  "../packages/vymath",
+                     "kvmath":  {
+                                    "entry":  "kvmath.kvr",
+                                    "source":  "../packages/kvmath",
                                     "version":  "0.2.0"
                                 },
-                     "vystats":  {
-                                     "entry":  "vystats.vy",
-                                     "source":  "../packages/vystats",
+                     "kvstats":  {
+                                     "entry":  "kvstats.kvr",
+                                     "source":  "../packages/kvstats",
                                      "version":  "0.1.0"
                                  },
-                     "vytest":  {
-                                    "entry":  "vytest.vy",
-                                    "source":  "../packages/vytest",
+                     "kvtest":  {
+                                    "entry":  "kvtest.kvr",
+                                    "source":  "../packages/kvtest",
                                     "version":  "0.3.0"
                                 },
-                     "vytext":  {
-                                    "entry":  "vytext.vy",
-                                    "source":  "../packages/vytext",
+                     "kvtext":  {
+                                    "entry":  "kvtext.kvr",
+                                    "source":  "../packages/kvtext",
                                     "version":  "0.1.0"
                                 },
-                     "vyscience":  {
+                     "kvscience":  {
                                        "version":  "0.2.0",
-                                       "entry":  "vyscience.vy",
-                                       "source":  "../packages/vyscience"
+                                       "entry":  "kvscience.kvr",
+                                       "source":  "../packages/kvscience"
                                    },
-                     "vyml":  {
+                     "kvml":  {
                                   "version":  "0.3.0",
-                                  "entry":  "vyml.vy",
-                                  "source":  "../packages/vyml"
+                                  "entry":  "kvml.kvr",
+                                  "source":  "../packages/kvml"
                               },
-                     "vydata":  {
+                     "kvdata":  {
                                     "version":  "0.4.0",
-                                    "entry":  "vydata.vy",
-                                    "source":  "../packages/vydata"
+                                    "entry":  "kvdata.kvr",
+                                    "source":  "../packages/kvdata"
                                 },
-                     "vygui":  {
+                     "kvgui":  {
                                    "version":  "0.1.0",
-                                   "entry":  "vygui.vy",
-                                   "source":  "../packages/vygui"
+                                   "entry":  "kvgui.kvr",
+                                   "source":  "../packages/kvgui"
                                },
-                     "vyweb":  {
+                     "kvweb":  {
                                    "version":  "0.4.0",
-                                   "entry":  "vyweb.vy",
-                                   "source":  "../packages/vyweb"
+                                   "entry":  "kvweb.kvr",
+                                   "source":  "../packages/kvweb"
                                },
-                     "vyplot":  {
+                     "kvplot":  {
                                     "version":  "0.2.0",
-                                    "entry":  "vyplot.vy",
-                                    "source":  "../packages/vyplot"
+                                    "entry":  "kvplot.kvr",
+                                    "source":  "../packages/kvplot"
                                 },
-                     "vyhttp":  {
+                     "kvhttp":  {
                                     "version":  "0.2.0",
-                                    "entry":  "vyhttp.vy",
-                                    "source":  "../packages/vyhttp"
+                                    "entry":  "kvhttp.kvr",
+                                    "source":  "../packages/kvhttp"
                                 },
-                     "vyconcurrent":  {
+                     "kvconcurrent":  {
                                           "version":  "0.2.0",
-                                          "entry":  "vyconcurrent.vy",
-                                          "source":  "../packages/vyconcurrent"
+                                          "entry":  "kvconcurrent.kvr",
+                                          "source":  "../packages/kvconcurrent"
                                       },
-                     "vyffi":  {
+                     "kvffi":  {
                                    "version":  "0.1.0",
-                                   "entry":  "vyffi.vy",
-                                   "source":  "../packages/vyffi"
+                                   "entry":  "kvffi.kvr",
+                                   "source":  "../packages/kvffi"
                                },
-                     "vyjson":  {
+                     "kvjson":  {
                                     "version":  "0.1.0",
-                                    "entry":  "vyjson.vy",
-                                    "source":  "../packages/vyjson"
+                                    "entry":  "kvjson.kvr",
+                                    "source":  "../packages/kvjson"
                                 },
-                     "vyregex":  {
+                     "kvregex":  {
                                      "version":  "0.1.0",
-                                     "entry":  "vyregex.vy",
-                                     "source":  "../packages/vyregex"
+                                     "entry":  "kvregex.kvr",
+                                     "source":  "../packages/kvregex"
                                  },
-                     "vycrypto":  {
+                     "kvcrypto":  {
                                       "version":  "0.1.0",
-                                      "entry":  "vycrypto.vy",
-                                      "source":  "../packages/vycrypto"
+                                      "entry":  "kvcrypto.kvr",
+                                      "source":  "../packages/kvcrypto"
                                   },
-                     "vysqlite":  {
+                     "kvsqlite":  {
                                       "version":  "0.2.0",
-                                      "entry":  "vysqlite.vy",
-                                      "source":  "../packages/vysqlite"
+                                      "entry":  "kvsqlite.kvr",
+                                      "source":  "../packages/kvsqlite"
                                   },
-                     "vyos":  {
+                     "kvos":  {
                                   "version":  "0.2.0",
-                                  "entry":  "vyos.vy",
-                                  "source":  "../packages/vyos"
+                                  "entry":  "kvos.kvr",
+                                  "source":  "../packages/kvos"
                               },
-                     "vylinalg":  {
+                     "kvlinalg":  {
                                       "version":  "0.1.0",
-                                      "entry":  "vylinalg.vy",
-                                      "source":  "../packages/vylinalg"
+                                      "entry":  "kvlinalg.kvr",
+                                      "source":  "../packages/kvlinalg"
                                   },
-                     "vyframe":  {
+                     "kvframe":  {
                                      "version":  "0.2.0",
-                                     "entry":  "vyframe.vy",
-                                     "source":  "../packages/vyframe"
+                                     "entry":  "kvframe.kvr",
+                                     "source":  "../packages/kvframe"
                                  },
-                     "vydatetime":  {
+                     "kvdatetime":  {
                                         "version":  "0.1.0",
-                                        "entry":  "vydatetime.vy",
-                                        "source":  "../packages/vydatetime"
+                                        "entry":  "kvdatetime.kvr",
+                                        "source":  "../packages/kvdatetime"
                                     },
-                     "vyencoding":  {
+                     "kvencoding":  {
                                         "version":  "0.1.0",
-                                        "entry":  "vyencoding.vy",
-                                        "source":  "../packages/vyencoding"
+                                        "entry":  "kvencoding.kvr",
+                                        "source":  "../packages/kvencoding"
                                     },
-                     "vyconfig":  {
+                     "kvconfig":  {
                                       "version":  "0.1.0",
-                                      "entry":  "vyconfig.vy",
-                                      "source":  "../packages/vyconfig"
+                                      "entry":  "kvconfig.kvr",
+                                      "source":  "../packages/kvconfig"
                                   },
-                     "vyuuid":  {
+                     "kvuuid":  {
                                     "version":  "0.1.0",
-                                    "entry":  "vyuuid.vy",
-                                    "source":  "../packages/vyuuid"
+                                    "entry":  "kvuuid.kvr",
+                                    "source":  "../packages/kvuuid"
                                 },
-                     "vysets":  {
+                     "kvsets":  {
                                     "version":  "0.1.0",
-                                    "entry":  "vysets.vy",
-                                    "source":  "../packages/vysets"
+                                    "entry":  "kvsets.kvr",
+                                    "source":  "../packages/kvsets"
                                 },
-                     "vyfunctional":  {
+                     "kvfunctional":  {
                                           "version":  "0.1.0",
-                                          "entry":  "vyfunctional.vy",
-                                          "source":  "../packages/vyfunctional"
+                                          "entry":  "kvfunctional.kvr",
+                                          "source":  "../packages/kvfunctional"
                                       },
-                     "vyviz":  {
+                     "kvviz":  {
                                    "version":  "0.1.0",
-                                   "entry":  "vyviz.vy",
-                                   "source":  "../packages/vyviz"
+                                   "entry":  "kvviz.kvr",
+                                   "source":  "../packages/kvviz"
                                },
-                     "vyasync":  {
+                     "kvasync":  {
                                      "version":  "0.2.0",
-                                     "entry":  "vyasync.vy",
-                                     "source":  "../packages/vyasync"
+                                     "entry":  "kvasync.kvr",
+                                     "source":  "../packages/kvasync"
                                  },
-                     "vyiter":  {
+                     "kviter":  {
                                     "version":  "0.1.0",
-                                    "entry":  "vyiter.vy",
-                                    "source":  "../packages/vyiter"
+                                    "entry":  "kviter.kvr",
+                                    "source":  "../packages/kviter"
                                 },
-                     "vypath":  {
+                     "kvpath":  {
                                     "version":  "0.1.0",
-                                    "entry":  "vypath.vy",
-                                    "source":  "../packages/vypath"
+                                    "entry":  "kvpath.kvr",
+                                    "source":  "../packages/kvpath"
                                 },
-                     "vyfs":  {
+                     "kvfs":  {
                                   "version":  "0.1.0",
-                                  "entry":  "vyfs.vy",
-                                  "source":  "../packages/vyfs"
+                                  "entry":  "kvfs.kvr",
+                                  "source":  "../packages/kvfs"
                               },
-                     "vyprocess":  {
+                     "kvprocess":  {
                                        "version":  "0.1.0",
-                                       "entry":  "vyprocess.vy",
-                                       "source":  "../packages/vyprocess"
+                                       "entry":  "kvprocess.kvr",
+                                       "source":  "../packages/kvprocess"
                                    },
-                     "vyplatform":  {
+                     "kvplatform":  {
                                         "version":  "0.1.0",
-                                        "entry":  "vyplatform.vy",
-                                        "source":  "../packages/vyplatform"
+                                        "entry":  "kvplatform.kvr",
+                                        "source":  "../packages/kvplatform"
                                     },
-                     "vytoml":  {
+                     "kvtoml":  {
                                     "version":  "0.1.0",
-                                    "entry":  "vytoml.vy",
-                                    "source":  "../packages/vytoml"
+                                    "entry":  "kvtoml.kvr",
+                                    "source":  "../packages/kvtoml"
                                 },
-                     "vybase64":  {
+                     "kvbase64":  {
                                       "version":  "0.1.0",
-                                      "entry":  "vybase64.vy",
-                                      "source":  "../packages/vybase64"
+                                      "entry":  "kvbase64.kvr",
+                                      "source":  "../packages/kvbase64"
                                   },
-                     "vycsv":  {
+                     "kvcsv":  {
                                    "version":  "0.1.0",
-                                   "entry":  "vycsv.vy",
-                                   "source":  "../packages/vycsv"
+                                   "entry":  "kvcsv.kvr",
+                                   "source":  "../packages/kvcsv"
                                },
-                     "vyrandom":  {
+                     "kvrandom":  {
                                       "version":  "0.1.0",
-                                      "entry":  "vyrandom.vy",
-                                      "source":  "../packages/vyrandom"
+                                      "entry":  "kvrandom.kvr",
+                                      "source":  "../packages/kvrandom"
                                   },
-                     "vytime":  {
+                     "kvtime":  {
                                     "version":  "0.1.0",
-                                    "entry":  "vytime.vy",
-                                    "source":  "../packages/vytime"
+                                    "entry":  "kvtime.kvr",
+                                    "source":  "../packages/kvtime"
                                 },
-                     "vyhash":  {
+                     "kvhash":  {
                                     "version":  "0.1.0",
-                                    "entry":  "vyhash.vy",
-                                    "source":  "../packages/vyhash"
+                                    "entry":  "kvhash.kvr",
+                                    "source":  "../packages/kvhash"
                                 },
-                     "vymlmetrics":  {
+                     "kvmlmetrics":  {
                                          "version":  "0.2.0",
-                                         "entry":  "vymlmetrics.vy",
-                                         "source":  "../packages/vymlmetrics"
+                                         "entry":  "kvmlmetrics.kvr",
+                                         "source":  "../packages/kvmlmetrics"
                                      },
-                     "vystrings":  {
+                     "kvstrings":  {
                                        "version":  "0.1.0",
-                                       "entry":  "vystrings.vy",
-                                       "source":  "../packages/vystrings"
+                                       "entry":  "kvstrings.kvr",
+                                       "source":  "../packages/kvstrings"
                                    },
-                     "vyorm":  {
+                     "kvorm":  {
                                    "version":  "0.2.0",
-                                   "entry":  "vyorm.vy",
-                                   "source":  "../packages/vyorm"
+                                   "entry":  "kvorm.kvr",
+                                   "source":  "../packages/kvorm"
                                },
-                     "vyproperty":  {
+                     "kvproperty":  {
                                         "version":  "0.1.0",
-                                        "entry":  "vyproperty.vy",
-                                        "source":  "../packages/vyproperty"
+                                        "entry":  "kvproperty.kvr",
+                                        "source":  "../packages/kvproperty"
                                     },
-                     "vyrequest":  {
+                     "kvrequest":  {
                                        "version":  "0.1.0",
-                                       "entry":  "vyrequest.vy",
-                                       "source":  "../packages/vyrequest"
+                                       "entry":  "kvrequest.kvr",
+                                       "source":  "../packages/kvrequest"
                                    },
-                     "vytensor":  {
+                     "kvtensor":  {
                                       "version":  "0.3.0",
-                                      "entry":  "vytensor.vy",
-                                      "source":  "../packages/vytensor"
+                                      "entry":  "kvtensor.kvr",
+                                      "source":  "../packages/kvtensor"
                                   },
-                     "vyautograd":  {
+                     "kvautograd":  {
                                         "version":  "0.1.0",
-                                        "entry":  "vyautograd.vy",
-                                        "source":  "../packages/vyautograd"
+                                        "entry":  "kvautograd.kvr",
+                                        "source":  "../packages/kvautograd"
                                     },
-                     "vyoptim":  {
+                     "kvoptim":  {
                                      "version":  "0.2.0",
-                                     "entry":  "vyoptim.vy",
-                                     "source":  "../packages/vyoptim"
+                                     "entry":  "kvoptim.kvr",
+                                     "source":  "../packages/kvoptim"
                                  },
-                     "vynn":  {
+                     "kvnn":  {
                                   "version":  "0.2.0",
-                                  "entry":  "vynn.vy",
-                                  "source":  "../packages/vynn"
+                                  "entry":  "kvnn.kvr",
+                                  "source":  "../packages/kvnn"
                               },
-                     "vysecurity":  {
+                     "kvsecurity":  {
                                         "version":  "0.1.0",
-                                        "entry":  "vysecurity.vy",
-                                        "source":  "../packages/vysecurity"
+                                        "entry":  "kvsecurity.kvr",
+                                        "source":  "../packages/kvsecurity"
                                     },
-                     "vyauth":  {
-                                    "source":  "../packages/vyauth",
-                                    "entry":  "vyauth.vy",
+                     "kvauth":  {
+                                    "source":  "../packages/kvauth",
+                                    "entry":  "kvauth.kvr",
                                     "version":  "0.1.0"
                                 },
-                     "vyetl":  {
-                                   "source":  "../packages/vyetl",
-                                   "entry":  "vyetl.vy",
+                     "kvetl":  {
+                                   "source":  "../packages/kvetl",
+                                   "entry":  "kvetl.kvr",
                                    "version":  "0.1.0"
                                },
-                     "vyquery":  {
-                                     "source":  "../packages/vyquery",
-                                     "entry":  "vyquery.vy",
+                     "kvquery":  {
+                                     "source":  "../packages/kvquery",
+                                     "entry":  "kvquery.kvr",
                                      "version":  "0.1.0"
                                  },
-                     "vyarray":  {
-                                     "source":  "../packages/vyarray",
-                                     "entry":  "vyarray.vy",
+                     "kvarray":  {
+                                     "source":  "../packages/kvarray",
+                                     "entry":  "kvarray.kvr",
                                      "version":  "0.1.0"
                                  },
-                     "vyapi":  {
-                                   "source":  "../packages/vyapi",
-                                   "entry":  "vyapi.vy",
+                     "kvapi":  {
+                                   "source":  "../packages/kvapi",
+                                   "entry":  "kvapi.kvr",
                                    "version":  "0.2.0"
                                },
-                     "vyvalidate":  {
-                                        "source":  "../packages/vyvalidate",
-                                        "entry":  "vyvalidate.vy",
+                     "kvvalidate":  {
+                                        "source":  "../packages/kvvalidate",
+                                        "entry":  "kvvalidate.kvr",
                                         "version":  "0.1.0"
                                     },
-                     "vymodel":  {
-                                     "source":  "../packages/vymodel",
-                                     "entry":  "vymodel.vy",
+                     "kvmodel":  {
+                                     "source":  "../packages/kvmodel",
+                                     "entry":  "kvmodel.kvr",
                                      "version":  "0.2.0"
                                  },
-                     "vyserde":  {
-                                     "source":  "../packages/vyserde",
-                                     "entry":  "vyserde.vy",
+                     "kvserde":  {
+                                     "source":  "../packages/kvserde",
+                                     "entry":  "kvserde.kvr",
                                      "version":  "0.1.0"
                                  },
-                     "vyjit":  {
-                                   "source":  "../packages/vyjit",
-                                   "entry":  "vyjit.vy",
+                     "kvjit":  {
+                                   "source":  "../packages/kvjit",
+                                   "entry":  "kvjit.kvr",
                                    "version":  "0.1.0"
                                },
-                     "vygpu":  {
-                                   "source":  "../packages/vygpu",
-                                   "entry":  "vygpu.vy",
+                     "kvgpu":  {
+                                   "source":  "../packages/kvgpu",
+                                   "entry":  "kvgpu.kvr",
                                    "version":  "0.1.0"
                                },
-                     "vyplugin":  {
-                                      "source":  "../packages/vyplugin",
-                                      "entry":  "vyplugin.vy",
+                     "kvplugin":  {
+                                      "source":  "../packages/kvplugin",
+                                      "entry":  "kvplugin.kvr",
                                       "version":  "0.1.0"
                                   },
-                     "vycache":  {
-                                     "source":  "../packages/vycache",
-                                     "entry":  "vycache.vy",
+                     "kvcache":  {
+                                     "source":  "../packages/kvcache",
+                                     "entry":  "kvcache.kvr",
                                      "version":  "0.1.0"
                                  },
-                     "vydiff":  {
-                                    "source":  "../packages/vydiff",
-                                    "entry":  "vydiff.vy",
+                     "kvdiff":  {
+                                    "source":  "../packages/kvdiff",
+                                    "entry":  "kvdiff.kvr",
                                     "version":  "0.1.0"
                                 },
-                     "vytemplate":  {
-                                        "source":  "../packages/vytemplate",
-                                        "entry":  "vytemplate.vy",
+                     "kvtemplate":  {
+                                        "source":  "../packages/kvtemplate",
+                                        "entry":  "kvtemplate.kvr",
                                         "version":  "0.1.0"
                                     },
-                     "vyargparse":  {
-                                        "source":  "../packages/vyargparse",
-                                        "entry":  "vyargparse.vy",
+                     "kvargparse":  {
+                                        "source":  "../packages/kvargparse",
+                                        "entry":  "kvargparse.kvr",
                                         "version":  "0.1.0"
                                     },
-                     "vydecimal":  {
-                                       "source":  "../packages/vydecimal",
-                                       "entry":  "vydecimal.vy",
+                     "kvdecimal":  {
+                                       "source":  "../packages/kvdecimal",
+                                       "entry":  "kvdecimal.kvr",
                                        "version":  "0.2.0"
                                    },
-                     "vycomplex":  {
-                                       "source":  "../packages/vycomplex",
-                                       "entry":  "vycomplex.vy",
+                     "kvcomplex":  {
+                                       "source":  "../packages/kvcomplex",
+                                       "entry":  "kvcomplex.kvr",
                                        "version":  "0.1.0"
                                    },
-                     "vyitertools":  {
-                                         "source":  "../packages/vyitertools",
-                                         "entry":  "vyitertools.vy",
+                     "kvitertools":  {
+                                         "source":  "../packages/kvitertools",
+                                         "entry":  "kvitertools.kvr",
                                          "version":  "0.1.0"
                                      },
-                     "vyfunctools":  {
-                                         "source":  "../packages/vyfunctools",
-                                         "entry":  "vyfunctools.vy",
+                     "kvfunctools":  {
+                                         "source":  "../packages/kvfunctools",
+                                         "entry":  "kvfunctools.kvr",
                                          "version":  "0.1.0"
                                      },
-                     "vytyping":  {
-                                      "source":  "../packages/vytyping",
-                                      "entry":  "vytyping.vy",
+                     "kvtyping":  {
+                                      "source":  "../packages/kvtyping",
+                                      "entry":  "kvtyping.kvr",
                                       "version":  "0.1.0"
                                   },
-                     "vygraph":  {
-                                     "source":  "../packages/vygraph",
-                                     "entry":  "vygraph.vy",
+                     "kvgraph":  {
+                                     "source":  "../packages/kvgraph",
+                                     "entry":  "kvgraph.kvr",
                                      "version":  "0.1.0"
                                  },
-                     "vysemver":  {
-                                      "source":  "../packages/vysemver",
-                                      "entry":  "vysemver.vy",
+                     "kvsemver":  {
+                                      "source":  "../packages/kvsemver",
+                                      "entry":  "kvsemver.kvr",
                                       "version":  "0.1.0"
                                   }
                  },

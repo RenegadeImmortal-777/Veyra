@@ -20,7 +20,7 @@ pub(crate) fn new_project(name: &str) -> Result<(), String> {
         .file_name()
         .and_then(|x| x.to_str())
         .filter(|x| !x.is_empty())
-        .unwrap_or("veyra-app")
+        .unwrap_or("kovrek-app")
         .to_string();
     fs::create_dir_all(p.join("src")).map_err(|e| e.to_string())?;
     fs::create_dir_all(p.join("tests")).map_err(|e| e.to_string())?;
@@ -28,27 +28,27 @@ pub(crate) fn new_project(name: &str) -> Result<(), String> {
     let manifest = serde_json::json!({
         "name": project_name,
         "version": "0.1.0",
-        "entry": "src/main.vy",
+        "entry": "src/main.kvr",
         "edition": "2026",
         "engine": VERSION,
         "packages": {}
     });
     fs::write(
-        p.join("veyra.json"),
+        p.join("kovrek.json"),
         serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     fs::write(
-        p.join("src/main.vy"),
-        "const language: String = \"Veyra\";\nprint(\"Hello from\", language);\n",
+        p.join("src/main.kvr"),
+        "const language: String = \"Kovrek\";\nprint(\"Hello from\", language);\n",
     )
     .map_err(|e| e.to_string())?;
-    println!("Created Veyra project {name}");
+    println!("Created Kovrek project {name}");
     Ok(())
 }
 
 pub(crate) fn doctor() {
-    println!("Veyra {VERSION}");
+    println!("Kovrek {VERSION}");
     println!("engine: native Rust bytecode VM + AOT");
     println!(
         "jit: {}",
@@ -70,8 +70,8 @@ pub(crate) fn doctor() {
         println!("gpu: {backend} ({adapter})");
     }
     println!(
-        "plugin-abi: veyra_plugin_v{}",
-        crate::plugin::VEYRA_PLUGIN_ABI_VERSION
+        "plugin-abi: kovrek_plugin_v{}",
+        crate::plugin::KOVREK_PLUGIN_ABI_VERSION
     );
     println!("target: {}", env::consts::ARCH);
     println!("os: {}", env::consts::OS);
@@ -79,7 +79,7 @@ pub(crate) fn doctor() {
 }
 
 pub(crate) fn repl() -> Result<(), String> {
-    println!("Veyra {VERSION} native REPL — :quit to exit");
+    println!("Kovrek {VERSION} native REPL — :quit to exit");
     let mut line = String::new();
     loop {
         print!("vy> ");
@@ -104,6 +104,6 @@ pub(crate) fn repl() -> Result<(), String> {
 
 pub(crate) fn usage() {
     println!(
-        "Veyra {VERSION}\n\nUsage:\n  veyra run [--caps c1,c2] [file.vy]\n  veyra check [file.vy]\n  veyra verify [file.vy]\n  veyra lint [file.vy]\n  veyra debug [file.vy]\n  veyra dap\n  veyra ast [file.vy]\n  veyra symbols [file.vy]\n  veyra lsp\n  veyra test\n  veyra bench [file.vy] [iterations]\n  veyra profile [file.vy]\n  veyra doc [file.vy]\n  veyra aot [--direct] [--elf|--pe] [file.vy] [out_exe]\n  veyra wasm [--wasi] [file.vy] [-o out.wasm] [--disasm] [--run <fn> [args...]]\n  veyra ffi bindgen <header.h> <lib_path> [-o out.vy]\n  veyra notebook [dir] [port]\n  veyra build [--native]\n  veyra audit\n  veyra serve [dir] [port]\n  veyra web <routes.json> [port]\n  veyra app <app.vy> <routes.json> [port]\n  veyra disasm [file.vy]\n  veyra fmt <file.vy>\n  veyra new <name>\n  veyra pkg list\n  veyra pkg search <term>\n  veyra pkg info <name>\n  veyra pkg tree\n  veyra pkg add <name[@semver]>\n  veyra pkg remove <name>\n  veyra pkg update [name]\n  veyra pkg installed\n  veyra pkg install\n  veyra pkg publish\n  veyra pkg keygen [name]\n  veyra pkg sign [dir] [key]\n  veyra pkg verify [target]\n  veyra pkg pack [dir] [out.vypkg.json]\n  veyra pkg unpack <bundle.vypkg.json> [dest]\n  veyra pkg build-plugin [dir]\n  veyra pkg py-bridge <pypi_pkg> [out_dir] [--pip-install]\n  veyra pkg serve [dir] [port]\n  veyra doctor\n  veyra repl\n  veyra --version"
+        "Kovrek {VERSION}\n\nUsage:\n  kovrek run [--caps c1,c2] [file.kvr]\n  kovrek check [file.kvr]\n  kovrek verify [file.kvr]\n  kovrek lint [file.kvr]\n  kovrek debug [file.kvr]\n  kovrek dap\n  kovrek ast [file.kvr]\n  kovrek symbols [file.kvr]\n  kovrek lsp\n  kovrek test\n  kovrek bench [file.kvr] [iterations]\n  kovrek profile [file.kvr]\n  kovrek doc [file.kvr]\n  kovrek aot [--direct] [--elf|--pe] [file.kvr] [out_exe]\n  kovrek wasm [--wasi] [file.kvr] [-o out.wasm] [--disasm] [--run <fn> [args...]]\n  kovrek ffi bindgen <header.h> <lib_path> [-o out.kvr]\n  kovrek notebook [dir] [port]\n  kovrek build [--native]\n  kovrek audit\n  kovrek serve [dir] [port]\n  kovrek web <routes.json> [port]\n  kovrek app <app.kvr> <routes.json> [port]\n  kovrek disasm [file.kvr]\n  kovrek fmt <file.kvr>\n  kovrek new <name>\n  kovrek pkg list\n  kovrek pkg search <term>\n  kovrek pkg info <name>\n  kovrek pkg tree\n  kovrek pkg add <name[@semver]>\n  kovrek pkg remove <name>\n  kovrek pkg update [name]\n  kovrek pkg installed\n  kovrek pkg install\n  kovrek pkg publish\n  kovrek pkg keygen [name]\n  kovrek pkg sign [dir] [key]\n  kovrek pkg verify [target]\n  kovrek pkg pack [dir] [out.kvpkg.json]\n  kovrek pkg unpack <bundle.kvpkg.json> [dest]\n  kovrek pkg build-plugin [dir]\n  kovrek pkg py-bridge <pypi_pkg> [out_dir] [--pip-install]\n  kovrek pkg serve [dir] [port]\n  kovrek doctor\n  kovrek repl\n  kovrek --version"
     );
 }

@@ -1,7 +1,7 @@
-# Veyra Horizon Roadmap
+# Kovrek Horizon Roadmap
 
 ## Current platform
-- Complete Veyra 1 compatibility interpreter
+- Complete Kovrek 1 compatibility interpreter
 - Native Rust bytecode VM
 - Unified CLI
 - Project manifests and builds

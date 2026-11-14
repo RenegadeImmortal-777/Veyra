@@ -1,0 +1,69 @@
+// Kovrek's First File — Hello, Kovrek 12.0 Sovereign
+// Check:  .\bin\kovrek-native.exe check examples\first_kovrek.kvr
+// Verify: .\bin\kovrek-native.exe verify examples\first_kovrek.kvr
+// Run:    .\bin\kovrek-native.exe run examples\first_kovrek.kvr
+
+const LANGUAGE: String = "Kovrek";
+const RELEASE: String = "12.0 Sovereign";
+
+@secret
+fn load_release_token() -> String {
+    return "kvr-sovereign-001";
+}
+
+@linear
+fn acquire_compile_slot(target: String) -> String {
+    return "slot:" + target;
+}
+
+@verify
+fn checked_throughput(workers: Int, tasks_per_worker: Int) -> Int {
+    requires(workers >= 1, "workers >= 1");
+    requires(workers <= 64, "workers <= 64");
+    requires(tasks_per_worker >= 1, "tasks_per_worker >= 1");
+    requires(tasks_per_worker <= 1000, "tasks_per_worker <= 1000");
+    let step = 0;
+    while step < workers {
+        step += 1;
+    }
+    let total = step * tasks_per_worker;
+    ensures(total >= 1, "total >= 1");
+    return (1000 / step) + total;
+}
+
+class BuildFrame {
+    fn __init__(self, target: String, ops: Int) {
+        self.target = target;
+        self.ops = ops;
+    }
+}
+
+fn measure_frame(target: String, ops: Int) -> Int {
+    let frame = BuildFrame(target, ops);
+    return frame.ops * 2;
+}
+
+let safe_tok = sanitize(load_release_token());
+let slot = acquire_compile_slot("first-kovrek");
+linear_consume(slot);
+
+profile_start();
+let score = checked_throughput(8, 25);
+let doubled = measure_frame(LANGUAGE, score);
+let prof = profile_stop();
+
+assert(score == 325, "throughput mismatch");
+assert(doubled == 650, "frame doubling mismatch");
+assert(prof["gc"]["auto_arena_scopes"] >= 1, "auto_arena inactive");
+
+let summary = {
+    "language": LANGUAGE,
+    "release": RELEASE,
+    "token": safe_tok,
+    "throughput": score,
+    "arena_doubled": doubled,
+    "auto_arena_scopes": prof["gc"]["auto_arena_scopes"]
+};
+
+print("Hello from", LANGUAGE, RELEASE);
+print("Summary JSON:", json_stringify(summary));

@@ -1,11 +1,11 @@
-# Veyra build artifacts
+# Kovrek build artifacts
 engine-rs/target/
 __pycache__/
 tests/__pycache__/
 *.pyc
 dist/
-.veyra/
-*.vyc
+.kovrek/
+*.kvc
 
 gate-report.txt
 /cache/

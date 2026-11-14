@@ -7,11 +7,11 @@ labels: bug
 
 ## Environment
 - OS & Architecture: (e.g., Windows 11 x86_64, Ubuntu 24.04 x86_64, macOS arm64)
-- `veyra --version` output:
-- Execution mode: (`veyra run` / `veyra verify` / `veyra aot --direct` / `veyra wasm` / `cargo test`)
+- `kovrek --version` output:
+- Execution mode: (`kovrek run` / `kovrek verify` / `kovrek aot --direct` / `kovrek wasm` / `cargo test`)
 
-## Minimal Reproduction (`.vy`)
-```veyra
+## Minimal Reproduction (`.kvr`)
+```kovrek
 // Paste a minimal snippet that reproduces the issue
 ```
 

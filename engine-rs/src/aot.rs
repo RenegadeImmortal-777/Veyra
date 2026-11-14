@@ -1,4 +1,4 @@
-// Native AOT compiler backend: compiles Veyra AST to standalone optimized
+// Native AOT compiler backend: compiles Kovrek AST to standalone optimized
 // Rust machine code via `rustc`. Works offline with zero extra dependencies
 // and compiles cleanly under `--no-default-features`.
 
@@ -2239,7 +2239,7 @@ pub(crate) fn compile_source_to_native(src: &str, out_exe: &Path) -> Result<(), 
     }
     let id = AOT_TEMP_IDS.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let tmp_rs = env::temp_dir().join(format!("veyra_aot_{pid}_{id}.rs"));
+    let tmp_rs = env::temp_dir().join(format!("kovrek_aot_{pid}_{id}.rs"));
     fs::write(&tmp_rs, &rust_code).map_err(|e| e.to_string())?;
     let _guard = TempFileGuard(tmp_rs.clone());
 
@@ -3474,7 +3474,7 @@ impl Rt {
         let Val::Object(id) = val else {
             return None;
         };
-        self.objects.get(*id).and_then(|o| match o.fields.get("__veyra_class__") {
+        self.objects.get(*id).and_then(|o| match o.fields.get("__kovrek_class__") {
             Some(Val::Str(s)) => Some(s.clone()),
             _ => None,
         })
@@ -3507,7 +3507,7 @@ impl Rt {
             .and_then(|c| c.metaclass.clone())
             .unwrap_or_else(|| "type".to_string());
         let mut fields = HashMap::new();
-        fields.insert("__veyra_class__".to_string(), Val::Str(cls_name.to_string()));
+        fields.insert("__kovrek_class__".to_string(), Val::Str(cls_name.to_string()));
         fields.insert("__name__".to_string(), Val::Str(cls_name.to_string()));
         let obj = self.alloc_object(&meta_name, fields);
         if let Val::Object(id) = obj {
@@ -4036,7 +4036,7 @@ impl Rt {
                         _ => self.call_val_kw(&func, full_args, kwargs),
                     };
                 }
-                if let Some(Val::Str(ref cls_name)) = snap.1.get("__veyra_class__") {
+                if let Some(Val::Str(ref cls_name)) = snap.1.get("__kovrek_class__") {
                     return self.instantiate_kw(cls_name, args, kwargs);
                 }
                 if let Some(res) = self.try_dunder(val, "__call__", args, kwargs)? {
@@ -4677,7 +4677,7 @@ impl Rt {
             }
             return Err(Flow::Err(format!("'property' object has no attribute '{name}'")));
         }
-        if let Some(Val::Str(ref cname)) = fields.get("__veyra_class__") {
+        if let Some(Val::Str(ref cname)) = fields.get("__kovrek_class__") {
             match name {
                 "__name__" => return Ok(Val::Str(cname.clone())),
                 "__bases__" => {
@@ -4822,7 +4822,7 @@ impl Rt {
                 .ok_or_else(|| Flow::Err("dangling object".into()))?;
             (
                 data.class_name.clone(),
-                match data.fields.get("__veyra_class__") {
+                match data.fields.get("__kovrek_class__") {
                     Some(Val::Str(s)) => Some(s.clone()),
                     _ => None,
                 },
@@ -4918,7 +4918,7 @@ impl Rt {
                 .ok_or_else(|| Flow::Err("dangling object".into()))?;
             (
                 data.class_name.clone(),
-                match data.fields.get("__veyra_class__") {
+                match data.fields.get("__kovrek_class__") {
                     Some(Val::Str(s)) => Some(s.clone()),
                     _ => None,
                 },
@@ -5161,7 +5161,7 @@ impl Rt {
                         .ok_or_else(|| Flow::Err("dangling object".into()))?;
                     (
                         obj.class_name.clone(),
-                        obj.fields.contains_key("__veyra_class__"),
+                        obj.fields.contains_key("__kovrek_class__"),
                         obj.fields.contains_key(name),
                         matches!(
                             obj.class_name.as_str(),
@@ -5640,7 +5640,7 @@ impl Rt {
                 let ok = match &args[0] {
                     Val::Fn(_) => true,
                     Val::Object(id) => self.objects.get(*id).is_some_and(|o| {
-                        o.fields.contains_key("__veyra_class__")
+                        o.fields.contains_key("__kovrek_class__")
                             || o.class_name == "__bound_method__"
                             || (!matches!(
                                 o.class_name.as_str(),

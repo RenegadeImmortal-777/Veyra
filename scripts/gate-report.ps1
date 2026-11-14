@@ -1,4 +1,4 @@
-# Veyra release gate report
+# Kovrek release gate report
 #
 # Runs every release gate in order, captures the RAW output and the exit code of
 # each one, and writes gate-report.txt at the repository root.
@@ -30,7 +30,7 @@ function Add-Line {
     Write-Host $Text
 }
 
-Add-Line 'Veyra gate report'
+Add-Line 'Kovrek gate report'
 if ($Quick) { Add-Line 'mode      : QUICK (Rust gates only)' }
 Add-Line ("generated : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 Add-Line ("machine   : {0}" -f $env:COMPUTERNAME)

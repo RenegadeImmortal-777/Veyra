@@ -358,7 +358,7 @@ pub(crate) fn lsp_completion_items() -> JsonValue {
         words.iter().map(|w| serde_json::json!({
             "label": w,
             "kind": if ["let","const","fn","class","return","if","else","while","for","in","try","catch","throw","match","case","break","continue","await"].contains(w) { 14 } else { 3 },
-            "detail": "Veyra"
+            "detail": "Kovrek"
         })).collect()
     )
 }
@@ -406,7 +406,7 @@ pub(crate) fn lsp_diagnostics(text: &str) -> Vec<JsonValue> {
                     "end": {"line":line,"character":1}
                 },
                 "severity": 1,
-                "source": "veyra",
+                "source": "kovrek",
                 "message": message
             })]
         }
@@ -563,7 +563,7 @@ pub(crate) fn lsp_server() -> Result<(), String> {
             "documentSymbolProvider": true,
             "documentFormattingProvider": true
         },
-        "serverInfo": {"name": "Veyra Language Server", "version": VERSION}
+        "serverInfo": {"name": "Kovrek Language Server", "version": VERSION}
     });
     connection
         .initialize_finish(initialize_id, initialize_result)
@@ -607,7 +607,7 @@ pub(crate) fn lsp_server() -> Result<(), String> {
                             serde_json::json!({
                                 "contents": {
                                     "kind": "markdown",
-                                    "value": format!("Veyra symbol: {word}\n\nNative symbol or language construct.")
+                                    "value": format!("Kovrek symbol: {word}\n\nNative symbol or language construct.")
                                 }
                             })
                         }

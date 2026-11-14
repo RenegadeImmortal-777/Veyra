@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Kovrek",
+  "scopeName": "source.kovrek",
+  "patterns": [
+    {"name":"comment.line.double-slash.kovrek","match":"//.*$"},
+    {"name":"comment.block.kovrek","begin":"/\\*","end":"\\*/"},
+    {"name":"string.quoted.double.kovrek","begin":"\"","end":"\""},
+    {"name":"keyword.control.kovrek","match":"\\b(if|else|while|for|in|return|use|async|try|catch|finally|throw|with|as|break|continue|await|yield|match|case|and|or|not)\\b"},
+    {"name":"storage.type.kovrek","match":"\\b(Int|Float|Number|String|Bool|List|Map|Function|Generator|Object|Null|Any|Void)\\b"},
+    {"name":"storage.modifier.kovrek","match":"\\b(let|const|fn|class)\\b"},
+    {"name":"constant.language.kovrek","match":"\\b(true|false|null)\\b"},
+    {"name":"constant.numeric.kovrek","match":"\\b[0-9]+(?:\\.[0-9]+)?\\b"},
+    {"name":"entity.name.function.kovrek","match":"(?<=fn\\s)[A-Za-z_][A-Za-z0-9_]*"},
+    {"name":"entity.name.type.class.kovrek","match":"(?<=class\\s)[A-Za-z_][A-Za-z0-9_]*"}
+  ]
+}

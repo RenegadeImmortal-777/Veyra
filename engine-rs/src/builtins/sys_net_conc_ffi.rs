@@ -1015,7 +1015,7 @@ impl Vm {
                         let stem = src_path
                             .file_stem()
                             .and_then(|s| s.to_str())
-                            .unwrap_or("veyra_plugin");
+                            .unwrap_or("kovrek_plugin");
                         src_path.with_file_name(format!(
                             "{stem}.{}",
                             crate::plugin::platform_shared_ext()

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Veyra 12.0 "Sovereign" — Native Language, Prover, GPU & Fault Simulation</title>
+  <title>Kovrek 12.0 "Sovereign" — Native Language, Prover, GPU & Fault Simulation</title>
   <style>
     :root {
       --bg: #0b0f19;
@@ -173,7 +173,7 @@
 </head>
 <body>
   <header>
-    <div class="badge">Veyra 12.0 "Sovereign" • 130/130 Tests • 74/74 Packages • 8/8 Gates</div>
+    <div class="badge">Kovrek 12.0 "Sovereign" • 130/130 Tests • 74/74 Packages • 8/8 Gates</div>
     <h1>Python Ergonomics.<br/>One Native Full-Stack Language.</h1>
     <p class="subtitle">
       An 8.8 MB zero-dependency native runtime uniting Python-grade syntax, a 3-stage self-hosted compiler,
@@ -182,16 +182,16 @@
       and Wasm/PE32+/ELF64 AOT.
     </p>
     <div class="cta-row">
-      <a class="btn btn-primary" href="https://github.com/RenegadeImmortal-777/Veyra/releases/download/v12.0.0-sovereign/veyra-native-windows-x86_64.exe">
+      <a class="btn btn-primary" href="https://github.com/RenegadeImmortal-777/Kovrek/releases/download/v12.0.0-sovereign/kovrek-native-windows-x86_64.exe">
         Download Windows (x64)
       </a>
-      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Veyra/releases/download/v12.0.0-sovereign/veyra-native-linux-x86_64">
+      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Kovrek/releases/download/v12.0.0-sovereign/kovrek-native-linux-x86_64">
         Linux (x64)
       </a>
-      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Veyra/releases/download/v12.0.0-sovereign/veyra-native-macos-arm64">
+      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Kovrek/releases/download/v12.0.0-sovereign/kovrek-native-macos-arm64">
         macOS (arm64)
       </a>
-      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Veyra">
+      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Kovrek">
         GitHub Repository
       </a>
     </div>
@@ -200,7 +200,7 @@
   <main>
     <section class="playground">
       <div class="pg-bar">
-        <strong>Verified Sovereign Apex Showcase (Captured from <code>bin/veyra-native.exe</code>)</strong>
+        <strong>Verified Sovereign Apex Showcase (Captured from <code>bin/kovrek-native.exe</code>)</strong>
         <div class="pg-controls">
           <select id="preset" onchange="loadPreset()">
             <option value="verify">1. @verify Relational Prover + @secret + auto_arena</option>
@@ -228,32 +228,32 @@
       </div>
       <div class="card">
         <h3>Crash-Safe Actors, Wasm &amp; Direct AOT</h3>
-        <p>FoundationDB-style deterministic virtual-clock &amp; crash VFS testing, OTP supervised TCP actors, standalone <code>veyra wasm</code>, direct linker-free PE32+/ELF64 emission, and 74 verified packages.</p>
+        <p>FoundationDB-style deterministic virtual-clock &amp; crash VFS testing, OTP supervised TCP actors, standalone <code>kovrek wasm</code>, direct linker-free PE32+/ELF64 emission, and 74 verified packages.</p>
       </div>
     </section>
   </main>
 
   <footer>
-    Veyra 12.0 "Sovereign" • <a href="https://github.com/RenegadeImmortal-777/Veyra" style="color: var(--accent);">github.com/RenegadeImmortal-777/Veyra</a>
+    Kovrek 12.0 "Sovereign" • <a href="https://github.com/RenegadeImmortal-777/Kovrek" style="color: var(--accent);">github.com/RenegadeImmortal-777/Kovrek</a>
   </footer>
 
   <script>
     const PRESETS = {
       verify: {
         code: `@secret\nfn load_api_token() -> String { return "sk-live-98765"; }\n\n@linear\nfn open_handle(name: String) -> String { return "handle:" + name; }\n\n@verify\nfn safe_loop_budget(limit: Int) -> Int {\n    requires(limit >= 1, "limit >= 1");\n    let step = 0;\n    while step < limit { step += 1; }\n    ensures(step >= 1, "step >= 1");\n    return 1000 / step;\n}\n\nclass Scratch { fn __init__(self, seq: Int) { self.seq = seq; } }\nfn work_with_auto_arena(n: Int) -> Int {\n    let tmp = Scratch(n);\n    return tmp.seq * 2;\n}\n\nlet tok = sanitize(load_api_token());\nlet h = open_handle("wal-stream");\nlinear_consume(h);\nprofile_start();\nlet ratio = safe_loop_budget(10);\nlet doubled = work_with_auto_arena(ratio);\nlet prof = profile_stop();\nprint("sanitized token:", tok);\nprint("safe_loop_budget(10) =", ratio, "| auto_arena doubled =", doubled);\nprint("auto_arena scopes triggered:", prof["gc"]["auto_arena_scopes"]);`,
-        out: `$ veyra verify examples/sovereign/01_verify_safety.vy\n{\n  "contracts_proven": 3,\n  "counterexamples": [],\n  "diagnostics": [],\n  "functions_checked": 4,\n  "invariants_checked": 6,\n  "ok": true\n}\n\n$ veyra run examples/sovereign/01_verify_safety.vy\nsanitized token: sk-live-98765\nsafe_loop_budget(10) = 100 | auto_arena doubled = 200\nauto_arena scopes triggered: 1`
+        out: `$ kovrek verify examples/sovereign/01_verify_safety.kvr\n{\n  "contracts_proven": 3,\n  "counterexamples": [],\n  "diagnostics": [],\n  "functions_checked": 4,\n  "invariants_checked": 6,\n  "ok": true\n}\n\n$ kovrek run examples/sovereign/01_verify_safety.kvr\nsanitized token: sk-live-98765\nsafe_loop_budget(10) = 100 | auto_arena doubled = 200\nauto_arena scopes triggered: 1`
       },
       sim: {
         code: `sim_start(42);\nsim_fs_write("/wal/epoch1.ckpt", "{\\"committed\\":true,\\"offset\\":4096}");\nlet synced = sim_fs_sync();\nsim_fs_write("/wal/inflight.tmp", "uncommitted-dirty-page");\nlet crash = sim_fs_crash();\nprint("synced files:", synced, "| lost dirty:", crash["lost_dirty"]);\nprint("recovered:", sim_fs_read("/wal/epoch1.ckpt"));\nsim_stop();\n\nfn counter(state: Int, msg: Int) -> Map {\n    let next = state + msg;\n    return {"state": next, "reply": next};\n}\nlet aid = actor_spawn(counter, {"init": 100});\nlet node = actor_node_listen(aid, 0);\nprint("remote RPC:", actor_remote_ask(node["addr"], 15, 2000), actor_remote_ask(node["addr"], 27, 2000));\nactor_node_stop(node);\nactor_stop(aid);`,
-        out: `$ veyra run examples/sovereign/02_crash_sim_actors.vy\n=== Part 1: Deterministic Fault-Injectable Crash Simulation ===\nsynced files: 1 | lost dirty files on crash: 1\ndurable checkpoint recovered: {"committed":true,"offset":4096}\nvirtual files present after crash: [/wal/epoch1.ckpt]\n=== Part 2: Location-Transparent Supervised TCP Actors ===\nlistening on: 127.0.0.1:53745\nremote RPC replies: 115 142\ncluster shutdown clean`
+        out: `$ kovrek run examples/sovereign/02_crash_sim_actors.kvr\n=== Part 1: Deterministic Fault-Injectable Crash Simulation ===\nsynced files: 1 | lost dirty files on crash: 1\ndurable checkpoint recovered: {"committed":true,"offset":4096}\nvirtual files present after crash: [/wal/epoch1.ckpt]\n=== Part 2: Location-Transparent Supervised TCP Actors ===\nlistening on: 127.0.0.1:53745\nremote RPC replies: 115 142\ncluster shutdown clean`
       },
       gpu: {
         code: `let tm = gpu_kernel_inspect("tiled_matmul");\nlet ak = gpu_kernel_inspect("attention_causal");\nprint("tiled_matmul uses groupshared:", tm["uses_workgroup_shared"], "| SPIR-V words:", len(tm["spirv_words"]));\nprint("attention_causal SPIR-V words:", len(ak["spirv_words"]));\n\nlet attn = gpu_attention([[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], [[10.0, 0.0], [0.0, 20.0]], true);\nprint("causal flash attention output:", attn);\n\nlet x = tensor([[1.0, 2.0], [3.0, 4.0]], false);\nlet w = tensor([[0.5, -0.5], [1.0, 0.25]], true);\nlet bias = tensor([0.1, -0.2], true);\nfn train_step(x, w, bias) -> Float {\n    tensor_zero_grad(w); tensor_zero_grad(bias);\n    let pred = tensor_relu(tensor_add(tensor_matmul(x, w), bias));\n    let loss = tensor_mean(tensor_pow(pred, 2.0));\n    tensor_backward(loss);\n    tensor_adam_step(w, 0.08, 0.9, 0.999, 0.00000001);\n    tensor_adam_step(bias, 0.08, 0.9, 0.999, 0.00000001);\n    return tensor_values(loss)[0];\n}\nprofile_start();\nlet epoch = 1;\nwhile epoch <= 5 {\n    print("step", epoch, "loss =", round(train_step(x, w, bias), 5));\n    epoch += 1;\n}\nprint("profiled calls:", profile_stop()["total_calls"]);`,
-        out: `$ veyra profile examples/sovereign/03_gpu_flash_autograd.vy\ntiled_matmul uses groupshared: true | SPIR-V words: 673\nattention_causal SPIR-V words: 613\ncausal flash attention output: [[10, 0], [3.302384376525879, 13.395231246948242]]\nstep 1 loss = 9.53\nstep 2 loss = 7.45\nstep 3 loss = 5.63464\nstep 4 loss = 4.08653\nstep 5 loss = 2.80504\nprofiled calls: 5`
+        out: `$ kovrek profile examples/sovereign/03_gpu_flash_autograd.kvr\ntiled_matmul uses groupshared: true | SPIR-V words: 673\nattention_causal SPIR-V words: 613\ncausal flash attention output: [[10, 0], [3.302384376525879, 13.395231246948242]]\nstep 1 loss = 9.53\nstep 2 loss = 7.45\nstep 3 loss = 5.63464\nstep 4 loss = 4.08653\nstep 5 loss = 2.80504\nprofiled calls: 5`
       },
       oop: {
         code: `class Base {\n    fn __init__(self, label) { self.label = label; }\n}\n\nclass Engine(Base) {\n    fn compute(self, x) { return x ** 3; }\n}\n\nlet eng = Engine("Sovereign");\ntry {\n    print(eng.label, "cube(4) =", eng.compute(4));\n    let xs = [1, 2, 3];\n    print(xs[99]);\n} catch err {\n    print("Caught cleanly:", err);\n}`,
-        out: `$ veyra run oop_test.vy\nSovereign cube(4) = 64\nCaught cleanly: list index 99 out of range`
+        out: `$ kovrek run oop_test.kvr\nSovereign cube(4) = 64\nCaught cleanly: list index 99 out of range`
       }
     };
 
@@ -265,7 +265,7 @@
     function runSnippet() {
       const key = document.getElementById('preset').value;
       const outEl = document.getElementById('output');
-      outEl.textContent = "Verified output from veyra-native 12.0.0-sovereign:\n\n" + PRESETS[key].out;
+      outEl.textContent = "Verified output from kovrek-native 12.0.0-sovereign:\n\n" + PRESETS[key].out;
     }
     loadPreset();
   </script>

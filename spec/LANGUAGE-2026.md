@@ -1,6 +1,6 @@
-# Veyra Language Specification — 2026 Edition
+# Kovrek Language Specification — 2026 Edition
 
-Veyra source files use UTF-8 and the `.vy` extension.
+Kovrek source files use UTF-8 and the `.kvr` extension.
 
 Execution defaults to the native Rust Horizon engine, which does not require Python.
 Python interoperability described below is an optional bridge provided by the legacy
@@ -24,9 +24,9 @@ async function, with `await` and `gather` for tasks.
 ## Interoperability (Convergence runtime only)
 
 `py_import(name)` imports an installed Python module. Python objects participate in
-Veyra member access and calls. `py_call(fn, args, kwargs)` supports Python keyword
+Kovrek member access and calls. `py_call(fn, args, kwargs)` supports Python keyword
 arguments. `py_get`, `py_set` and `py_dir` provide reflection helpers. Project-local
-Python packages are isolated in `.veyra/venv` and managed by the Veyra CLI. The
+Python packages are isolated in `.kovrek/venv` and managed by the Kovrek CLI. The
 native engine has no equivalent of this bridge.
 
 ## Runtime services
@@ -39,15 +39,15 @@ runtime with reverse-mode autograd.
 
 ## Projects
 
-`veyra.json` is the manifest. `veyra add`/`remove`/`packages` manage dependencies,
-`veyra lock` captures exact installed versions, `veyra install` restores them, and
-`veyra audit` validates the dependency graph and package integrity.
+`kovrek.json` is the manifest. `kovrek add`/`remove`/`packages` manage dependencies,
+`kovrek lock` captures exact installed versions, `kovrek install` restores them, and
+`kovrek audit` validates the dependency graph and package integrity.
 
 ## Engines
 
 Two engines ship in this repository. The native Horizon engine is the default and
 implements the language surface above without Python. The legacy Convergence runtime
-implements the earlier Veyra 1 surface in Python and uniquely provides the
-`py_import` bridge. Both consume the same `.vy` source. The native engine is the
-migration target and, as of Veyra 11, has the broader language coverage; the
+implements the earlier Kovrek 1 surface in Python and uniquely provides the
+`py_import` bridge. Both consume the same `.kvr` source. The native engine is the
+migration target and, as of Kovrek 11, has the broader language coverage; the
 Convergence runtime's remaining distinct value is Python interoperability.

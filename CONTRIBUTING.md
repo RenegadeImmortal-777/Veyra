@@ -1,6 +1,6 @@
-# Contributing to Veyra
+# Contributing to Kovrek
 
-Thank you for checking out **Veyra 12.0 "Sovereign"**. All core compiler, VM, JIT, GPU, Formal Verification, Actor, and CLI systems live in Rust (`engine-rs/`) alongside the pure-Veyra self-hosted compiler (`compiler-vy/`), 74 curated packages (`packages/`), and VS Code tooling (`tooling/vscode/`).
+Thank you for checking out **Kovrek 12.0 "Sovereign"**. All core compiler, VM, JIT, GPU, Formal Verification, Actor, and CLI systems live in Rust (`engine-rs/`) alongside the pure-Kovrek self-hosted compiler (`compiler-kvr/`), 74 curated packages (`packages/`), and VS Code tooling (`tooling/vscode/`).
 
 ## Prerequisites
 
@@ -44,12 +44,12 @@ sh ./scripts/package-matrix.sh
 | `engine-rs/src/spirv.rs` & `gpu.rs` | Vulkan SPIR-V + Direct3D 11 HLSL compute emitters (tiled GEMM, causal FlashAttention, LayerNorm) |
 | `engine-rs/src/sim_actor.rs` | OTP supervisors, location-transparent TCP actors, deterministic virtual-clock & crash-safe VFS simulation |
 | `engine-rs/src/native_codegen.rs` | Standalone `.wasm` / WASI emitter & direct zero-toolchain PE32+/ELF64 binary writer |
-| `compiler-vy/src/main.vy` | 3-stage self-hosted pure-Veyra `.vybc` compiler |
+| `compiler-kvr/src/main.kvr` | 3-stage self-hosted pure-Kovrek `.kvbc` compiler |
 | `tooling/vscode/` | VS Code grammar, LSP client, and time-travel DAP integration |
 
 ## High-Impact Areas to Help With
 
-- **Cross-platform verification:** Testing direct ELF64 `veyra aot --direct --elf` and macOS `aarch64` JIT paths on Linux/macOS hardware.
-- **Standard library & examples:** Building real-world apps and benchmarks in `examples/` using `vyhttp`, `vysqlite`, `vyframe`, and `vytensor`.
-- **Self-hosted compiler passes:** Expanding IR optimizations and diagnostics in `compiler-vy/src/main.vy` while preserving the 3-stage fixpoint (`Stage 2 == Stage 3`).
+- **Cross-platform verification:** Testing direct ELF64 `kovrek aot --direct --elf` and macOS `aarch64` JIT paths on Linux/macOS hardware.
+- **Standard library & examples:** Building real-world apps and benchmarks in `examples/` using `kvhttp`, `kvsqlite`, `kvframe`, and `kvtensor`.
+- **Self-hosted compiler passes:** Expanding IR optimizations and diagnostics in `compiler-kvr/src/main.kvr` while preserving the 3-stage fixpoint (`Stage 2 == Stage 3`).
 - **Editor tooling:** Improving syntax scopes, snippets, and DAP UX in `tooling/vscode/`.

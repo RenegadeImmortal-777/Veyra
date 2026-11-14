@@ -1,7 +1,0 @@
-use "vyweb";
-
-fn user(req: Map) -> Map {
-    let id = param(req, "id");
-    let q = query_param(req, "q");
-    return json_response({"id":id, "q":q});
-}

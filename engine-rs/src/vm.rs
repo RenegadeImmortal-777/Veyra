@@ -1352,7 +1352,7 @@ impl Vm {
                         let o = heap.get(id).ok_or("dangling object")?;
                         Ok((
                             o.class_name.clone(),
-                            o.fields.contains_key("__veyra_class__"),
+                            o.fields.contains_key("__kovrek_class__"),
                             o.class_name == "__bound_method__",
                         ))
                     })()
@@ -1413,7 +1413,7 @@ impl Vm {
         let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
         Ok(heap
             .get(id)
-            .and_then(|o| match o.fields.get("__veyra_class__") {
+            .and_then(|o| match o.fields.get("__kovrek_class__") {
                 Some(Val::Str(name)) => Some(name.clone()),
                 _ => None,
             }))
@@ -1453,7 +1453,7 @@ impl Vm {
             .unwrap_or_else(|| "type".to_string());
         let mut fields = HashMap::new();
         fields.insert(
-            "__veyra_class__".to_string(),
+            "__kovrek_class__".to_string(),
             Val::Str(cls_name.to_string()),
         );
         fields.insert("__name__".to_string(), Val::Str(cls_name.to_string()));
@@ -1665,7 +1665,7 @@ impl Vm {
                 full_args.extend(args);
                 return self.invoke_ctx_sync(&func, full_args, kwargs, owner, Some(bound_self));
             }
-            if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+            if let Some(Val::Str(cls_name)) = snap.fields.get("__kovrek_class__") {
                 return self.instantiate_kw(cls_name, args, kwargs);
             }
             let (owner, def) = self
@@ -2000,7 +2000,7 @@ impl Vm {
             }
             return Err(format!("'property' object has no attribute '{name}'"));
         }
-        if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+        if let Some(Val::Str(cls_name)) = snap.fields.get("__kovrek_class__") {
             match name {
                 "__name__" => return Ok(Val::Str(cls_name.clone())),
                 "__bases__" => {
@@ -2236,7 +2236,7 @@ impl Vm {
             return Err("member assignment requires object".into());
         };
         let snap = self.object_data_snapshot(id)?;
-        if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+        if let Some(Val::Str(cls_name)) = snap.fields.get("__kovrek_class__") {
             let is_fn = matches!(value, Val::Function(ref fk) if !fk.starts_with("__builtin__:"))
                 .then(|| self.callable_def(&value).ok().map(|(_, d)| d))
                 .flatten();
@@ -2322,7 +2322,7 @@ impl Vm {
             return Err("delattr requires Object".into());
         };
         let snap = self.object_data_snapshot(id)?;
-        if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+        if let Some(Val::Str(cls_name)) = snap.fields.get("__kovrek_class__") {
             let map = Arc::make_mut(&mut self.classes);
             let cls = map
                 .get_mut(cls_name)
@@ -2441,7 +2441,7 @@ impl Vm {
                     Some(bound_self),
                 );
             }
-            if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+            if let Some(Val::Str(cls_name)) = snap.fields.get("__kovrek_class__") {
                 let inst = self.instantiate_kw(cls_name, args, kwargs)?;
                 self.stack.push(inst);
                 return Ok(());
@@ -2474,7 +2474,7 @@ impl Vm {
         if snap.class_name != "__super__"
             && snap.class_name != "__property__"
             && snap.class_name != "__bound_method__"
-            && !snap.fields.contains_key("__veyra_class__")
+            && !snap.fields.contains_key("__kovrek_class__")
             && !snap.fields.contains_key(name)
         {
             let mro = self.class_mro_slice(&snap.class_name);
@@ -3978,7 +3978,7 @@ impl Vm {
                 }
                 vars.sort();
                 eprintln!(
-                    "[veyra-debug pc={:04}] {:?} | stack=[{}] | vars={{ {} }}",
+                    "[kovrek-debug pc={:04}] {:?} | stack=[{}] | vars={{ {} }}",
                     self.ip,
                     op,
                     self.stack

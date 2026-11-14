@@ -16,14 +16,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bin_src: engine-rs/target/release/veyra
-            asset_name: veyra-native-linux-x86_64
+            bin_src: engine-rs/target/release/kovrek
+            asset_name: kovrek-native-linux-x86_64
           - os: macos-latest
-            bin_src: engine-rs/target/release/veyra
-            asset_name: veyra-native-macos-arm64
+            bin_src: engine-rs/target/release/kovrek
+            asset_name: kovrek-native-macos-arm64
           - os: windows-latest
-            bin_src: engine-rs/target/release/veyra.exe
-            asset_name: veyra-native-windows-x86_64.exe
+            bin_src: engine-rs/target/release/kovrek.exe
+            asset_name: kovrek-native-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

@@ -1,5 +1,5 @@
 // HTTP servers: static directory serving, file-backed routes and the dynamic
-// Veyra app server.
+// Kovrek app server.
 //
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
@@ -36,7 +36,7 @@ pub(crate) fn resolve_static_path(dir: &Path, request_url: &str) -> Option<PathB
 
 pub(crate) fn serve_directory(dir: &Path, port: u16) -> Result<(), String> {
     let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
-    println!("Veyra web server: http://127.0.0.1:{port}");
+    println!("Kovrek web server: http://127.0.0.1:{port}");
     println!("Serving {}", dir.display());
     for req in server.incoming_requests() {
         let response = if let Some(path) = resolve_static_path(dir, req.url()) {
@@ -73,7 +73,7 @@ pub(crate) fn serve_routes(routes_file: &Path, port: u16) -> Result<(), String> 
         .and_then(JsonValue::as_object)
         .ok_or("web route file requires a 'routes' object")?;
     let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
-    println!("Veyra API server: http://127.0.0.1:{port}");
+    println!("Kovrek API server: http://127.0.0.1:{port}");
     println!("Routes: {}", routes.len());
     for mut req in server.incoming_requests() {
         let path = req.url().split('?').next().unwrap_or("/");
@@ -166,7 +166,7 @@ pub(crate) fn query_params(url: &str) -> Val {
     Val::Map(pairs)
 }
 
-pub(crate) fn serve_veyra_app(
+pub(crate) fn serve_kovrek_app(
     app_file: &Path,
     routes_file: &Path,
     port: u16,
@@ -181,7 +181,7 @@ pub(crate) fn serve_veyra_app(
         .and_then(JsonValue::as_object)
         .ok_or("app routes file requires a 'routes' object")?;
     let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
-    println!("Veyra dynamic app: http://127.0.0.1:{port}");
+    println!("Kovrek dynamic app: http://127.0.0.1:{port}");
     println!("Handlers: {}", routes.len());
     for mut req in server.incoming_requests() {
         let full_url = req.url().to_string();
@@ -309,7 +309,7 @@ pub(crate) fn serve_veyra_app(
                     }
                     r
                 }
-                Err(e) => Response::from_string(format!("Veyra handler error: {e}"))
+                Err(e) => Response::from_string(format!("Kovrek handler error: {e}"))
                     .with_status_code(StatusCode(500)),
             }
         } else {
@@ -322,7 +322,7 @@ pub(crate) fn serve_veyra_app(
 
 pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
     let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
-    println!("Veyra Package Registry Server: http://127.0.0.1:{port}");
+    println!("Kovrek Package Registry Server: http://127.0.0.1:{port}");
     println!("Root {}", dir.display());
     for mut req in server.incoming_requests() {
         let method = req.method().as_str().to_string();
@@ -340,7 +340,7 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
                         let entry = bundle
                             .get("entry")
                             .and_then(JsonValue::as_str)
-                            .unwrap_or("src/main.vy");
+                            .unwrap_or("src/main.kvr");
                         let sha256 = bundle
                             .get("sha256")
                             .and_then(JsonValue::as_str)
@@ -355,7 +355,7 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
                                     let bundles_dir = dir.join("bundles");
                                     let _ = fs::create_dir_all(&bundles_dir);
                                     let _ =
-                                        fs::write(bundles_dir.join(format!("{name}.vypkg")), &body);
+                                        fs::write(bundles_dir.join(format!("{name}.kvpkg")), &body);
                                     let index_path = dir.join("registry").join("index.json");
                                     if let Some(parent) = index_path.parent() {
                                         let _ = fs::create_dir_all(parent);
@@ -374,7 +374,7 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
                                         "version": version,
                                         "entry": entry,
                                         "source": format!("../packages/{name}"),
-                                        "bundle_path": format!("/bundles/{name}.vypkg"),
+                                        "bundle_path": format!("/bundles/{name}.kvpkg"),
                                         "sha256": sha256
                                     });
                                     if let Some(deps) = bundle.get("dependencies") {
@@ -448,7 +448,7 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
 }
 
 // =========================================================================
-// Persistent Reactive Notebook Runtime & Server (`veyra notebook`)
+// Persistent Reactive Notebook Runtime & Server (`kovrek notebook`)
 // =========================================================================
 
 #[derive(Clone, Debug)]
@@ -955,21 +955,21 @@ pub(crate) fn handle_notebook_api_request(
 }
 
 pub(crate) fn serve_notebook(dir: &Path, port: u16) -> Result<(), String> {
-    let storage = dir.join(".veyra-notebook.json");
+    let storage = dir.join(".kovrek-notebook.json");
     let session = std::sync::Arc::new(std::sync::Mutex::new(NotebookSession::new(Some(
         storage.clone(),
     ))));
     let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
-    println!("Veyra Notebook server: http://127.0.0.1:{port}");
+    println!("Kovrek Notebook server: http://127.0.0.1:{port}");
     println!("Workspace: {}", dir.display());
 
     const UI_HTML: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>Veyra Notebook</title>
+<html><head><meta charset="utf-8"><title>Kovrek Notebook</title>
 <style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;background:#0f172a;color:#e2e8f0}
 textarea{width:100%;height:90px;background:#1e293b;color:#f8fafc;border:1px solid #334155;padding:.6rem;font-family:monospace}
 button{background:#38bdf8;color:#0f172a;border:0;padding:.45rem 1rem;border-radius:6px;font-weight:600;cursor:pointer;margin:.4rem .3rem 0 0}
 pre{background:#020617;padding:.75rem;border-radius:6px;white-space:pre-wrap}</style></head>
-<body><h1>Veyra Reactive Notebook</h1>
+<body><h1>Kovrek Reactive Notebook</h1>
 <div><input id="cid" value="cell1" style="padding:.4rem;background:#1e293b;color:#f8fafc;border:1px solid #334155"/>
 <button onclick="runCell()">Run Cell</button><button onclick="resetNb()">Reset Session</button></div>
 <textarea id="src" placeholder="let x = 21 * 2;&#10;print(x);"></textarea>

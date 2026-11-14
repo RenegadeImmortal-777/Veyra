@@ -1,4 +1,4 @@
-// Veyra GPU / Compute Acceleration Engine:
+// Kovrek GPU / Compute Acceleration Engine:
 // - On Windows: dynamically loads DXGI, Direct3D 11 (`d3d11.dll`), and HLSL
 //   shader compiler (`d3dcompiler_47.dll`), enumerates real hardware adapters,
 //   compiles `cs_5_0` compute shaders, and executes matrix multiplication,
@@ -492,7 +492,7 @@ mod d3d11_backend {
             }
             let entry_c = std::ffi::CString::new(entry).map_err(|e| e.to_string())?;
             let target_c = b"cs_5_0\0";
-            let name_c = b"veyra_compute.hlsl\0";
+            let name_c = b"kovrek_compute.hlsl\0";
             let mut code_raw: *mut c_void = core::ptr::null_mut();
             let mut err_raw: *mut c_void = core::ptr::null_mut();
             let hr = unsafe {
@@ -1507,9 +1507,9 @@ mod vulkan_backend {
             let app_info = VkApplicationInfo {
                 s_type: VK_STRUCTURE_TYPE_APPLICATION_INFO,
                 p_next: core::ptr::null(),
-                p_application_name: c"Veyra".as_ptr(),
+                p_application_name: c"Kovrek".as_ptr(),
                 application_version: 1,
-                p_engine_name: c"VeyraEngine".as_ptr(),
+                p_engine_name: c"KovrekEngine".as_ptr(),
                 engine_version: 1,
                 api_version: VK_API_VERSION_1_0,
             };
@@ -2845,7 +2845,7 @@ pub(crate) fn gpu_matmul_f64(a: &[f64], b: &[f64], m: usize, k: usize, n: usize)
                 if want_f64 {
                     if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                         st.dispatch_f64(
-                            "veyra:matmul:f64:v1",
+                            "kovrek:matmul:f64:v1",
                             HLSL_MATMUL_F64,
                             "CSMain",
                             a,
@@ -2862,7 +2862,7 @@ pub(crate) fn gpu_matmul_f64(a: &[f64], b: &[f64], m: usize, k: usize, n: usize)
                     let bf: Vec<f32> = b.iter().map(|&x| x as f32).collect();
                     if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                         st.dispatch(
-                            "veyra:matmul:v1",
+                            "kovrek:matmul:v1",
                             HLSL_MATMUL,
                             "CSMain",
                             &af,
@@ -2963,7 +2963,7 @@ pub(crate) fn gpu_ewise_f64(a: &[f64], b: &[f64], op_code: u32, scalar: f64) -> 
                     ];
                     if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                         st.dispatch_f64(
-                            "veyra:ewise:f64:v1",
+                            "kovrek:ewise:f64:v1",
                             HLSL_EWISE_F64,
                             "CSMain",
                             a,
@@ -2981,7 +2981,7 @@ pub(crate) fn gpu_ewise_f64(a: &[f64], b: &[f64], op_code: u32, scalar: f64) -> 
                     let cb = [a.len() as u32, op_code, (scalar as f32).to_bits(), 0];
                     if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                         st.dispatch(
-                            "veyra:ewise:v2",
+                            "kovrek:ewise:v2",
                             HLSL_EWISE,
                             "CSMain",
                             &af,
@@ -3040,7 +3040,7 @@ pub(crate) fn gpu_softmax_rows_f64(data: &[f64], rows: usize, cols: usize) -> Ve
                 let af: Vec<f32> = data.iter().map(|&x| x as f32).collect();
                 if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                     st.dispatch(
-                        "veyra:softmax:v1",
+                        "kovrek:softmax:v1",
                         HLSL_SOFTMAX,
                         "CSMain",
                         &af,
@@ -3090,7 +3090,7 @@ pub(crate) fn gpu_layernorm_f64(data: &[f64], rows: usize, cols: usize, eps: f64
                 let af: Vec<f32> = data.iter().map(|&x| x as f32).collect();
                 if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                     st.dispatch(
-                        "veyra:layernorm:v1",
+                        "kovrek:layernorm:v1",
                         HLSL_LAYERNORM,
                         "CSMain",
                         &af,
@@ -3166,7 +3166,7 @@ pub(crate) fn gpu_conv2d_f64(input: &[f64], weight: &[f64], d: &Conv2dDims) -> V
                 let bf: Vec<f32> = weight.iter().map(|&x| x as f32).collect();
                 if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                     st.dispatch(
-                        "veyra:conv2d:v1",
+                        "kovrek:conv2d:v1",
                         HLSL_CONV2D,
                         "CSMain",
                         &af,
@@ -3497,7 +3497,7 @@ pub(crate) fn gpu_tiled_matmul_f64(a: &[f64], b: &[f64], m: usize, k: usize, n: 
                     let src = hlsl_tiled_matmul();
                     if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                         st.dispatch(
-                            "veyra:tiled_matmul",
+                            "kovrek:tiled_matmul",
                             &src,
                             "CSMain",
                             &af,
@@ -3587,7 +3587,7 @@ pub(crate) fn gpu_attention_f64(
                 #[cfg(windows)]
                 {
                     let src = hlsl_attention(causal);
-                    let key = format!("veyra:attn:{}", u8::from(causal));
+                    let key = format!("kovrek:attn:{}", u8::from(causal));
                     if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                         st.dispatch(
                             &key,
@@ -3720,7 +3720,7 @@ pub(crate) fn gpu_fused_layernorm_f64(
                 #[cfg(windows)]
                 {
                     let src = hlsl_fused_layernorm_residual(act_code, has_gb);
-                    let key = format!("veyra:fused_ln:{act_code}:{}", u8::from(has_gb));
+                    let key = format!("kovrek:fused_ln:{act_code}:{}", u8::from(has_gb));
                     if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                         st.dispatch(
                             &key,
@@ -3832,7 +3832,7 @@ pub(crate) fn gpu_fuse_f64(ops: &[crate::spirv::FusedEwiseOp], a: &[f64], b: &[f
                 let af: Vec<f32> = a.iter().map(|&x| x as f32).collect();
                 let bf: Vec<f32> = b.iter().map(|&x| x as f32).collect();
                 let src = hlsl_fused_ewise(ops);
-                let key = format!("veyra:fused:{hash:016x}");
+                let key = format!("kovrek:fused:{hash:016x}");
                 if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                     st.dispatch(
                         &key,
@@ -3942,7 +3942,7 @@ pub(crate) fn gpu_fused_linear_f64(
                 #[cfg(windows)]
                 {
                     let src = hlsl_fused_linear(act_code, has_bias);
-                    let key = format!("veyra:fused_linear:{act_code}:{}", usize::from(has_bias));
+                    let key = format!("kovrek:fused_linear:{act_code}:{}", usize::from(has_bias));
                     if let Ok(out) = d3d11_backend::with_d3d11(|st| {
                         st.dispatch(
                             &key,
