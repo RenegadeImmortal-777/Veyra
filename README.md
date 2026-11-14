@@ -2,7 +2,7 @@
 
 > **Python ergonomics. Single-binary Rust runtime (`8.8 MB`). Static `@verify` proofs, GPU FlashAttention/tiled GEMM (`SPIR-V` + `HLSL`), crash-safe deterministic actors, and zero-toolchain native/Wasm AOT — with zero Python dependency.**
 
-[![Release Binaries](https://img.shields.io/badge/release-v12.0.0--sovereign-0ea5e9)](https://github.com/RenegadeImmortal-777/Kovrek/releases/tag/v12.0.0-sovereign)
+[![Release Binaries](https://img.shields.io/badge/release-v12.0.1--kovrek-0ea5e9)](https://github.com/RenegadeImmortal-777/Kovrek/releases/tag/v12.0.1-kovrek)
 [![Tests](https://img.shields.io/badge/cargo%20test-130%2F130%20pass-10b981)](STATUS.md)
 [![Packages](https://img.shields.io/badge/packages-74%2F74%20verified-10b981)](docs/PACKAGES.md)
 [![Gates](https://img.shields.io/badge/release%20gates-8%2F8%20pass-10b981)](STATUS.md)
@@ -54,7 +54,7 @@ sim_stop();
 ## Quick Start
 
 ### Option A: Prebuilt Native Binary (Recommended)
-1. Download the `v12.0.0-sovereign` binary for Windows/Linux/macOS from [GitHub Releases](https://github.com/RenegadeImmortal-777/Kovrek/releases/tag/v12.0.0-sovereign) (or run `.\INSTALL.bat` on Windows from a clone).
+1. Download the `v12.0.1-kovrek` binary for Windows/Linux/macOS from [GitHub Releases](https://github.com/RenegadeImmortal-777/Kovrek/releases/tag/v12.0.1-kovrek) (or run `.\INSTALL.bat` on Windows from a clone).
 2. Try the built-in demos right away:
 
 ```powershell

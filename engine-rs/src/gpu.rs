@@ -2292,6 +2292,7 @@ mod vulkan_backend {
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const HLSL_MATMUL: &str = r#"
 cbuffer Dims : register(b0) { uint M; uint K; uint N; uint Pad; };
 StructuredBuffer<float> A : register(t0);
@@ -2310,6 +2311,7 @@ void CSMain(uint3 gid : SV_DispatchThreadID) {
 }
 "#;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const HLSL_MATMUL_F64: &str = r#"
 cbuffer Dims : register(b0) { uint M; uint K; uint N; uint Pad; };
 StructuredBuffer<double> A : register(t0);
@@ -2328,6 +2330,7 @@ void CSMain(uint3 gid : SV_DispatchThreadID) {
 }
 "#;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const HLSL_EWISE: &str = r#"
 cbuffer Params : register(b0) { uint Len; uint OpCode; float Scalar; uint Pad; };
 StructuredBuffer<float> A : register(t0);
@@ -2354,6 +2357,7 @@ void CSMain(uint3 gid : SV_DispatchThreadID) {
 }
 "#;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const HLSL_EWISE_F64: &str = r#"
 cbuffer Params : register(b0) { uint Len; uint OpCode; uint ScalarLo; uint ScalarHi; };
 StructuredBuffer<double> A : register(t0);
@@ -2373,6 +2377,7 @@ void CSMain(uint3 gid : SV_DispatchThreadID) {
 }
 "#;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const HLSL_SOFTMAX: &str = r#"
 cbuffer Dims : register(b0) { uint Rows; uint Cols; uint Pad0; uint Pad1; };
 StructuredBuffer<float> In : register(t0);
@@ -2399,6 +2404,7 @@ void CSMain(uint3 gid : SV_DispatchThreadID) {
 }
 "#;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const HLSL_LAYERNORM: &str = r#"
 cbuffer Dims : register(b0) { uint Rows; uint Cols; float Eps; uint Pad; };
 StructuredBuffer<float> In : register(t0);
@@ -2426,6 +2432,7 @@ void CSMain(uint3 gid : SV_DispatchThreadID) {
 }
 "#;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const HLSL_CONV2D: &str = r#"
 cbuffer ConvDims : register(b0) {
     uint N; uint C; uint H; uint W;
@@ -2464,6 +2471,7 @@ void CSMain(uint3 gid : SV_DispatchThreadID) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResolvedBackend {
+    #[cfg_attr(not(windows), allow(dead_code))]
     D3D11,
     Vulkan,
     Cpu,
@@ -3320,6 +3328,7 @@ pub(crate) fn hlsl_fused_ewise(ops: &[crate::spirv::FusedEwiseOp]) -> String {
     s
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn hlsl_fused_linear(act_code: u32, has_bias: bool) -> String {
     let mut s = String::from(
         "cbuffer Params : register(b0) { uint M; uint K; uint N; uint _p3; };\n\
