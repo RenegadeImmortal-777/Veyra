@@ -579,6 +579,7 @@ impl Vm {
                 Val::Bool(Path::new(p).is_dir())
             }
             "read_file" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 1 {
                     return Err("read_file expects path".into());
                 }
@@ -589,6 +590,7 @@ impl Vm {
                 Val::Str(fs::read_to_string(p).map_err(|e| e.to_string())?)
             }
             "write_file" => {
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 2 {
                     return Err("write_file expects path,data".into());
                 }
@@ -617,6 +619,7 @@ impl Vm {
                     .to_string(),
             ),
             "env_get" => {
+                crate::runtime::require_cap("env")?;
                 if a.len() != 1 {
                     return Err("env_get expects key".into());
                 }

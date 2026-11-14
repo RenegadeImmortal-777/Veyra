@@ -446,3 +446,291 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
     }
     Ok(())
 }
+
+// =========================================================================
+// Persistent Reactive Notebook Runtime & Server (`veyra notebook`)
+// =========================================================================
+
+#[derive(Clone, Debug)]
+pub(crate) struct NotebookCellResult {
+    pub(crate) cell_id: String,
+    pub(crate) source: String,
+    pub(crate) stdout: String,
+    pub(crate) value: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) exec_count: usize,
+}
+
+pub(crate) struct NotebookSession {
+    vars: std::collections::HashMap<String, Val>,
+    funcs: std::sync::Arc<std::collections::HashMap<String, crate::bytecode::FunctionDef>>,
+    classes: std::sync::Arc<std::collections::HashMap<String, crate::bytecode::ClassDef>>,
+    objects: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u64, crate::bytecode::ObjectData>>,
+    >,
+    class_objects: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    pub(crate) cells: std::collections::BTreeMap<String, NotebookCellResult>,
+    exec_counter: usize,
+    storage_file: Option<PathBuf>,
+}
+
+impl NotebookSession {
+    pub(crate) fn new(storage_file: Option<PathBuf>) -> Self {
+        Self {
+            vars: std::collections::HashMap::new(),
+            funcs: std::sync::Arc::new(std::collections::HashMap::new()),
+            classes: std::sync::Arc::new(std::collections::HashMap::new()),
+            objects: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            class_objects: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            cells: std::collections::BTreeMap::new(),
+            exec_counter: 0,
+            storage_file,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.vars.clear();
+        self.funcs = std::sync::Arc::new(std::collections::HashMap::new());
+        self.classes = std::sync::Arc::new(std::collections::HashMap::new());
+        self.objects = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        self.class_objects =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        self.cells.clear();
+        self.exec_counter = 0;
+        self.persist();
+    }
+
+    fn persist(&self) {
+        let Some(ref path) = self.storage_file else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let items: Vec<JsonValue> = self
+            .cells
+            .values()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.cell_id,
+                    "source": c.source,
+                    "stdout": c.stdout,
+                    "value": c.value,
+                    "error": c.error,
+                    "exec_count": c.exec_count,
+                })
+            })
+            .collect();
+        if let Ok(raw) = serde_json::to_string_pretty(&serde_json::json!({ "cells": items })) {
+            let _ = fs::write(path, raw);
+        }
+    }
+
+    pub(crate) fn eval_cell(&mut self, cell_id: &str, source: &str) -> NotebookCellResult {
+        self.exec_counter += 1;
+        let exec_count = self.exec_counter;
+        let trimmed = source.trim();
+        let mut is_expr_fallback = false;
+
+        let predeclared: Vec<String> = self
+            .vars
+            .keys()
+            .chain(self.funcs.keys())
+            .chain(self.classes.keys())
+            .cloned()
+            .collect();
+        let compiled = if trimmed.is_empty() {
+            Ok((Vec::new(), Vec::new()))
+        } else {
+            match crate::pipeline::compile_notebook_cell_with_globals(source, &predeclared) {
+                Ok((code, dbg)) => Ok((code, dbg.local_names)),
+                Err(stmt_err) => match crate::pipeline::compile_eval_expr(trimmed) {
+                    Ok(code) => {
+                        is_expr_fallback = true;
+                        Ok((code, Vec::new()))
+                    }
+                    Err(_) => Err(stmt_err),
+                },
+            }
+        };
+
+        let (stdout, value, error) = match compiled {
+            Err(e) => (String::new(), None, Some(e)),
+            Ok((code, local_names)) => {
+                if code.is_empty() {
+                    (String::new(), None, None)
+                } else {
+                    let mut vm = crate::vm::Vm::new(code);
+                    vm.vars = self.vars.clone();
+                    vm.funcs = self.funcs.clone();
+                    vm.classes = self.classes.clone();
+                    vm.objects = self.objects.clone();
+                    vm.class_objects = self.class_objects.clone();
+                    for (slot, name) in local_names.iter().enumerate() {
+                        if let Some(val) = vm.vars.get(name).cloned()
+                            && slot < vm.locals.len()
+                        {
+                            vm.locals[slot] = val;
+                            vm.local_defined[slot] = true;
+                        }
+                    }
+
+                    let (res, captured) = crate::runtime::with_print_capture(|| vm.execute());
+                    for (slot, name) in local_names.iter().enumerate() {
+                        if !name.starts_with("__")
+                            && vm.local_defined.get(slot).copied().unwrap_or(false)
+                            && let Some(val) = vm.locals.get(slot)
+                        {
+                            vm.vars.insert(name.clone(), val.clone());
+                        }
+                    }
+                    self.vars = vm.vars;
+                    self.funcs = vm.funcs;
+                    self.classes = vm.classes;
+                    match res {
+                        Ok(v) => {
+                            let val_str = if is_expr_fallback || !matches!(v, Val::Null) {
+                                Some(v.show())
+                            } else {
+                                None
+                            };
+                            (captured, val_str, None)
+                        }
+                        Err(err) => (captured, None, Some(err)),
+                    }
+                }
+            }
+        };
+
+        let result = NotebookCellResult {
+            cell_id: cell_id.to_string(),
+            source: source.to_string(),
+            stdout,
+            value,
+            error,
+            exec_count,
+        };
+        self.cells.insert(cell_id.to_string(), result.clone());
+        self.persist();
+        result
+    }
+}
+
+pub(crate) fn serve_notebook(dir: &Path, port: u16) -> Result<(), String> {
+    let storage = dir.join(".veyra-notebook.json");
+    let session = std::sync::Arc::new(std::sync::Mutex::new(NotebookSession::new(Some(
+        storage.clone(),
+    ))));
+    let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
+    println!("Veyra Notebook server: http://127.0.0.1:{port}");
+    println!("Workspace: {}", dir.display());
+
+    const UI_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Veyra Notebook</title>
+<style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;background:#0f172a;color:#e2e8f0}
+textarea{width:100%;height:90px;background:#1e293b;color:#f8fafc;border:1px solid #334155;padding:.6rem;font-family:monospace}
+button{background:#38bdf8;color:#0f172a;border:0;padding:.45rem 1rem;border-radius:6px;font-weight:600;cursor:pointer;margin:.4rem .3rem 0 0}
+pre{background:#020617;padding:.75rem;border-radius:6px;white-space:pre-wrap}</style></head>
+<body><h1>Veyra Reactive Notebook</h1>
+<div><input id="cid" value="cell1" style="padding:.4rem;background:#1e293b;color:#f8fafc;border:1px solid #334155"/>
+<button onclick="runCell()">Run Cell</button><button onclick="resetNb()">Reset Session</button></div>
+<textarea id="src" placeholder="let x = 21 * 2;&#10;print(x);"></textarea>
+<pre id="out">Ready.</pre>
+<script>
+async function runCell(){const r=await fetch('/api/notebook/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:cid.value,source:src.value})});const d=await r.json();out.textContent=JSON.stringify(d,null,2);}
+async function resetNb(){await fetch('/api/notebook/reset',{method:'POST'});out.textContent='Session reset.';}
+</script></body></html>"#;
+
+    for mut req in server.incoming_requests() {
+        let method = req.method().as_str().to_string();
+        let url = req.url().split('?').next().unwrap_or("/").to_string();
+        let response = match (method.as_str(), url.as_str()) {
+            ("GET", "/") => {
+                let mut r = Response::from_string(UI_HTML);
+                if let Ok(h) =
+                    Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+                {
+                    r.add_header(h);
+                }
+                r
+            }
+            ("GET", "/api/notebook/state") => {
+                let Ok(guard) = session.lock() else {
+                    let _ = req.respond(
+                        Response::from_string("500 Session error")
+                            .with_status_code(StatusCode(500)),
+                    );
+                    continue;
+                };
+                let items: Vec<JsonValue> = guard
+                    .cells
+                    .values()
+                    .map(|c| {
+                        serde_json::json!({
+                            "id": c.cell_id,
+                            "source": c.source,
+                            "stdout": c.stdout,
+                            "value": c.value,
+                            "error": c.error,
+                            "exec_count": c.exec_count,
+                        })
+                    })
+                    .collect();
+                let mut r = Response::from_string(
+                    serde_json::to_string(&serde_json::json!({ "cells": items }))
+                        .unwrap_or_default(),
+                );
+                if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+                    r.add_header(h);
+                }
+                r
+            }
+            ("POST", "/api/notebook/run") => {
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let parsed: JsonValue = serde_json::from_str(&body).unwrap_or_default();
+                let cid = parsed
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("cell1");
+                let src = parsed
+                    .get("source")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                let Ok(mut guard) = session.lock() else {
+                    let _ = req.respond(
+                        Response::from_string("500 Session error")
+                            .with_status_code(StatusCode(500)),
+                    );
+                    continue;
+                };
+                let res = guard.eval_cell(cid, src);
+                let mut r = Response::from_string(
+                    serde_json::to_string(&serde_json::json!({
+                        "id": res.cell_id,
+                        "stdout": res.stdout,
+                        "value": res.value,
+                        "error": res.error,
+                        "exec_count": res.exec_count,
+                    }))
+                    .unwrap_or_default(),
+                );
+                if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+                    r.add_header(h);
+                }
+                r
+            }
+            ("POST", "/api/notebook/reset") => {
+                if let Ok(mut guard) = session.lock() {
+                    guard.reset();
+                }
+                Response::from_string(r#"{"ok":true}"#)
+            }
+            _ => Response::from_string("404 Not Found").with_status_code(StatusCode(404)),
+        };
+        req.respond(response).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}

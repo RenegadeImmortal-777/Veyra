@@ -329,7 +329,9 @@ fn validate_aot_support(stmts: &[Stmt]) -> Result<(), String> {
             }
             Stmt::DecoratedFn(decs, _, _, _, body) => {
                 for d in decs {
-                    validate_aot_expr(d)?;
+                    if !crate::pipeline::is_static_effect_decorator(d) {
+                        validate_aot_expr(d)?;
+                    }
                 }
                 validate_aot_support(body)?;
             }
@@ -628,7 +630,9 @@ fn collect_all_ids_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             Stmt::DecoratedFn(decs, n, _, _, body) => {
                 out.insert(n.clone());
                 for d in decs {
-                    collect_all_ids_expr(d, out);
+                    if !crate::pipeline::is_static_effect_decorator(d) {
+                        collect_all_ids_expr(d, out);
+                    }
                 }
                 collect_all_ids_stmts(body, out);
             }
@@ -743,7 +747,9 @@ fn collect_nested_refs_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             Stmt::DecoratedFn(decs, name, _, _, body) => {
                 out.insert(name.clone());
                 for d in decs {
-                    collect_all_ids_expr(d, out);
+                    if !crate::pipeline::is_static_effect_decorator(d) {
+                        collect_all_ids_expr(d, out);
+                    }
                 }
                 collect_all_ids_stmts(body, out);
             }
@@ -1749,7 +1755,9 @@ impl AotEmitter {
             Stmt::DecoratedFn(decs, name, params, ret_ty, body) => {
                 let mut dec_tmps = Vec::with_capacity(decs.len());
                 for d in decs {
-                    dec_tmps.push(self.emit_expr(d, scope)?);
+                    if !crate::pipeline::is_static_effect_decorator(d) {
+                        dec_tmps.push(self.emit_expr(d, scope)?);
+                    }
                 }
                 let mut wrapped = self.emit_fn_body_value(params, ret_ty, body, scope, false)?;
                 for d_tmp in dec_tmps.iter().rev() {
@@ -5592,6 +5600,24 @@ impl Rt {
                         None => "assertion failed".into(),
                     };
                     return Err(Flow::Err(msg));
+                }
+                Val::Null
+            }
+            "requires" | "ensures" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(Flow::Err(format!("{name} expects (cond[, message])")));
+                }
+                if !args[0].truthy() {
+                    let kind = if name == "requires" {
+                        "precondition"
+                    } else {
+                        "postcondition"
+                    };
+                    let msg = match args.get(1) {
+                        Some(m) => self.show_val_runtime(m)?,
+                        None => format!("{kind} failed"),
+                    };
+                    return Err(Flow::Err(format!("ContractError: {msg}")));
                 }
                 Val::Null
             }

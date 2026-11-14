@@ -70,6 +70,7 @@ pub(crate) struct AdapterSummary {
 
 static GPU_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static GPU_SHADERS_COMPILED: AtomicUsize = AtomicUsize::new(0);
+static GPU_FUSED_KERNELS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(windows)]
 mod d3d11_backend {
@@ -2647,6 +2648,10 @@ pub(crate) fn gpu_info_val() -> Val {
                         Val::Str("shaders_compiled".into()),
                         Val::Num(GPU_SHADERS_COMPILED.load(Ordering::Relaxed) as f64),
                     ),
+                    (
+                        Val::Str("fused_kernels".into()),
+                        Val::Num(GPU_FUSED_KERNELS.load(Ordering::Relaxed) as f64),
+                    ),
                 ]))
             }) {
                 return val;
@@ -2706,6 +2711,10 @@ pub(crate) fn gpu_info_val() -> Val {
                         Val::Str("shaders_compiled".into()),
                         Val::Num(GPU_SHADERS_COMPILED.load(Ordering::Relaxed) as f64),
                     ),
+                    (
+                        Val::Str("fused_kernels".into()),
+                        Val::Num(GPU_FUSED_KERNELS.load(Ordering::Relaxed) as f64),
+                    ),
                 ]))
             }) {
                 return val;
@@ -2732,6 +2741,10 @@ pub(crate) fn gpu_info_val() -> Val {
         (
             Val::Str("shaders_compiled".into()),
             Val::Num(GPU_SHADERS_COMPILED.load(Ordering::Relaxed) as f64),
+        ),
+        (
+            Val::Str("fused_kernels".into()),
+            Val::Num(GPU_FUSED_KERNELS.load(Ordering::Relaxed) as f64),
         ),
     ])
 }
@@ -3158,4 +3171,159 @@ pub(crate) fn gpu_run_spirv(
         st.dispatch(&key, words, &af, &bf, out_len, push_words, (gx, gy, gz))
     })?;
     Ok(out.into_iter().map(|x| x as f64).collect())
+}
+
+pub(crate) fn hlsl_fused_ewise(ops: &[crate::spirv::FusedEwiseOp]) -> String {
+    use crate::spirv::FusedEwiseOp;
+    let mut s = String::from(
+        "cbuffer Params : register(b0) { uint len; uint _p1; uint _p2; uint _p3; };\n\
+         StructuredBuffer<float> A : register(t0);\n\
+         StructuredBuffer<float> B : register(t1);\n\
+         RWStructuredBuffer<float> Out : register(u0);\n\
+         [numthreads(256, 1, 1)]\n\
+         void CSMain(uint3 dtid : SV_DispatchThreadID) {\n\
+           uint i = dtid.x;\n\
+           if (i >= len) return;\n\
+           float x = A[i];\n",
+    );
+    let needs_b = ops.iter().any(|op| {
+        matches!(
+            op,
+            FusedEwiseOp::Add | FusedEwiseOp::Sub | FusedEwiseOp::Mul
+        )
+    });
+    if needs_b {
+        s.push_str("  float b = B[i];\n");
+    }
+    for &op in ops {
+        match op {
+            FusedEwiseOp::Add => s.push_str("  x = x + b;\n"),
+            FusedEwiseOp::Sub => s.push_str("  x = x - b;\n"),
+            FusedEwiseOp::Mul => s.push_str("  x = x * b;\n"),
+            FusedEwiseOp::AddScalar(v) => s.push_str(&format!("  x = x + {:.9};\n", v)),
+            FusedEwiseOp::Scale(v) => s.push_str(&format!("  x = x * {:.9};\n", v)),
+            FusedEwiseOp::Abs => s.push_str("  x = abs(x);\n"),
+            FusedEwiseOp::Neg => s.push_str("  x = -x;\n"),
+            FusedEwiseOp::Sqrt => s.push_str("  x = sqrt(max(x, 0.0));\n"),
+            FusedEwiseOp::Relu => s.push_str("  x = max(x, 0.0);\n"),
+            FusedEwiseOp::Sigmoid => s.push_str("  x = 1.0 / (1.0 + exp(-x));\n"),
+            FusedEwiseOp::Tanh => {
+                s.push_str("  float t2 = clamp(2.0 * x, -18.0, 18.0); x = 1.0 - 2.0 / (exp(t2) + 1.0);\n")
+            }
+            FusedEwiseOp::Gelu => {
+                s.push_str("  float y = 0.79788456 * (x + 0.044715 * x * x * x); float y2 = clamp(2.0 * y, -18.0, 18.0); x = 0.5 * x * (2.0 - 2.0 / (exp(y2) + 1.0));\n")
+            }
+        }
+    }
+    s.push_str("  Out[i] = x;\n}\n");
+    s
+}
+
+fn fused_pipeline_hash(ops: &[crate::spirv::FusedEwiseOp]) -> u64 {
+    use crate::spirv::FusedEwiseOp;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &op in ops {
+        let (tag, bits) = match op {
+            FusedEwiseOp::Add => (1u64, 0u32),
+            FusedEwiseOp::Sub => (2, 0),
+            FusedEwiseOp::Mul => (3, 0),
+            FusedEwiseOp::AddScalar(v) => (4, v.to_bits()),
+            FusedEwiseOp::Scale(v) => (5, v.to_bits()),
+            FusedEwiseOp::Abs => (6, 0),
+            FusedEwiseOp::Neg => (7, 0),
+            FusedEwiseOp::Sqrt => (8, 0),
+            FusedEwiseOp::Relu => (9, 0),
+            FusedEwiseOp::Sigmoid => (10, 0),
+            FusedEwiseOp::Gelu => (11, 0),
+            FusedEwiseOp::Tanh => (12, 0),
+        };
+        h ^= (tag << 32) | u64::from(bits);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+pub(crate) fn gpu_fuse_f64(ops: &[crate::spirv::FusedEwiseOp], a: &[f64], b: &[f64]) -> Vec<f64> {
+    use crate::spirv::FusedEwiseOp;
+    if a.is_empty() {
+        return Vec::new();
+    }
+    GPU_FUSED_KERNELS.fetch_add(1, Ordering::Relaxed);
+    let groups = (a.len() as u32).div_ceil(256);
+    let want_f64 = current_precision_pref() == PrecisionPref::F64;
+    let hash = fused_pipeline_hash(ops);
+
+    match resolve_backend() {
+        ResolvedBackend::D3D11 if !want_f64 => {
+            #[cfg(windows)]
+            {
+                let af: Vec<f32> = a.iter().map(|&x| x as f32).collect();
+                let bf: Vec<f32> = b.iter().map(|&x| x as f32).collect();
+                let src = hlsl_fused_ewise(ops);
+                let key = format!("veyra:fused:{hash:016x}");
+                if let Ok(out) = d3d11_backend::with_d3d11(|st| {
+                    st.dispatch(
+                        &key,
+                        &src,
+                        "CSMain",
+                        &af,
+                        &bf,
+                        a.len(),
+                        &[a.len() as u32, 0, 0, 0],
+                        (groups, 1, 1),
+                    )
+                }) {
+                    return out.into_iter().map(|x| x as f64).collect();
+                }
+            }
+        }
+        ResolvedBackend::Vulkan if !want_f64 => {
+            let af: Vec<f32> = a.iter().map(|&x| x as f32).collect();
+            let bf: Vec<f32> = b.iter().map(|&x| x as f32).collect();
+            let spv = crate::spirv::spirv_fused_ewise(ops);
+            let key = format!("vk:fused:{hash:016x}");
+            if let Ok(out) = vulkan_backend::with_vulkan(|st| {
+                st.dispatch(
+                    &key,
+                    &spv,
+                    &af,
+                    &bf,
+                    a.len(),
+                    &[a.len() as u32],
+                    (groups, 1, 1),
+                )
+            }) {
+                return out.into_iter().map(|x| x as f64).collect();
+            }
+        }
+        _ => {}
+    }
+
+    a.iter()
+        .enumerate()
+        .map(|(i, &x0)| {
+            let b_val = b.get(i).copied().unwrap_or(0.0);
+            let mut x = x0;
+            for &op in ops {
+                x = match op {
+                    FusedEwiseOp::Add => x + b_val,
+                    FusedEwiseOp::Sub => x - b_val,
+                    FusedEwiseOp::Mul => x * b_val,
+                    FusedEwiseOp::AddScalar(s) => x + f64::from(s),
+                    FusedEwiseOp::Scale(s) => x * f64::from(s),
+                    FusedEwiseOp::Abs => x.abs(),
+                    FusedEwiseOp::Neg => -x,
+                    FusedEwiseOp::Sqrt => x.max(0.0).sqrt(),
+                    FusedEwiseOp::Relu => x.max(0.0),
+                    FusedEwiseOp::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+                    FusedEwiseOp::Tanh => x.tanh(),
+                    FusedEwiseOp::Gelu => {
+                        let y = 0.797_884_560_802_865_4 * (x + 0.044_715 * x * x * x);
+                        0.5 * x * (1.0 + y.tanh())
+                    }
+                };
+            }
+            x
+        })
+        .collect()
 }

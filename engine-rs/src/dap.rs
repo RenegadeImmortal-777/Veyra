@@ -4,7 +4,7 @@
 // via `veyra dap`, and wires line breakpoints, stepping, stack traces, scopes,
 // variable inspection, and expression evaluation into `Vm`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -181,6 +181,15 @@ pub(crate) struct ActiveFrame {
     pub(crate) vars: HashMap<String, Val>,
 }
 
+const MAX_TRACE_SNAPSHOTS: usize = 4096;
+
+#[derive(Clone, Debug)]
+struct TraceSnapshot {
+    frames: Vec<ActiveFrame>,
+    #[allow(dead_code)]
+    last_stop_site: Option<(usize, usize)>,
+}
+
 struct DebugState {
     configured: bool,
     terminated: bool,
@@ -189,6 +198,8 @@ struct DebugState {
     step: StepAction,
     breakpoints: HashMap<String, HashSet<usize>>,
     frames: Vec<ActiveFrame>,
+    history: VecDeque<TraceSnapshot>,
+    history_cursor: Option<usize>,
     next_frame_id: usize,
     last_stop_site: Option<(usize, usize)>,
     funcs: Arc<HashMap<String, FunctionDef>>,
@@ -287,6 +298,8 @@ impl DebugSession {
                 step: StepAction::Run,
                 breakpoints: HashMap::new(),
                 frames: Vec::new(),
+                history: VecDeque::new(),
+                history_cursor: None,
                 next_frame_id: 1,
                 last_stop_site: None,
                 funcs: Arc::new(HashMap::new()),
@@ -405,8 +418,58 @@ impl DebugSession {
         Ok(())
     }
 
+    fn displayed_frames(g: &DebugState) -> &[ActiveFrame] {
+        if let Some(idx) = g.history_cursor
+            && let Some(snap) = g.history.get(idx)
+        {
+            &snap.frames
+        } else {
+            &g.frames
+        }
+    }
+
     pub(crate) fn resume(&self, action: StepAction) -> Result<(), String> {
         let mut g = self.state.lock().map_err(|_| "dap state poisoned")?;
+        if let Some(idx) = g.history_cursor {
+            let at_history_step = matches!(
+                action,
+                StepAction::StepIn | StepAction::StepOver { .. } | StepAction::StepOut { .. }
+            );
+            if at_history_step && idx + 1 < g.history.len() {
+                g.history_cursor = Some(idx + 1);
+                if let Ok(mut refs) = self.var_refs.lock() {
+                    refs.clear();
+                }
+                drop(g);
+                let _ = self.sink.send_event(
+                    "stopped",
+                    Some(json!({
+                        "reason": "step",
+                        "threadId": 1,
+                        "allThreadsStopped": true
+                    })),
+                );
+                return Ok(());
+            }
+            if at_history_step && idx + 1 == g.history.len() {
+                // Stepping from the last historic frame restores the live stop frame first.
+                g.history_cursor = None;
+                if let Ok(mut refs) = self.var_refs.lock() {
+                    refs.clear();
+                }
+                drop(g);
+                let _ = self.sink.send_event(
+                    "stopped",
+                    Some(json!({
+                        "reason": "step",
+                        "threadId": 1,
+                        "allThreadsStopped": true
+                    })),
+                );
+                return Ok(());
+            }
+            g.history_cursor = None;
+        }
         let depth = g.frames.len();
         g.step = match action {
             StepAction::StepOver { .. } => StepAction::StepOver {
@@ -419,6 +482,71 @@ impl DebugSession {
         };
         g.paused = false;
         self.wake.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn step_back(&self) -> Result<(), String> {
+        let mut g = self.state.lock().map_err(|_| "dap state poisoned")?;
+        if g.history.is_empty() {
+            return Err("no recorded trace history to step back into".into());
+        }
+        let cur = g
+            .history_cursor
+            .unwrap_or_else(|| g.history.len().saturating_sub(1));
+        let prev = cur.saturating_sub(1);
+        g.history_cursor = Some(prev);
+        if let Ok(mut refs) = self.var_refs.lock() {
+            refs.clear();
+        }
+        drop(g);
+        let _ = self.sink.send_event(
+            "stopped",
+            Some(json!({
+                "reason": "step",
+                "threadId": 1,
+                "allThreadsStopped": true
+            })),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn reverse_continue(&self) -> Result<(), String> {
+        let mut g = self.state.lock().map_err(|_| "dap state poisoned")?;
+        if g.history.is_empty() {
+            return Err("no recorded trace history".into());
+        }
+        let cur = g
+            .history_cursor
+            .unwrap_or_else(|| g.history.len().saturating_sub(1));
+        let mut target = None;
+        for idx in (0..cur).rev() {
+            if let Some(snap) = g.history.get(idx)
+                && let Some(top) = snap.frames.last()
+            {
+                let norm = normalize_path(&top.source);
+                if g.breakpoints
+                    .get(&norm)
+                    .is_some_and(|set| set.contains(&top.line))
+                {
+                    target = Some((idx, "breakpoint"));
+                    break;
+                }
+            }
+        }
+        let (idx, reason) = target.unwrap_or((0, "entry"));
+        g.history_cursor = Some(idx);
+        if let Ok(mut refs) = self.var_refs.lock() {
+            refs.clear();
+        }
+        drop(g);
+        let _ = self.sink.send_event(
+            "stopped",
+            Some(json!({
+                "reason": reason,
+                "threadId": 1,
+                "allThreadsStopped": true
+            })),
+        );
         Ok(())
     }
 
@@ -462,6 +590,23 @@ impl DebugSession {
                 top.source = file.clone();
                 top.line = line;
             }
+        }
+        if is_stmt_entry && line > 0 && g.last_stop_site != Some((scope_id, ip)) {
+            let snap_vars = self
+                .map
+                .merge_frame_vars(scope_id, vars, cells, locals, local_defined);
+            if let Some(top) = g.frames.last_mut() {
+                top.vars = snap_vars;
+            }
+            if g.history.len() >= MAX_TRACE_SNAPSHOTS {
+                g.history.pop_front();
+            }
+            let frames_snapshot = g.frames.clone();
+            g.history.push_back(TraceSnapshot {
+                frames: frames_snapshot,
+                last_stop_site: Some((scope_id, ip)),
+            });
+            g.history_cursor = None;
         }
 
         if let Some(prev_site) = g.last_stop_site {
@@ -537,8 +682,9 @@ impl DebugSession {
 
     pub(crate) fn stack_frames(&self) -> Result<Vec<JsonValue>, String> {
         let g = self.state.lock().map_err(|_| "dap state poisoned")?;
-        let mut out = Vec::with_capacity(g.frames.len());
-        for f in g.frames.iter().rev() {
+        let frames = Self::displayed_frames(&g);
+        let mut out = Vec::with_capacity(frames.len());
+        for f in frames.iter().rev() {
             out.push(json!({
                 "id": f.id,
                 "name": f.name,
@@ -564,11 +710,10 @@ impl DebugSession {
 
     pub(crate) fn scopes(&self, frame_id: usize) -> Result<Vec<JsonValue>, String> {
         let g = self.state.lock().map_err(|_| "dap state poisoned")?;
-        let frame = g
-            .frames
+        let frames = Self::displayed_frames(&g);
+        let frame = frames
             .iter()
             .find(|f| f.id == frame_id)
-            .or_else(|| g.frames.last())
             .ok_or_else(|| format!("unknown stack frame {frame_id}"))?;
         let mut locals: Vec<(String, Val)> = frame
             .vars
@@ -585,9 +730,8 @@ impl DebugSession {
             "expensive": false
         })];
 
-        if g.frames.first().is_some_and(|root| root.id != frame.id) {
-            let mut globals: Vec<(String, Val)> = g
-                .frames
+        if frames.first().is_some_and(|root| root.id != frame.id) {
+            let mut globals: Vec<(String, Val)> = frames
                 .first()
                 .map(|root| {
                     root.vars
@@ -646,9 +790,10 @@ impl DebugSession {
         frame_id: Option<usize>,
     ) -> Result<JsonValue, String> {
         let g = self.state.lock().map_err(|_| "dap state poisoned")?;
+        let frames = Self::displayed_frames(&g);
         let frame = frame_id
-            .and_then(|fid| g.frames.iter().find(|f| f.id == fid))
-            .or_else(|| g.frames.last())
+            .and_then(|id| frames.iter().find(|f| f.id == id))
+            .or_else(|| frames.last())
             .ok_or_else(|| "no paused stack frame".to_string())?;
         let trimmed = expr.trim();
         if let Some(v) = frame.vars.get(trimmed) {
@@ -659,8 +804,7 @@ impl DebugSession {
             }));
         }
         let code = compile_eval_expr(trimmed)?;
-        let mut vars = g
-            .frames
+        let mut vars = frames
             .first()
             .map(|root| root.vars.clone())
             .unwrap_or_default();
@@ -833,6 +977,7 @@ impl DapServer {
                     Some(json!({
                         "supportsConfigurationDoneRequest": true,
                         "supportsEvaluateForHovers": true,
+                        "supportsStepBack": true,
                         "supportsTerminateRequest": true,
                         "supportsSingleThreadExecutionRequests": true
                     })),
@@ -1019,6 +1164,18 @@ impl DapServer {
             "pause" => {
                 if let Some(ref s) = self.session {
                     s.resume(StepAction::PauseNext)?;
+                }
+                self.sink.send_response(seq, cmd, true, None, None)?;
+            }
+            "stepBack" => {
+                if let Some(ref s) = self.session {
+                    s.step_back()?;
+                }
+                self.sink.send_response(seq, cmd, true, None, None)?;
+            }
+            "reverseContinue" => {
+                if let Some(ref s) = self.session {
+                    s.reverse_continue()?;
                 }
                 self.sink.send_response(seq, cmd, true, None, None)?;
             }

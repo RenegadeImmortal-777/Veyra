@@ -61,6 +61,82 @@ fn parse_pos_int(arg: Option<&Val>, default: usize, label: &str) -> Result<usize
     }
 }
 
+fn parse_fused_gpu_ops(val: &Val) -> Result<Vec<crate::spirv::FusedEwiseOp>, String> {
+    use crate::spirv::FusedEwiseOp;
+    let Val::List(items) = val else {
+        return Err("gpu_fuse ops must be List".into());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let parsed = match item {
+            Val::Str(s) => {
+                let s = s.trim();
+                if let Some((op, arg)) = s.split_once(':') {
+                    let v: f32 = arg
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("invalid fused scalar arg '{arg}'"))?;
+                    match op.trim() {
+                        "add_scalar" | "bias" => FusedEwiseOp::AddScalar(v),
+                        "scale" | "mul_scalar" => FusedEwiseOp::Scale(v),
+                        other => return Err(format!("unsupported fused gpu op '{other}'")),
+                    }
+                } else {
+                    match s {
+                        "add" => FusedEwiseOp::Add,
+                        "sub" => FusedEwiseOp::Sub,
+                        "mul" => FusedEwiseOp::Mul,
+                        "abs" => FusedEwiseOp::Abs,
+                        "neg" => FusedEwiseOp::Neg,
+                        "sqrt" => FusedEwiseOp::Sqrt,
+                        "relu" => FusedEwiseOp::Relu,
+                        "sigmoid" => FusedEwiseOp::Sigmoid,
+                        "gelu" => FusedEwiseOp::Gelu,
+                        "tanh" => FusedEwiseOp::Tanh,
+                        other => return Err(format!("unsupported fused gpu op '{other}'")),
+                    }
+                }
+            }
+            Val::Map(pairs) => {
+                let op_name = match map_lookup(pairs, &Val::Str("op".into())) {
+                    Some(Val::Str(s)) => s.clone(),
+                    _ => return Err("fused gpu op Map must contain String field 'op'".into()),
+                };
+                let scalar = match map_lookup(pairs, &Val::Str("val".into())) {
+                    Some(Val::Num(n)) => Some(*n as f32),
+                    None | Some(Val::Null) => None,
+                    Some(_) => return Err("fused gpu op 'val' must be Number".into()),
+                };
+                match op_name.as_str() {
+                    "add" => FusedEwiseOp::Add,
+                    "sub" => FusedEwiseOp::Sub,
+                    "mul" => FusedEwiseOp::Mul,
+                    "abs" => FusedEwiseOp::Abs,
+                    "neg" => FusedEwiseOp::Neg,
+                    "sqrt" => FusedEwiseOp::Sqrt,
+                    "relu" => FusedEwiseOp::Relu,
+                    "sigmoid" => FusedEwiseOp::Sigmoid,
+                    "gelu" => FusedEwiseOp::Gelu,
+                    "tanh" => FusedEwiseOp::Tanh,
+                    "add_scalar" | "bias" => {
+                        FusedEwiseOp::AddScalar(scalar.ok_or("bias op requires 'val'")?)
+                    }
+                    "scale" | "mul_scalar" => {
+                        FusedEwiseOp::Scale(scalar.ok_or("scale op requires 'val'")?)
+                    }
+                    other => return Err(format!("unsupported fused gpu op '{other}'")),
+                }
+            }
+            _ => return Err("gpu_fuse ops entries must be String or Map".into()),
+        };
+        out.push(parsed);
+    }
+    if out.is_empty() {
+        return Err("gpu_fuse requires at least 1 op".into());
+    }
+    Ok(out)
+}
+
 impl Vm {
     pub(crate) fn call_builtin_science_ml(
         &mut self,
@@ -1827,6 +1903,58 @@ impl Vm {
                     gz,
                 )?;
                 nums_to_val(out)
+            }
+            "gpu_fuse" => {
+                crate::runtime::require_cap("gpu")?;
+                if a.len() < 2 || a.len() > 3 {
+                    return Err("gpu_fuse expects (ops, a[, b_or_scalar])".into());
+                }
+                let ops = parse_fused_gpu_ops(&a[0])?;
+                let (data_a, shape_opt) = if let Ok(tid) = tensor_id(&a[1]) {
+                    let snap = tensor_snapshot(tid)?;
+                    (snap.data, Some(snap.shape))
+                } else {
+                    (as_num_list(&a[1])?, None)
+                };
+                let data_b = match a.get(2) {
+                    None | Some(Val::Null) => vec![0.0; data_a.len()],
+                    Some(Val::Num(s)) => vec![*s; data_a.len()],
+                    Some(v) => {
+                        let raw = if let Ok(tid) = tensor_id(v) {
+                            tensor_snapshot(tid)?.data
+                        } else {
+                            as_num_list(v)?
+                        };
+                        if raw.len() == 1 {
+                            vec![raw[0]; data_a.len()]
+                        } else if raw.len() != data_a.len() {
+                            return Err("gpu_fuse b length must match a length".into());
+                        } else {
+                            raw
+                        }
+                    }
+                };
+                let res = crate::gpu::gpu_fuse_f64(&ops, &data_a, &data_b);
+                if let Some(shape) = shape_opt {
+                    tensor_store(res, shape, false, TensorOp::Leaf)?
+                } else {
+                    nums_to_val(res)
+                }
+            }
+            "gpu_fuse_inspect" => {
+                if a.len() != 1 {
+                    return Err("gpu_fuse_inspect expects (ops)".into());
+                }
+                let ops = parse_fused_gpu_ops(&a[0])?;
+                let spv = crate::spirv::spirv_fused_ewise(&ops);
+                let hlsl = crate::gpu::hlsl_fused_ewise(&ops);
+                Val::Map(vec![
+                    (
+                        Val::Str("spirv_words".into()),
+                        Val::List(spv.into_iter().map(|w| Val::Num(w as f64)).collect()),
+                    ),
+                    (Val::Str("hlsl".into()), Val::Str(hlsl)),
+                ])
             }
             _ => return Ok(None),
         };

@@ -1176,6 +1176,22 @@ pub(crate) fn pkg_audit() -> Result<(), String> {
         .ok_or("invalid lockfile packages")?;
     let mut checked = 0usize;
     let mut signed = 0usize;
+    let mut caps_summary = Vec::new();
+    if let Ok(manifest_txt) = fs::read_to_string(root.join("veyra.json"))
+        && let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_txt)
+        && let Some(caps) = manifest_json
+            .get("capabilities")
+            .and_then(JsonValue::as_array)
+    {
+        let names: Vec<String> = caps
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(ToString::to_string)
+            .collect();
+        if !names.is_empty() {
+            caps_summary.push(format!("root=[{}]", names.join(",")));
+        }
+    }
     for (name, meta) in packages {
         let expected = meta
             .get("sha256")
@@ -1186,6 +1202,19 @@ pub(crate) fn pkg_audit() -> Result<(), String> {
         if actual != expected {
             return Err(format!("package integrity mismatch: {name}"));
         }
+        if let Ok(pkg_txt) = fs::read_to_string(pkg_dir.join("veyra.json"))
+            && let Ok(pkg_json) = serde_json::from_str::<JsonValue>(&pkg_txt)
+            && let Some(caps) = pkg_json.get("capabilities").and_then(JsonValue::as_array)
+        {
+            let names: Vec<String> = caps
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(ToString::to_string)
+                .collect();
+            if !names.is_empty() {
+                caps_summary.push(format!("{name}=[{}]", names.join(",")));
+            }
+        }
         if pkg_dir.join("veyra.sig.json").is_file() {
             if verify_package_dir_sig(&pkg_dir)? {
                 signed += 1;
@@ -1193,12 +1222,17 @@ pub(crate) fn pkg_audit() -> Result<(), String> {
         }
         checked += 1;
     }
+    let cap_suffix = if caps_summary.is_empty() {
+        String::new()
+    } else {
+        format!("; capabilities: {}", caps_summary.join(" "))
+    };
     if signed > 0 {
         println!(
-            "Audit OK: {checked} package(s), content hashes verified ({signed} cryptographically signed)"
+            "Audit OK: {checked} package(s), content hashes verified ({signed} cryptographically signed){cap_suffix}"
         );
     } else {
-        println!("Audit OK: {checked} package(s), content hashes verified");
+        println!("Audit OK: {checked} package(s), content hashes verified{cap_suffix}");
     }
     Ok(())
 }
@@ -1675,11 +1709,25 @@ pub(crate) fn build_package_bundle(dir: &Path) -> Result<JsonValue, String> {
     } else {
         None
     };
+    let normalized_caps: Vec<String> = manifest
+        .get("capabilities")
+        .and_then(JsonValue::as_array)
+        .map(|arr| {
+            let set: std::collections::BTreeSet<String> = arr
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            set.into_iter().collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     Ok(serde_json::json!({
         "format": "veyra.bundle.v1",
         "name": name,
         "version": version,
         "entry": entry,
+        "capabilities": normalized_caps,
         "dependencies": manifest.get("dependencies").cloned().unwrap_or_else(|| serde_json::json!([])),
         "native": manifest.get("native").cloned().unwrap_or(JsonValue::Null),
         "sha256": sha256,

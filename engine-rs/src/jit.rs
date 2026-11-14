@@ -19,7 +19,7 @@ use crate::value::Val;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct JitSlice {
-    pub(crate) ptr: *const f64,
+    pub(crate) ptr: *mut f64,
     pub(crate) len: usize,
 }
 
@@ -58,6 +58,7 @@ impl ParamKind {
 pub(crate) enum JitReturnKind {
     Num,
     Bool,
+    NumList,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -172,9 +173,9 @@ impl CompiledJitFn {
         };
 
         let slices: Vec<JitSlice> = flat_lists
-            .iter()
+            .iter_mut()
             .map(|v| JitSlice {
-                ptr: v.as_ptr(),
+                ptr: v.as_mut_ptr(),
                 len: v.len(),
             })
             .collect();
@@ -194,6 +195,11 @@ impl CompiledJitFn {
         Some(match self.return_kind {
             JitReturnKind::Num => Val::Num(out),
             JitReturnKind::Bool => Val::Bool(out != 0.0 && !out.is_nan()),
+            JitReturnKind::NumList => {
+                let idx = out.to_bits() as usize;
+                let items = flat_lists.get(idx)?;
+                Val::List(items.iter().copied().map(Val::Num).collect())
+            }
         })
     }
 }
@@ -314,7 +320,9 @@ fn infer_param_kinds(def: &FunctionDef) -> Result<Vec<ParamKind>, String> {
     let mut kinds = Vec::with_capacity(def.params.len());
     for (_, ty) in def.params.iter() {
         match ty.as_deref() {
-            None | Some("Any") | Some("Number") | Some("Int") => kinds.push(ParamKind::Num),
+            None | Some("Any") | Some("Number") | Some("Float") | Some("Int") => {
+                kinds.push(ParamKind::Num)
+            }
             Some("List") => kinds.push(ParamKind::NumList),
             _ => return Err("non-numeric/list parameter type annotation".into()),
         }
@@ -398,7 +406,7 @@ fn observe_runtime_param_kinds(def: &FunctionDef, args: &[Val]) -> Option<Vec<Pa
         match v {
             Val::Num(n) => {
                 match ty.as_deref() {
-                    None | Some("Any") | Some("Number") => {}
+                    None | Some("Any") | Some("Number") | Some("Float") => {}
                     Some("Int") if n.fract() == 0.0 => {}
                     _ => return None,
                 }
@@ -586,7 +594,7 @@ fn type_compat_with_kind(ty: Option<&String>, kind: ParamKind) -> bool {
     match kind {
         ParamKind::Num => matches!(
             ty.map(String::as_str),
-            None | Some("Any") | Some("Number") | Some("Int")
+            None | Some("Any") | Some("Number") | Some("Float") | Some("Int")
         ),
         ParamKind::NumList => matches!(ty.map(String::as_str), None | Some("Any") | Some("List")),
     }
@@ -613,6 +621,11 @@ fn is_vm_builtin_shadow(name: &str) -> bool {
 fn expected_return_from_annotation(def: &FunctionDef) -> JitReturnKind {
     if def.return_type.as_deref() == Some("Bool") {
         return JitReturnKind::Bool;
+    }
+    if let Some(rt) = def.return_type.as_deref()
+        && (rt == "List" || rt.starts_with("List<"))
+    {
+        return JitReturnKind::NumList;
     }
     if def.return_type.as_deref().is_some() && def.return_type.as_deref() != Some("Any") {
         return JitReturnKind::Num;
@@ -678,7 +691,7 @@ fn verify_and_collect_plans(
         }
     }
     match def.return_type.as_deref() {
-        None | Some("Any") | Some("Number") | Some("Bool") => {}
+        None | Some("Any") | Some("Number") | Some("Float") | Some("Bool") | Some("List") => {}
         Some("Int") => {
             if def.code.iter().any(|op| matches!(op, Op::Div | Op::Pow)) {
                 return Err("Int return check uses VM for div/pow".into());
@@ -840,6 +853,20 @@ fn verify_and_collect_plans(
                         }
                         stack.push(AbstractType::Num);
                     }
+                    Op::SetIndex => {
+                        let val = stack.pop().ok_or("stack underflow")?;
+                        let idx = stack.pop().ok_or("stack underflow")?;
+                        let container = stack.pop().ok_or("stack underflow")?;
+                        if val != AbstractType::Num
+                            || idx != AbstractType::Num
+                            || container != AbstractType::NumList
+                        {
+                            return Err(
+                                "JIT setindex requires (List<Number>, Number, Number)".into()
+                            );
+                        }
+                        stack.push(AbstractType::NumList);
+                    }
                     Op::Call(fn_name, argc) => {
                         if stack.len() < *argc {
                             return Err("call stack underflow".into());
@@ -868,6 +895,7 @@ fn verify_and_collect_plans(
                             stack.push(match rk {
                                 JitReturnKind::Bool => AbstractType::Bool,
                                 JitReturnKind::Num => AbstractType::Num,
+                                JitReturnKind::NumList => AbstractType::NumList,
                             });
                         } else if let Some(mh) = math_helper_kind(fn_name, *argc) {
                             if !arg_types.iter().all(|t| *t == AbstractType::Num) {
@@ -893,6 +921,7 @@ fn verify_and_collect_plans(
                             stack.push(match callee_ret {
                                 JitReturnKind::Bool => AbstractType::Bool,
                                 JitReturnKind::Num => AbstractType::Num,
+                                JitReturnKind::NumList => AbstractType::NumList,
                             });
                         } else {
                             return Err(format!("unsupported JIT call '{fn_name}/{argc}'"));
@@ -916,9 +945,7 @@ fn verify_and_collect_plans(
                         let rk = match r {
                             AbstractType::Num => JitReturnKind::Num,
                             AbstractType::Bool => JitReturnKind::Bool,
-                            AbstractType::NumList => {
-                                return Err("JIT functions cannot return List".into());
-                            }
+                            AbstractType::NumList => JitReturnKind::NumList,
                         };
                         if let Some(prev) = observed_return {
                             if prev != rk {
@@ -958,6 +985,9 @@ fn verify_and_collect_plans(
         let return_kind = observed_return.unwrap_or(JitReturnKind::Num);
         if def.return_type.as_deref() == Some("Bool") && return_kind != JitReturnKind::Bool {
             return Err("expected Bool return".into());
+        }
+        if def.return_type.as_deref() == Some("List") && return_kind != JitReturnKind::NumList {
+            return Err("expected List return".into());
         }
         Ok(return_kind)
     })();
@@ -1064,6 +1094,39 @@ unsafe extern "C" fn jit_list_get(ctx: *mut JitCallCtx, list_idx: usize, index_f
         return 0.0;
     }
     unsafe { *slice.ptr.add(resolved as usize) }
+}
+
+#[allow(dead_code)]
+unsafe extern "C" fn jit_list_set(
+    ctx: *mut JitCallCtx,
+    list_idx: usize,
+    index_f64: f64,
+    value: f64,
+) -> f64 {
+    if ctx.is_null() {
+        return 0.0;
+    }
+    let ctx_ref = unsafe { &mut *ctx };
+    if list_idx >= ctx_ref.list_count {
+        ctx_ref.oob = 1;
+        return 0.0;
+    }
+    let slice = unsafe { &*ctx_ref.lists_ptr.add(list_idx) };
+    if slice.len == 0 || !index_f64.is_finite() {
+        ctx_ref.oob = 1;
+        return 0.0;
+    }
+    let raw = index_f64 as isize;
+    let len = slice.len as isize;
+    let resolved = if raw < 0 { len + raw } else { raw };
+    if resolved < 0 || (resolved as usize) >= slice.len {
+        ctx_ref.oob = 1;
+        return 0.0;
+    }
+    unsafe {
+        *slice.ptr.add(resolved as usize) = value;
+    }
+    f64::from_bits(list_idx as u64)
 }
 
 fn math_helper_kind(name: &str, argc: usize) -> Option<MathHelper> {
@@ -1215,6 +1278,11 @@ fn compile_x86_64_code(
         #[allow(dead_code)]
         fn load_xmm2_slot(&mut self, slot: usize) {
             self.code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x93]);
+            self.emit_i32(self.slot_disp(slot));
+        }
+        #[allow(dead_code)]
+        fn load_xmm3_slot(&mut self, slot: usize) {
+            self.code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x9B]);
             self.emit_i32(self.slot_disp(slot));
         }
         fn load_rax_slot(&mut self, slot: usize) {
@@ -1461,6 +1529,32 @@ fn compile_x86_64_code(
                     asm.code.extend_from_slice(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
                 }
                 asm.emit_call_abs(jit_list_get as *const () as usize);
+                asm.push_xmm0(&mut depth, local_count);
+            }
+            Op::SetIndex => {
+                if depth < 3 {
+                    return Err("jit setindex stack underflow".into());
+                }
+                #[cfg(windows)]
+                {
+                    depth -= 1;
+                    asm.load_xmm3_slot(local_count + depth);
+                    depth -= 1;
+                    asm.load_xmm2_slot(local_count + depth);
+                    depth -= 1;
+                    asm.load_rdx_slot(local_count + depth);
+                    asm.code.extend_from_slice(&[0x4C, 0x89, 0xE1]); // mov rcx, r12
+                }
+                #[cfg(not(windows))]
+                {
+                    depth -= 1;
+                    asm.load_xmm1_slot(local_count + depth);
+                    asm.pop_xmm0(&mut depth, local_count)?;
+                    depth -= 1;
+                    asm.load_rsi_slot(local_count + depth);
+                    asm.code.extend_from_slice(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
+                }
+                asm.emit_call_abs(jit_list_set as *const () as usize);
                 asm.push_xmm0(&mut depth, local_count);
             }
             Op::Call(fn_name, argc) => {
@@ -1859,6 +1953,15 @@ fn compile_aarch64_code(
                 // MOV X0, X20 (ORR X0, XZR, X20)
                 asm.emit(0xAA14_03E0);
                 asm.emit_call_abs(jit_list_get as *const () as usize);
+                asm.push_d0(&mut depth, local_count)?;
+            }
+            Op::SetIndex => {
+                asm.pop_d(1, &mut depth, local_count)?;
+                asm.pop_d(0, &mut depth, local_count)?;
+                asm.pop_x(1, &mut depth, local_count)?;
+                // MOV X0, X20 (ORR X0, XZR, X20)
+                asm.emit(0xAA14_03E0);
+                asm.emit_call_abs(jit_list_set as *const () as usize);
                 asm.push_d0(&mut depth, local_count)?;
             }
             Op::Call(fn_name, argc) => {

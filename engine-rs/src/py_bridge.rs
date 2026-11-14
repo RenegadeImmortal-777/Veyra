@@ -265,6 +265,14 @@ struct PyCapiInner {
     err_clear: unsafe extern "C" fn(),
     compile_string: unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> *mut PyObject,
     eval_code: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
+    capsule_new: unsafe extern "C" fn(
+        *mut c_void,
+        *const c_char,
+        Option<unsafe extern "C" fn(*mut PyObject)>,
+    ) -> *mut PyObject,
+    capsule_get_pointer: unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut c_void,
+    capsule_is_valid: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
+    capsule_set_name: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
     none_ptr: *mut PyObject,
     true_ptr: *mut PyObject,
     false_ptr: *mut PyObject,
@@ -574,6 +582,21 @@ impl PyCapiInner {
         let err_clear: unsafe extern "C" fn() = unsafe { load_fn(&lib, b"PyErr_Clear\0")? };
         let compile_string = unsafe { load_fn(&lib, b"Py_CompileString\0")? };
         let eval_code = unsafe { load_fn(&lib, b"PyEval_EvalCode\0")? };
+        let capsule_new: unsafe extern "C" fn(
+            *mut c_void,
+            *const c_char,
+            Option<unsafe extern "C" fn(*mut PyObject)>,
+        ) -> *mut PyObject = unsafe { load_fn(&lib, b"PyCapsule_New\0")? };
+        let capsule_get_pointer: unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut c_void =
+            unsafe { load_fn(&lib, b"PyCapsule_GetPointer\0")? };
+        let capsule_is_valid: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int =
+            unsafe { load_fn(&lib, b"PyCapsule_IsValid\0")? };
+        let capsule_get_name: unsafe extern "C" fn(*mut PyObject) -> *const c_char =
+            unsafe { load_fn(&lib, b"PyCapsule_GetName\0")? };
+        let capsule_set_name: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int =
+            unsafe { load_fn(&lib, b"PyCapsule_SetName\0")? };
+        let _ = DLPACK_GET_NAME.set(capsule_get_name as usize);
+        let _ = DLPACK_GET_PTR.set(capsule_get_pointer as usize);
         let eval_save_thread: unsafe extern "C" fn() -> *mut c_void =
             unsafe { load_fn(&lib, b"PyEval_SaveThread\0")? };
 
@@ -718,6 +741,10 @@ impl PyCapiInner {
             err_clear,
             compile_string,
             eval_code,
+            capsule_new,
+            capsule_get_pointer,
+            capsule_is_valid,
+            capsule_set_name,
             none_ptr,
             true_ptr,
             false_ptr,
@@ -1462,6 +1489,10 @@ impl PyCapiInner {
     fn export_to_tensor(&self, obj: &Val) -> Result<Val, String> {
         let _gil = GilGuard::acquire(self);
         let mut py_obj = self.val_to_py(obj)?;
+        if let Ok(dl_tensor) = self.try_read_dlpack_obj(py_obj) {
+            unsafe { (self.py_dec_ref)(py_obj) };
+            return Ok(dl_tensor);
+        }
         // Handle PyTorch Tensor cleanly via `.detach().cpu().numpy()` if it lacks direct buffer
         if unsafe { (self.obj_check_buffer)(py_obj) } == 0
             && unsafe { (self.hasattr_str)(py_obj, c"detach".as_ptr()) } != 0
@@ -1715,6 +1746,393 @@ impl PyCapiInner {
         let out = self.pin_handle(py_obj);
         unsafe { (self.py_dec_ref)(py_obj) };
         out
+    }
+
+    fn dlpack_import_explicit(&self, obj: &Val) -> Result<Val, String> {
+        let _gil = GilGuard::acquire(self);
+        let py_obj = self.val_to_py(obj)?;
+        let res = self.try_read_dlpack_obj(py_obj);
+        unsafe { (self.py_dec_ref)(py_obj) };
+        res
+    }
+
+    fn try_read_dlpack_obj(&self, py_obj: *mut PyObject) -> Result<Val, String> {
+        let (cap, owns_cap) = if unsafe {
+            (self.capsule_is_valid)(py_obj, c"dltensor_versioned".as_ptr()) != 0
+                || (self.capsule_is_valid)(py_obj, c"dltensor".as_ptr()) != 0
+        } {
+            (py_obj, false)
+        } else if unsafe { (self.hasattr_str)(py_obj, c"__dlpack__".as_ptr()) } != 0 {
+            let dl_fn = unsafe { (self.getattr_str)(py_obj, c"__dlpack__".as_ptr()) };
+            if dl_fn.is_null() {
+                unsafe { (self.err_clear)() };
+                return Err("object __dlpack__ attribute unavailable".into());
+            }
+            let empty = unsafe { (self.tuple_new)(0) };
+            let kw = unsafe { (self.dict_new)() };
+            let mv_key = unsafe { (self.unicode_from_str)(c"max_version".as_ptr()) };
+            let mv_tup = unsafe { (self.tuple_new)(2) };
+            let maj = unsafe { (self.long_from_i64)(1) };
+            let min = unsafe { (self.long_from_i64)(0) };
+            unsafe {
+                (self.tuple_set_item)(mv_tup, 0, maj);
+                (self.tuple_set_item)(mv_tup, 1, min);
+                (self.dict_set_item)(kw, mv_key, mv_tup);
+                (self.py_dec_ref)(mv_key);
+                (self.py_dec_ref)(mv_tup);
+            }
+            let mut cap_obj = unsafe { (self.obj_call)(dl_fn, empty, kw) };
+            unsafe { (self.py_dec_ref)(kw) };
+            if cap_obj.is_null() {
+                unsafe { (self.err_clear)() };
+                cap_obj = unsafe { (self.obj_call)(dl_fn, empty, std::ptr::null_mut()) };
+            }
+            unsafe {
+                (self.py_dec_ref)(empty);
+                (self.py_dec_ref)(dl_fn);
+            }
+            if cap_obj.is_null() {
+                let err = self.take_error();
+                return Err(format!("calling __dlpack__() failed: {err}"));
+            }
+            (cap_obj, true)
+        } else {
+            return Err("object does not support DLPack (__dlpack__ or dltensor PyCapsule)".into());
+        };
+
+        let is_versioned =
+            unsafe { (self.capsule_is_valid)(cap, c"dltensor_versioned".as_ptr()) } != 0;
+        let is_legacy =
+            !is_versioned && unsafe { (self.capsule_is_valid)(cap, c"dltensor".as_ptr()) } != 0;
+        if !is_versioned && !is_legacy {
+            if owns_cap {
+                unsafe { (self.py_dec_ref)(cap) };
+            }
+            return Err(
+                "DLPack object is not a valid 'dltensor' or 'dltensor_versioned' PyCapsule".into(),
+            );
+        }
+        let cap_name = if is_versioned {
+            c"dltensor_versioned".as_ptr()
+        } else {
+            c"dltensor".as_ptr()
+        };
+        let ptr = unsafe { (self.capsule_get_pointer)(cap, cap_name) };
+        if ptr.is_null() {
+            unsafe { (self.err_clear)() };
+            if owns_cap {
+                unsafe { (self.py_dec_ref)(cap) };
+            }
+            return Err("DLPack PyCapsule contains null pointer".into());
+        }
+
+        let dl: &DLTensor = if is_versioned {
+            let managed_v = ptr as *mut DLManagedTensorVersioned;
+            unsafe { &(*managed_v).dl_tensor }
+        } else {
+            let managed = ptr as *mut DLManagedTensor;
+            unsafe { &(*managed).dl_tensor }
+        };
+        if dl.device.device_type != 1 {
+            let dev = dl.device.device_type;
+            if owns_cap {
+                unsafe { (self.py_dec_ref)(cap) };
+            }
+            return Err(format!(
+                "DLPack tensor uses non-CPU device_type={dev}; move to CPU first"
+            ));
+        }
+        if dl.dtype.lanes != 1 {
+            if owns_cap {
+                unsafe { (self.py_dec_ref)(cap) };
+            }
+            return Err("DLPack vector lanes != 1 unsupported".into());
+        }
+
+        let ndim = dl.ndim.max(0) as usize;
+        let shape: Vec<usize> = if ndim == 0 || dl.shape.is_null() {
+            vec![1]
+        } else {
+            unsafe { std::slice::from_raw_parts(dl.shape, ndim) }
+                .iter()
+                .map(|&d| d.max(0) as usize)
+                .collect()
+        };
+        let total: usize = shape.iter().product::<usize>().max(1);
+        let elem_bytes = (usize::from(dl.dtype.bits) / 8).max(1);
+        let mut strides: Vec<isize> = if ndim > 0 && !dl.strides.is_null() {
+            unsafe { std::slice::from_raw_parts(dl.strides, ndim) }
+                .iter()
+                .map(|&s| s as isize)
+                .collect()
+        } else {
+            let mut st = vec![1isize; shape.len()];
+            let mut acc = 1isize;
+            for i in (0..shape.len()).rev() {
+                st[i] = acc;
+                acc *= shape[i].max(1) as isize;
+            }
+            st
+        };
+        if strides.is_empty() {
+            strides.push(1);
+        }
+
+        let base_ptr = unsafe { (dl.data as *const u8).add(dl.byte_offset as usize) };
+        let mut out = Vec::with_capacity(total);
+        if total > 0 && !dl.data.is_null() {
+            let mut coords = vec![0usize; shape.len()];
+            for _ in 0..total {
+                let mut elem_off = 0isize;
+                for (ax, &c) in coords.iter().enumerate() {
+                    elem_off += (c as isize) * strides[ax];
+                }
+                let ptr_elem = unsafe { base_ptr.offset(elem_off * (elem_bytes as isize)) };
+                let slice = unsafe { std::slice::from_raw_parts(ptr_elem, elem_bytes) };
+                let Some(val) = decode_dl_scalar(dl.dtype, slice) else {
+                    if owns_cap {
+                        unsafe { (self.py_dec_ref)(cap) };
+                    }
+                    return Err(format!(
+                        "unsupported DLPack dtype (code={}, bits={})",
+                        dl.dtype.code, dl.dtype.bits
+                    ));
+                };
+                out.push(val);
+                for ax in (0..shape.len()).rev() {
+                    coords[ax] += 1;
+                    if coords[ax] < shape[ax].max(1) {
+                        break;
+                    }
+                    coords[ax] = 0;
+                }
+            }
+        }
+
+        // Consume capsule per DLPack specification: mark 'used_*' and invoke deleter once.
+        unsafe {
+            if is_versioned {
+                (self.capsule_set_name)(cap, c"used_dltensor_versioned".as_ptr());
+                let managed_v = ptr as *mut DLManagedTensorVersioned;
+                if let Some(del) = (*managed_v).deleter {
+                    del(managed_v);
+                }
+            } else {
+                (self.capsule_set_name)(cap, c"used_dltensor".as_ptr());
+                let managed = ptr as *mut DLManagedTensor;
+                if let Some(del) = (*managed).deleter {
+                    del(managed);
+                }
+            }
+            if owns_cap {
+                (self.py_dec_ref)(cap);
+            }
+        }
+        tensor_store(out, shape, false, TensorOp::Leaf)
+    }
+
+    fn export_tensor_dlpack(&self, tval: &Val) -> Result<Val, String> {
+        let id = tensor_id(tval)?;
+        let snap = tensor_snapshot(id)?;
+        let _gil = GilGuard::acquire(self);
+
+        let data: Box<[f64]> = snap.data.into_boxed_slice();
+        let shape: Box<[i64]> = snap.shape.iter().map(|&d| d as i64).collect();
+        let mut strides_vec = vec![1i64; shape.len()];
+        let mut stride = 1i64;
+        for i in (0..shape.len()).rev() {
+            strides_vec[i] = stride;
+            stride *= shape[i].max(1);
+        }
+        let strides: Box<[i64]> = strides_vec.into_boxed_slice();
+
+        let boxed = Box::new(VeyraDlManaged {
+            managed: DLManagedTensor {
+                dl_tensor: DLTensor {
+                    data: data.as_ptr() as *mut c_void,
+                    device: DLDevice {
+                        device_type: 1, // kDLCPU
+                        device_id: 0,
+                    },
+                    ndim: shape.len() as c_int,
+                    dtype: DLDataType {
+                        code: 2, // kDLFloat
+                        bits: 64,
+                        lanes: 1,
+                    },
+                    shape: shape.as_ptr() as *mut i64,
+                    strides: strides.as_ptr() as *mut i64,
+                    byte_offset: 0,
+                },
+                manager_ctx: std::ptr::null_mut(),
+                deleter: Some(veyra_dl_managed_deleter),
+            },
+            _data: data,
+            _shape: shape,
+            _strides: strides,
+        });
+        let raw_managed = Box::into_raw(boxed) as *mut c_void;
+        let cap = unsafe {
+            (self.capsule_new)(
+                raw_managed,
+                c"dltensor".as_ptr(),
+                Some(dlpack_capsule_destructor),
+            )
+        };
+        if cap.is_null() {
+            unsafe { drop(Box::from_raw(raw_managed as *mut VeyraDlManaged)) };
+            return Err(self.take_error());
+        }
+
+        // Ensure helper wrapper class `_VeyraDLPack` exists in Python module env dict.
+        let cls_key = unsafe { (self.unicode_from_str)(c"_VeyraDLPack".as_ptr()) };
+        let existing = unsafe { (self.dict_get_item)(self.env_dict, cls_key) };
+        if existing.is_null() {
+            let def_src = c"class _VeyraDLPack:\n    def __init__(self, cap):\n        self._cap = cap\n    def __dlpack__(self, stream=None, max_version=None, dl_device=None, copy=None):\n        cap = self._cap\n        if cap is None:\n            raise BufferError('DLPack capsule already consumed')\n        self._cap = None\n        return cap\n    def __dlpack_device__(self):\n        return (1, 0)\n";
+            let code_obj =
+                unsafe { (self.compile_string)(def_src.as_ptr(), c"<veyra-dlpack>".as_ptr(), 257) };
+            if code_obj.is_null() {
+                unsafe {
+                    (self.py_dec_ref)(cls_key);
+                    (self.py_dec_ref)(cap);
+                }
+                return Err(self.take_error());
+            }
+            let r = unsafe { (self.eval_code)(code_obj, self.env_dict, self.env_dict) };
+            unsafe { (self.py_dec_ref)(code_obj) };
+            if r.is_null() {
+                unsafe {
+                    (self.py_dec_ref)(cls_key);
+                    (self.py_dec_ref)(cap);
+                }
+                return Err(self.take_error());
+            }
+            unsafe { (self.py_dec_ref)(r) };
+        }
+        let cls_obj = unsafe { (self.dict_get_item)(self.env_dict, cls_key) };
+        unsafe { (self.py_dec_ref)(cls_key) };
+        if cls_obj.is_null() {
+            unsafe { (self.py_dec_ref)(cap) };
+            return Err("failed to define _VeyraDLPack helper class".into());
+        }
+        let args = unsafe { (self.tuple_new)(1) };
+        unsafe { (self.tuple_set_item)(args, 0, cap) }; // steals ref to `cap`
+        let wrapper = unsafe { (self.obj_call)(cls_obj, args, std::ptr::null_mut()) };
+        unsafe { (self.py_dec_ref)(args) };
+        if wrapper.is_null() {
+            return Err(self.take_error());
+        }
+        let handle = self.pin_handle(wrapper);
+        unsafe { (self.py_dec_ref)(wrapper) };
+        handle
+    }
+}
+
+static DLPACK_GET_NAME: OnceLock<usize> = OnceLock::new();
+static DLPACK_GET_PTR: OnceLock<usize> = OnceLock::new();
+
+#[repr(C)]
+struct DLDevice {
+    device_type: i32,
+    device_id: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DLDataType {
+    code: u8,
+    bits: u8,
+    lanes: u16,
+}
+
+#[repr(C)]
+struct DLTensor {
+    data: *mut c_void,
+    device: DLDevice,
+    ndim: c_int,
+    dtype: DLDataType,
+    shape: *mut i64,
+    strides: *mut i64,
+    byte_offset: u64,
+}
+
+#[repr(C)]
+struct DLPackVersion {
+    major: u32,
+    minor: u32,
+}
+
+#[repr(C)]
+struct DLManagedTensor {
+    dl_tensor: DLTensor,
+    manager_ctx: *mut c_void,
+    deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
+}
+
+#[repr(C)]
+struct DLManagedTensorVersioned {
+    version: DLPackVersion,
+    manager_ctx: *mut c_void,
+    deleter: Option<unsafe extern "C" fn(*mut DLManagedTensorVersioned)>,
+    flags: u64,
+    dl_tensor: DLTensor,
+}
+
+#[repr(C)]
+struct VeyraDlManaged {
+    managed: DLManagedTensor,
+    _data: Box<[f64]>,
+    _shape: Box<[i64]>,
+    _strides: Box<[i64]>,
+}
+
+unsafe extern "C" fn veyra_dl_managed_deleter(ptr: *mut DLManagedTensor) {
+    if !ptr.is_null() {
+        unsafe { drop(Box::from_raw(ptr as *mut VeyraDlManaged)) };
+    }
+}
+
+unsafe extern "C" fn dlpack_capsule_destructor(cap: *mut PyObject) {
+    if cap.is_null() {
+        return;
+    }
+    let Some(&get_name_addr) = DLPACK_GET_NAME.get() else {
+        return;
+    };
+    let Some(&get_ptr_addr) = DLPACK_GET_PTR.get() else {
+        return;
+    };
+    let get_name: unsafe extern "C" fn(*mut PyObject) -> *const c_char =
+        unsafe { std::mem::transmute(get_name_addr) };
+    let get_ptr: unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut c_void =
+        unsafe { std::mem::transmute(get_ptr_addr) };
+    let name = unsafe { get_name(cap) };
+    if !name.is_null() && unsafe { CStr::from_ptr(name) } == c"dltensor" {
+        let raw = unsafe { get_ptr(cap, c"dltensor".as_ptr()) };
+        if !raw.is_null() {
+            let managed = raw as *mut DLManagedTensor;
+            unsafe {
+                if let Some(del) = (*managed).deleter {
+                    del(managed);
+                }
+            }
+        }
+    }
+}
+
+fn decode_dl_scalar(dtype: DLDataType, bytes: &[u8]) -> Option<f64> {
+    match (dtype.code, dtype.bits) {
+        (2, 64) => Some(f64::from_ne_bytes(bytes.try_into().ok()?)),
+        (2, 32) => Some(f32::from_ne_bytes(bytes.try_into().ok()?) as f64),
+        (0, 64) => Some(i64::from_ne_bytes(bytes.try_into().ok()?) as f64),
+        (0, 32) => Some(i32::from_ne_bytes(bytes.try_into().ok()?) as f64),
+        (0, 16) => Some(i16::from_ne_bytes(bytes.try_into().ok()?) as f64),
+        (0, 8) => Some((bytes[0] as i8) as f64),
+        (1, 64) => Some(u64::from_ne_bytes(bytes.try_into().ok()?) as f64),
+        (1, 32) => Some(u32::from_ne_bytes(bytes.try_into().ok()?) as f64),
+        (1, 16) => Some(u16::from_ne_bytes(bytes.try_into().ok()?) as f64),
+        (1, 8) | (6, 8) => Some(bytes[0] as f64),
+        _ => None,
     }
 }
 
@@ -2227,4 +2645,25 @@ pub(crate) fn tensor_to_py(tval: &Val) -> Result<Val, String> {
         "data": snap.data
     }))?;
     Ok(wire_to_val(&raw))
+}
+
+pub(crate) fn tensor_to_dlpack(tval: &Val) -> Result<Val, String> {
+    if let Some(api) = inproc_python() {
+        let tval = tval.clone();
+        return api.run(move |c| c.export_tensor_dlpack(&tval));
+    }
+    Err("tensor_to_dlpack requires in-process CPython C-API bridge".into())
+}
+
+pub(crate) fn py_from_dlpack(val: &Val) -> Result<Val, String> {
+    if let Some(api) = inproc_python() {
+        if is_py_handle(val) {
+            let obj = val.clone();
+            return api.run(move |c| c.dlpack_import_explicit(&obj));
+        }
+    }
+    Err(
+        "py_from_dlpack expects a DLPack-capable Python object/PyCapsule via in-process CPython"
+            .into(),
+    )
 }

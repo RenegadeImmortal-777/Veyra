@@ -59,6 +59,24 @@ impl Vm {
     ) -> Result<Option<Val>, String> {
         let v = match n {
             "print" => self.print_val(&a)?,
+            "requires" | "ensures" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err(format!("{n} expects (cond[, message])"));
+                }
+                if !a[0].truthy() {
+                    let kind = if n == "requires" {
+                        "precondition"
+                    } else {
+                        "postcondition"
+                    };
+                    let msg = match a.get(1) {
+                        Some(m) => m.show(),
+                        None => format!("{kind} failed"),
+                    };
+                    return Err(format!("ContractError: {msg}"));
+                }
+                Val::Null
+            }
             "vybc_compile" => {
                 if a.len() != 1 {
                     return Err("vybc_compile expects source String".into());

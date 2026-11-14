@@ -51,6 +51,20 @@ use crate::value::{
 use crate::value::{json_stringify_value, val_to_sql_value};
 use crate::vm::{Vm, collect_generator, generators, resume_generator};
 
+fn wasm_bytes_from_val(v: &Val) -> Result<Vec<u8>, String> {
+    match v {
+        Val::List(xs) => xs
+            .iter()
+            .map(|b| match b {
+                Val::Num(n) if *n >= 0.0 && *n <= 255.0 => Ok(*n as u8),
+                _ => Err("wasm bytes List entries must be integers in 0..=255".to_string()),
+            })
+            .collect(),
+        Val::Str(path) => fs::read(path).map_err(|e| format!("failed to read '{path}': {e}")),
+        _ => Err("expected wasm byte List or .wasm file path String".into()),
+    }
+}
+
 impl Vm {
     pub(crate) fn call_builtin_sys_net_conc_ffi(
         &mut self,
@@ -117,6 +131,7 @@ impl Vm {
                 Val::Bool(constant_time_strings_equal(left, right))
             }
             "shell" => {
+                crate::runtime::require_cap("process")?;
                 if a.len() != 1 {
                     return Err("shell expects command".into());
                 }
@@ -147,6 +162,7 @@ impl Vm {
             }
             #[cfg(feature = "native-services")]
             "http_request" => {
+                crate::runtime::require_cap("net")?;
                 if a.len() != 5 {
                     return Err("http_request expects method,url,headers,body,timeout_ms".into());
                 }
@@ -205,6 +221,7 @@ impl Vm {
             }
             #[cfg(feature = "native-services")]
             "http_get" => {
+                crate::runtime::require_cap("net")?;
                 if a.len() != 1 {
                     return Err("http_get expects url".into());
                 }
@@ -220,6 +237,7 @@ impl Vm {
             }
             #[cfg(feature = "native-services")]
             "http_post" => {
+                crate::runtime::require_cap("net")?;
                 if a.len() != 2 {
                     return Err("http_post expects url,body".into());
                 }
@@ -764,6 +782,7 @@ impl Vm {
                 Val::Bool(crate::py_bridge::py_available())
             }
             "py_import" => {
+                crate::runtime::require_cap("python")?;
                 if a.len() != 1 {
                     return Err("py_import expects module name String".into());
                 }
@@ -808,6 +827,7 @@ impl Vm {
                 crate::py_bridge::py_dir(&a[0])?
             }
             "py_eval" => {
+                crate::runtime::require_cap("python")?;
                 if a.is_empty() || a.len() > 2 {
                     return Err("py_eval expects (expr[, locals])".into());
                 }
@@ -817,6 +837,7 @@ impl Vm {
                 crate::py_bridge::py_eval(expr, a.get(1))?
             }
             "py_exec" => {
+                crate::runtime::require_cap("python")?;
                 if a.len() != 1 {
                     return Err("py_exec expects Python source String".into());
                 }
@@ -844,10 +865,25 @@ impl Vm {
                 crate::py_bridge::py_to_tensor(&a[0])?
             }
             "tensor_to_py" => {
+                crate::runtime::require_cap("python")?;
                 if a.len() != 1 {
                     return Err("tensor_to_py expects Tensor".into());
                 }
                 crate::py_bridge::tensor_to_py(&a[0])?
+            }
+            "tensor_to_dlpack" => {
+                crate::runtime::require_cap("python")?;
+                if a.len() != 1 {
+                    return Err("tensor_to_dlpack expects Tensor".into());
+                }
+                crate::py_bridge::tensor_to_dlpack(&a[0])?
+            }
+            "py_from_dlpack" => {
+                crate::runtime::require_cap("python")?;
+                if a.len() != 1 {
+                    return Err("py_from_dlpack expects DLPack Python object/PyCapsule".into());
+                }
+                crate::py_bridge::py_from_dlpack(&a[0])?
             }
             "jit_available" => {
                 if !a.is_empty() {
@@ -902,6 +938,7 @@ impl Vm {
                 Val::Bool(ok)
             }
             "plugin_load" => {
+                crate::runtime::require_cap("ffi")?;
                 if a.len() != 1 {
                     return Err("plugin_load expects library path String".into());
                 }
@@ -997,6 +1034,85 @@ impl Vm {
                 };
                 crate::plugin::get_loaded_plugin(pid)?.call(fname, &a[2..])?
             }
+            "cap_current" => {
+                if !a.is_empty() {
+                    return Err("cap_current expects 0 arguments".into());
+                }
+                match crate::runtime::current_caps() {
+                    None => Val::Str("all".into()),
+                    Some(list) => Val::List(list.into_iter().map(Val::Str).collect()),
+                }
+            }
+            "cap_restrict" => {
+                if a.len() != 2 {
+                    return Err("cap_restrict expects (caps_list_or_csv, fn)".into());
+                }
+                let caps: Vec<String> = match &a[0] {
+                    Val::Str(s) => s
+                        .split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect(),
+                    Val::List(xs) => xs
+                        .iter()
+                        .map(|v| match v {
+                            Val::Str(s) => Ok(s.trim().to_string()),
+                            _ => Err("cap_restrict capability names must be String".to_string()),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    _ => return Err("cap_restrict caps must be String or List".into()),
+                };
+                let callee = a[1].clone();
+                crate::runtime::run_with_caps(caps, || self.invoke_callable_sync(&callee, vec![]))?
+            }
+            "wasm_compile" => {
+                if a.len() != 1 {
+                    return Err("wasm_compile expects (source_string)".into());
+                }
+                let Val::Str(src) = &a[0] else {
+                    return Err("wasm_compile source must be String".into());
+                };
+                let bytes = crate::native_codegen::compile_source_to_wasm(src)?;
+                Val::List(bytes.into_iter().map(|b| Val::Num(f64::from(b))).collect())
+            }
+            "wasm_disasm" => {
+                if a.len() != 1 {
+                    return Err("wasm_disasm expects (wasm_bytes_or_path)".into());
+                }
+                let bytes = wasm_bytes_from_val(&a[0])?;
+                Val::Str(crate::native_codegen::wasm_disasm(&bytes)?)
+            }
+            "wasm_run" => {
+                if a.is_empty() || a.len() > 3 {
+                    return Err("wasm_run expects (wasm_bytes_or_path[, fn_name[, args]])".into());
+                }
+                let bytes = wasm_bytes_from_val(&a[0])?;
+                let fn_name = match a.get(1) {
+                    None | Some(Val::Null) => "main".to_string(),
+                    Some(Val::Str(s)) => s.clone(),
+                    Some(_) => return Err("wasm_run fn_name must be String".into()),
+                };
+                let args = match a.get(2) {
+                    None | Some(Val::Null) => Vec::new(),
+                    Some(Val::List(xs)) => xs
+                        .iter()
+                        .map(|v| match v {
+                            Val::Num(n) => Ok(*n),
+                            Val::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+                            _ => Err("wasm_run args must be numeric".to_string()),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Some(_) => return Err("wasm_run args must be List".into()),
+                };
+                let (res, prints) = crate::native_codegen::wasm_run(&bytes, &fn_name, &args)?;
+                Val::Map(vec![
+                    (Val::Str("result".into()), Val::Num(res)),
+                    (
+                        Val::Str("prints".into()),
+                        Val::List(prints.into_iter().map(Val::Str).collect()),
+                    ),
+                ])
+            }
             "__plugin_trampoline_list" => {
                 if a.len() != 3 {
                     return Err("__plugin_trampoline_list expects plugin_id,fn_name,args".into());
@@ -1005,6 +1121,183 @@ impl Vm {
                     return Err("invalid plugin list trampoline arguments".into());
                 };
                 crate::plugin::get_loaded_plugin(pid)?.call(fname, xs)?
+            }
+            "gc_collect" => {
+                if !a.is_empty() {
+                    return Err("gc_collect expects 0 arguments".into());
+                }
+                self.gc_collect()?
+            }
+            "gc_stats" => {
+                if !a.is_empty() {
+                    return Err("gc_stats expects 0 arguments".into());
+                }
+                self.gc_stats()?
+            }
+            "gc_pause" => {
+                if !a.is_empty() {
+                    return Err("gc_pause expects 0 arguments".into());
+                }
+                self.gc_set_paused(true)
+            }
+            "gc_resume" => {
+                if !a.is_empty() {
+                    return Err("gc_resume expects 0 arguments".into());
+                }
+                self.gc_set_paused(false)
+            }
+            "sim_start" => {
+                if a.len() != 1 {
+                    return Err("sim_start expects integer seed".into());
+                }
+                let seed = match a[0] {
+                    Val::Num(n) if n.is_finite() => n as i64 as u64,
+                    _ => return Err("sim_start seed must be Number".into()),
+                };
+                crate::sim_actor::sim_start(seed)
+            }
+            "sim_stop" => {
+                if !a.is_empty() {
+                    return Err("sim_stop expects 0 arguments".into());
+                }
+                crate::sim_actor::sim_stop()
+            }
+            "sim_now" => {
+                if !a.is_empty() {
+                    return Err("sim_now expects 0 arguments".into());
+                }
+                crate::sim_actor::sim_now()?
+            }
+            "sim_advance" => {
+                if a.len() != 1 {
+                    return Err("sim_advance expects milliseconds".into());
+                }
+                let Val::Num(ms) = a[0] else {
+                    return Err("sim_advance expects Number milliseconds".into());
+                };
+                crate::sim_actor::sim_advance(ms)?
+            }
+            "sim_rand" => {
+                if !a.is_empty() {
+                    return Err("sim_rand expects 0 arguments".into());
+                }
+                crate::sim_actor::sim_rand()?
+            }
+            "sim_fault" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("sim_fault expects (target[, rate])".into());
+                }
+                let Val::Str(ref target) = a[0] else {
+                    return Err("sim_fault target must be String".into());
+                };
+                if a.len() == 2 {
+                    let Val::Num(rate) = a[1] else {
+                        return Err("sim_fault rate must be Number".into());
+                    };
+                    crate::sim_actor::sim_fault_set(target, rate)?
+                } else {
+                    crate::sim_actor::sim_fault_check(target)?
+                }
+            }
+            "sim_log" => {
+                if a.len() > 1 {
+                    return Err("sim_log expects 0 or 1 argument".into());
+                }
+                if a.is_empty() {
+                    crate::sim_actor::sim_log_get()?
+                } else {
+                    crate::sim_actor::sim_log_append(a[0].clone())?
+                }
+            }
+            "actor_spawn" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("actor_spawn expects (handler[, options_map])".into());
+                }
+                crate::sim_actor::actor_spawn(self, a[0].clone(), a.get(1))?
+            }
+            "actor_send" => {
+                if a.len() != 2 {
+                    return Err("actor_send expects (actor_id, message)".into());
+                }
+                let Val::Num(id) = a[0] else {
+                    return Err("actor_send id must be Number".into());
+                };
+                if !id.is_finite() || id < 0.0 {
+                    return Err("actor_send id must be non-negative Number".into());
+                }
+                crate::sim_actor::actor_send(id as u64, a[1].clone())?
+            }
+            "actor_ask" => {
+                if a.len() < 2 || a.len() > 3 {
+                    return Err("actor_ask expects (actor_id, message[, timeout_ms])".into());
+                }
+                let Val::Num(id) = a[0] else {
+                    return Err("actor_ask id must be Number".into());
+                };
+                if !id.is_finite() || id < 0.0 {
+                    return Err("actor_ask id must be non-negative Number".into());
+                }
+                let timeout = match a.get(2) {
+                    None | Some(Val::Null) => 10_000u64,
+                    Some(Val::Num(ms)) if ms.is_finite() && *ms >= 0.0 => *ms as u64,
+                    Some(_) => {
+                        return Err("actor_ask timeout_ms must be non-negative Number".into());
+                    }
+                };
+                crate::sim_actor::actor_ask(id as u64, a[1].clone(), timeout)?
+            }
+            "actor_stop" => {
+                if a.len() != 1 {
+                    return Err("actor_stop expects (actor_id)".into());
+                }
+                let Val::Num(id) = a[0] else {
+                    return Err("actor_stop id must be Number".into());
+                };
+                crate::sim_actor::actor_stop(id as u64)?
+            }
+            "actor_status" => {
+                if a.len() != 1 {
+                    return Err("actor_status expects (actor_id)".into());
+                }
+                let Val::Num(id) = a[0] else {
+                    return Err("actor_status id must be Number".into());
+                };
+                crate::sim_actor::actor_status(id as u64)?
+            }
+            "ffi_bindgen" => {
+                if a.len() != 2 {
+                    return Err("ffi_bindgen expects (header_source, lib_path)".into());
+                }
+                let (Val::Str(header_src), Val::Str(lib_path)) = (&a[0], &a[1]) else {
+                    return Err("ffi_bindgen expects String arguments".into());
+                };
+                Val::Str(crate::plugin::ffi_bindgen(header_src, lib_path)?)
+            }
+            "ffi_call" => {
+                crate::runtime::require_cap("ffi")?;
+                if a.len() != 5 {
+                    return Err(
+                        "ffi_call expects (lib_path, symbol, ret_type, param_types, args)".into(),
+                    );
+                }
+                let (
+                    Val::Str(lib_path),
+                    Val::Str(symbol),
+                    Val::Str(ret_type),
+                    Val::List(param_list),
+                    Val::List(arg_list),
+                ) = (&a[0], &a[1], &a[2], &a[3], &a[4])
+                else {
+                    return Err("ffi_call expects (String, String, String, List, List)".into());
+                };
+                let param_types: Vec<String> = param_list
+                    .iter()
+                    .map(|v| match v {
+                        Val::Str(s) => Ok(s.clone()),
+                        _ => Err("ffi_call param_types must be Strings".to_string()),
+                    })
+                    .collect::<Result<_, _>>()?;
+                crate::plugin::ffi_call(lib_path, symbol, ret_type, &param_types, arg_list)?
             }
             _ => return Ok(None),
         };

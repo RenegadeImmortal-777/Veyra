@@ -40,7 +40,7 @@ Last full gate run: **2026-11-14**. Every gate passed (**8/8**).
 | Gate | Result |
 |---|---|
 | `cargo fmt --check` | PASS |
-| `cargo test` | PASS — 99 passed, 0 failed |
+| `cargo test` | PASS — 112 passed, 0 failed |
 | `cargo check --no-default-features` | PASS |
 | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | `cargo build --release` | PASS |
@@ -55,31 +55,35 @@ The engine source is modularized under `engine-rs/src/`:
 - `main.rs` is a 5-line binary entry point calling `veyra::run_cli()` in `lib.rs`.
 - `vm.rs` implements the flat `CallFrame` execution stack, indexed local variable
   slots (`LoadLocal`/`DefineLocal`/`StoreLocal`), loop/indexing superinstructions, shared
-  method cache, automatic hot-function promotion into `jit.rs`, and `Arc<Mutex<Val>>`
-  closure upvalue cell management, while built-in operations live in
+  method cache, mark-sweep cycle-collecting object GC (`gc_collect`, `gc_stats`,
+  `gc_pause`, `gc_resume`), automatic hot-function promotion into `jit.rs`, and
+  `Arc<Mutex<Val>>` closure upvalue cell management, while built-in operations live in
   `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
 - `jit.rs` provides Veyra's in-memory **multi-architecture x86_64 & aarch64 native machine-code JIT compiler**
   (`W^X` executable allocation, CFG type/stack verification, self-recursion `call rel32`, inter-function calls,
-  list indexing/slicing, libm helpers, and `jit_*` builtins).
-- `gpu.rs` provides Veyra's **universal Vulkan SPIR-V & Direct3D 11 (`cs_5_0` HLSL) `f64`/`f32` GPU compute
+  list indexing/slicing, `Op::SetIndex` list mutation and `NumList` returns, libm helpers, and `jit_*` builtins).
+- `gpu.rs` and `spirv.rs` provide Veyra's **universal Vulkan SPIR-V & Direct3D 11 (`cs_5_0` HLSL) `f64`/`f32` GPU compute
   backend** (`vulkan-1.dll`/`libvulkan.so.1`, `dxgi.dll`, `d3d11.dll`, `d3dcompiler_47.dll` with multi-threaded
-  CPU fallback), accelerating `gpu_*` ops, custom HLSL (`gpu_run_hlsl`), and
-  `tensor_to(t, "gpu")` device execution.
+  CPU fallback), single-pass fused elementwise kernel generation (`gpu_fuse`, `gpu_fuse_inspect`), custom HLSL
+  (`gpu_run_hlsl`), and `tensor_to(t, "gpu")` device execution.
+- `native_codegen.rs` and `aot.rs` implement standalone WebAssembly (`.wasm`) compilation/disassembly/execution
+  (`veyra wasm [file.vy] [-o out.wasm] [--disasm] [--run <fn> [args...]]`, `wasm_compile`/`wasm_disasm`/`wasm_run`),
+  direct zero-toolchain PE32+/ELF64 binary emission (`veyra aot [--direct] [--elf|--pe]`), and full-parity
+  `rustc`-compiled AOT builds (`veyra aot`, `veyra build --native`).
 - `plugin.rs` and `registry.rs` implement Veyra's `veyra_plugin_v1` native `cdylib`
-  extension ABI (flat and per-platform `"native"` target maps, `plugin_load`, `plugin_call`,
-  `plugin_build`, seamless `use "<pkg>"` import), HMAC-SHA256 package signing (`keygen`/`sign`/`verify`),
-  `.vypkg` bundles (`pack`/`unpack`), scoped `@org/pkg` + semver constraints, `veyra.lock` format 3,
+  extension ABI, pure-Rust C header FFI bindgen (`veyra ffi bindgen <header.h> <lib_path> [-o out.vy]`,
+  `ffi_bindgen`, capability-gated `ffi_call`), HMAC-SHA256 package signing (`keygen`/`sign`/`verify`),
+  reproducible `.vypkg.json` bundles (`pack`/`unpack`), scoped `@org/pkg` + semver constraints, `veyra.lock` format 3,
   federated registries (`VEYRA_REGISTRY_URLS`) with offline cache (`VEYRA_OFFLINE=1`), monorepo
   `"workspaces"`, `veyra pkg py-bridge`, and HTTP registry publishing/serving (`veyra pkg serve`, `POST /publish`).
-- `aot.rs` implements native AOT compilation (`veyra aot`, `veyra build --native`) via
-  standalone optimized Rust codegen compiled by `rustc` (supporting C3 MRO/`super()`/descriptors/metaclasses,
-  full structural `match`/`case`, `BigInt`/`BigDecimal`/`Complex`/`FFT`, `async fn`/`await`/`gather`,
-  `yield` generators + generator expressions, `**kwargs`/chained calls, dunders, and CPython C-API interop).
 - `py_bridge.rs` provides in-process CPython C-API bindings (`python3xx.dll`/`libpython3`, zero-copy PEP 3118
-  buffer `py_to_tensor`) with subprocess fallback (`py_available`, `py_import`, `py_call`, `py_get`, `py_set`,
-  `py_dir`, `py_eval`, `py_exec`) across VM and native AOT binaries.
-- `dap.rs` and `lsp.rs` implement the native DAP debugger and LSP server consumed by
-  the VS Code extension (`tooling/vscode/`).
+  buffer `py_to_tensor`, and PyCapsule DLPack `DLManagedTensor` / `DLManagedTensorVersioned` interop via
+  `tensor_to_dlpack` / `py_from_dlpack`) with subprocess fallback across VM and native AOT binaries.
+- `sim_actor.rs` implements deterministic simulation (`sim_start`/`sim_stop`/`sim_now`/`sim_advance`/`sim_rand`/
+  `sim_fault`/`sim_log`) and message-passing supervised actors (`actor_spawn`/`actor_send`/`actor_ask`/`actor_stop`/
+  `actor_status`).
+- `dap.rs`, `lsp.rs`, and `server.rs` implement the time-travel reversible DAP server (`stepBack`/`reverseContinue`),
+  the LSP server, and the stateful reactive notebook server (`veyra notebook [dir] [port]`).
 - See [docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md) and [WAY_FORWARD.md](WAY_FORWARD.md)
   for the full architectural map.
 
@@ -100,37 +104,51 @@ Native, without Python:
 
 - **Language**: typed functions and recursion, default parameters and `*rest`
   varargs, ternary expressions (`a if cond else b`), closures with shared mutable
-  lexical upvalues (`Arc<Mutex<Val>>` cells), classes with C3 MRO multiple inheritance,
-  `super()`, descriptors (`@property`), metaclasses, stacked decorators, and static/runtime
-  type enforcement, arbitrary-precision `BigInt`/`BigDecimal`/`Complex`/`FFT`, unwind-safe
-  `try`/`catch`/`finally` and `with ... as ...` context managers, generators, comprehensions,
-  full structural `match`/`case` pattern matching (literals, `*rest` sequences, `**rest` maps,
+  lexical upvalues (`Arc<Mutex<Val>>` cells), first-class contracts (`requires`,
+  `ensures`) and static transitive `@pure` / `@effect(...)` verification, classes with
+  C3 MRO multiple inheritance, `super()`, descriptors (`@property`), metaclasses,
+  stacked decorators, and static/runtime type enforcement, arbitrary-precision
+  `BigInt`/`BigDecimal`/`Complex`/`FFT`, unwind-safe `try`/`catch`/`finally` and
+  `with ... as ...` context managers, generators, comprehensions, full structural
+  `match`/`case` pattern matching (literals, `*rest` sequences, `**rest` maps,
   class patterns with positional/keyword fields, `|`, `as`, `if` guards),
   short-circuit `and`/`or`, right-associative `**`, tuple `(a, b)` and set `{a, b}`
   literals, f-strings, compound assignments (`+=`, `-=`, `*=`, `/=`), list/map index
   mutation (`xs[i] = v`, `m[k] = v`), 1/2/3-arg `range(...)`, async functions with
-  `await`/`gather`, tasks, channels, timeout-aware waits, indirect/chained calls (`f(x)(y)`),
-  keyword arguments/`*args`/`**kwargs`, chained comparisons (`0 <= x < 10`), lazy generator
-  expressions (`(x * x for x in xs)`), class dunders (`__add__`, `__sub__`, `__mul__`, `__eq__`,
-  `__getitem__`, `__setitem__`, `__len__`, `__str__`, `__repr__`, `__call__`), expanded Python-parity
-  builtins/methods (`repr`, `callable`, `divmod`, `getattr`, `hasattr`, `setattr`, `sorted`/`min`/`max`
-  with `key=`, variadic `zip`, `enumerate(..., start=...)`, `print(..., sep=..., end=...)`), and in-process
-  CPython C-API + PEP 3118 buffer interop (`py_import`, `py_call`, `py_get`, `py_set`, `py_dir`, `py_eval`, `py_exec`, `py_to_tensor`).
-- **Bytecode, VM & Native AOT**: portable `veyra-bc-v1` (`.vybc`) bytecode
+  `await`/`gather`, tasks, channels, timeout-aware waits, deterministic simulation
+  (`sim_start`/`sim_stop`/`sim_now`/`sim_advance`/`sim_rand`/`sim_fault`/`sim_log`),
+  supervised actors (`actor_spawn`/`actor_send`/`actor_ask`/`actor_stop`/`actor_status`),
+  indirect/chained calls (`f(x)(y)`), keyword arguments/`*args`/`**kwargs`, chained
+  comparisons (`0 <= x < 10`), lazy generator expressions (`(x * x for x in xs)`),
+  class dunders (`__add__`, `__sub__`, `__mul__`, `__eq__`, `__getitem__`,
+  `__setitem__`, `__len__`, `__str__`, `__repr__`, `__call__`), expanded Python-parity
+  builtins/methods (`repr`, `callable`, `divmod`, `getattr`, `hasattr`, `setattr`,
+  `sorted`/`min`/`max` with `key=`, variadic `zip`, `enumerate(..., start=...)`,
+  `print(..., sep=..., end=...)`), mark-sweep object GC (`gc_collect`/`gc_stats`/
+  `gc_pause`/`gc_resume`), and in-process CPython C-API + PEP 3118 buffer + PyCapsule
+  DLPack interop (`py_import`, `py_call`, `py_get`, `py_set`, `py_dir`, `py_eval`,
+  `py_exec`, `py_to_tensor`, `tensor_to_dlpack`, `py_from_dlpack`).
+- **Bytecode, VM, WASM & Native AOT**: portable `veyra-bc-v1` (`.vybc`) bytecode
   serialization with SHA-256 tamper verification, multi-pass bytecode optimizer
-  (`ir.rs`), flat `CallFrame` + indexed local slot VM (`vm.rs`), pure-Veyra
-  self-hosted compiler (`compiler-vy/src/main.vy`) verified to a 3-stage bootstrap
-  fixpoint (`Stage 2 .vybc == Stage 3 .vybc`), and full-parity native AOT compilation (`aot.rs`,
+  (`ir.rs`), flat `CallFrame` + indexed local slot VM (`vm.rs`), standalone WebAssembly
+  emitter/disassembler/VM (`veyra wasm`), direct zero-toolchain PE32+/ELF64 native
+  executable emission (`veyra aot --direct`), pure-Veyra self-hosted compiler
+  (`compiler-vy/src/main.vy`) verified to a 3-stage bootstrap fixpoint
+  (`Stage 2 .vybc == Stage 3 .vybc`), and full-parity native AOT compilation (`aot.rs`,
   `veyra aot`, `veyra build --native`) including async, generators, dunders, and Python bridge.
 - **Runtime services**: JSON, TOML, CSV, regex, Base64, UUID, date/time, filesystem,
-  paths, processes, environment, platform introspection.
+  paths, processes, environment, platform introspection, and capability sandboxing
+  (`veyra run --caps c1,c2`, `cap_current`, `cap_restrict`, `veyra audit`).
 - **Application**: HTTP client, path-traversal-hardened static/routed/dynamic web
-  servers, request and response headers, SQLite with parameter binding, ORM
-  foundations.
+  servers, request and response headers, persistent stateful reactive notebook server
+  (`veyra notebook [dir] [port]`), SQLite with parameter binding, ORM foundations.
 - **Security**: SHA-256, HMAC-SHA256, PBKDF2, constant-time equality, lockfile
-  integrity audit with tamper detection.
+  integrity audit with tamper detection, capability enforcement (`--caps`, manifest
+  `"capabilities"`, `cap_restrict`), and pure-Rust C header FFI bindgen (`veyra ffi bindgen`).
 - **Data/ML**: dataframe transforms and joins, statistics, linear algebra,
-  regression, clustering, ML metrics, plus an N-dimensional tensor runtime with
+  regression, clustering, ML metrics, fused single-pass Vulkan SPIR-V & HLSL GPU
+  pipelines (`gpu_fuse`, `gpu_fuse_inspect`), CPython DLPack zero-copy tensor interop
+  (`tensor_to_dlpack`, `py_from_dlpack`), plus an N-dimensional tensor runtime with
   NumPy/PyTorch-style N-D broadcasting and backward gradient reduction, cache-friendly
   `tensor_matmul`, reverse-mode autograd with automatic unreachable tape GC
   (`tensor_gc_unreachable`), Adam and SGD optimizers, neural network / transformer
@@ -139,16 +157,17 @@ Native, without Python:
   save/load serialization.
 - **Packages**: offline registry by default, federated registries (`VEYRA_REGISTRY_URLS`)
   with offline disk cache (`VEYRA_OFFLINE=1`), hosted & self-hosted HTTP registry
-  (`veyra pkg serve`, `POST /publish`, `.vypkg` bundles), HMAC-SHA256 signing &
+  (`veyra pkg serve`, `POST /publish`, `.vypkg.json` reproducible bundles), HMAC-SHA256 signing &
   verification, scoped `@org/pkg` + semver constraints, monorepo `"workspaces"`,
   `veyra.lock` format 3, flat and per-platform `veyra_plugin_v1` native binary plugins,
   `veyra pkg py-bridge`, recursive dependencies with cycle protection, and 74 shipped
   packages verified both statically and at runtime by `scripts/package-matrix.ps1`.
-- **Tooling**: `run`/`check`/`lint`/`fmt`/`test`/`build`/`aot`/`repl`/`disasm`,
-  `bench`/`profile`/`doc`, line-aware LSP diagnostics and navigation (completion,
-  hover, definitions, references, rename, hierarchical symbols, formatting), full
-  Debug Adapter Protocol server (`veyra dap` with breakpoints, stepping, stack frames,
-  variable inspection, and `evaluate`), and the VS Code extension (`tooling/vscode/`).
+- **Tooling**: `run`/`check`/`lint`/`fmt`/`test`/`build`/`aot`/`wasm`/`ffi`/`notebook`/
+  `repl`/`disasm`/`bench`/`profile`/`doc`, line-aware LSP diagnostics and navigation
+  (completion, hover, definitions, references, rename, hierarchical symbols, formatting),
+  time-travel reversible Debug Adapter Protocol server (`veyra dap` with breakpoints,
+  stepping, `stepBack`, `reverseContinue`, stack frames, variable inspection, and
+  `evaluate`), and the VS Code extension (`tooling/vscode/`).
 
 ## Resolved inconsistencies (closed in Veyra 12.0)
 

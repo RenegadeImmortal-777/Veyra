@@ -9,7 +9,11 @@ Veyra is a native-first general-purpose language and application platform with i
 - decorators, `with`/`as`, `try`/`catch`/`finally`
 - async functions, `gather`, tasks, channels, task status and timeout-aware waits
 - module objects via `import_package()`
-- C ABI FFI + in-process CPython C-API (`python3xx.dll`/`libpython3`) + PEP 3118 zero-copy `tensor` buffers + `veyra pkg py-bridge`
+- C ABI FFI + pure-Rust C header bindgen (`veyra ffi bindgen <header.h> <lib_path>`) + in-process CPython C-API (`python3xx.dll`/`libpython3`) + PEP 3118 & PyCapsule DLPack (`tensor_to_dlpack` / `py_from_dlpack`) zero-copy tensor interop + `veyra pkg py-bridge`
+- first-class `requires` / `ensures` contracts and static transitive `@pure` / `@effect(...)` verification
+- standalone WebAssembly emitter/disassembler/VM (`veyra wasm`), direct zero-toolchain PE32+/ELF64 emission (`veyra aot --direct`), and multi-arch x86_64/aarch64 native JIT (`Op::SetIndex` + `NumList` returns)
+- single-pass fused SPIR-V & HLSL GPU pipelines (`gpu_fuse`, `gpu_fuse_inspect`), mark-sweep object GC (`gc_collect`, `gc_stats`, `gc_pause`, `gc_resume`), deterministic simulation (`sim_start`..`sim_log`), and supervised actors (`actor_spawn`..`actor_status`)
+- capability sandboxing (`veyra run --caps`, `cap_current`, `cap_restrict`, `veyra audit`), reproducible `.vypkg.json` bundles, reversible time-travel DAP (`stepBack`, `reverseContinue`), and persistent reactive notebook server (`veyra notebook`)
 - dynamic web applications with request headers and arbitrary response headers
 - parameterized SQLite and ORM/query-building foundations
 - dataframe/statistics/plotting/ETL foundations

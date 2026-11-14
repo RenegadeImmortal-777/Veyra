@@ -158,7 +158,9 @@ fn collect_all_ids_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
             }
             Stmt::DecoratedFn(decs, _, _, _, body) => {
                 for d in decs {
-                    collect_all_ids_expr(d, out);
+                    if !crate::pipeline::is_static_effect_decorator(d) {
+                        collect_all_ids_expr(d, out);
+                    }
                 }
                 collect_all_ids_stmts(body, out);
             }
@@ -284,7 +286,9 @@ fn collect_unslotted_in_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::DecoratedFn(decs, name, _, _, body) => {
                 out.insert(name.clone());
                 for d in decs {
-                    collect_all_ids_expr(d, out);
+                    if !crate::pipeline::is_static_effect_decorator(d) {
+                        collect_all_ids_expr(d, out);
+                    }
                 }
                 collect_all_ids_stmts(body, out);
             }
@@ -905,17 +909,21 @@ impl Compiler {
             false,
             child_code,
         ));
-        if decorators.is_empty() {
+        let runtime_decs: Vec<&Expr> = decorators
+            .iter()
+            .filter(|d| !crate::pipeline::is_static_effect_decorator(d))
+            .collect();
+        if runtime_decs.is_empty() {
             self.code.push(Op::FunctionRef(fn_key));
             self.emit_define(name, false, None);
-        } else if decorators.len() == 1 {
-            self.emit_expr(&decorators[0])?;
+        } else if runtime_decs.len() == 1 {
+            self.emit_expr(runtime_decs[0])?;
             self.code.push(Op::FunctionRef(fn_key));
             self.code.push(Op::CallExpr(1));
             self.emit_define(name, false, None);
         } else {
-            let mut dec_tmps = Vec::with_capacity(decorators.len());
-            for d in decorators {
+            let mut dec_tmps = Vec::with_capacity(runtime_decs.len());
+            for d in runtime_decs {
                 let t = self.temp("dec");
                 self.emit_expr(d)?;
                 self.emit_define(&t, false, None);

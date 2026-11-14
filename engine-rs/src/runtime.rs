@@ -3,7 +3,9 @@
 //
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::env;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -84,4 +86,150 @@ pub(crate) fn resolve_function_object(name: &str) -> Result<Option<FunctionDef>,
         .map_err(|_| "function object registry poisoned")?
         .get(name)
         .cloned())
+}
+
+thread_local! {
+    static ACTIVE_CAPS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+}
+
+fn parse_cap_set<'a>(caps: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    caps.into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn env_cap_override() -> Option<HashSet<String>> {
+    let raw = env::var("VEYRA_CAPS").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "*" || trimmed.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    Some(parse_cap_set(trimmed.split(',')))
+}
+
+pub(crate) fn require_cap(cap: &str) -> Result<(), String> {
+    ACTIVE_CAPS.with(|cell| {
+        let borrow = cell.borrow();
+        let active = borrow.as_ref();
+        if let Some(set) = active {
+            if set.contains("*") || set.contains("all") || set.contains(cap) {
+                return Ok(());
+            }
+            if let Some((cat, _)) = cap.split_once('.')
+                && set.contains(cat)
+            {
+                return Ok(());
+            }
+            return Err(format!(
+                "CapabilityError: missing required capability '{cap}'"
+            ));
+        }
+        if let Some(env_set) = env_cap_override() {
+            if env_set.contains(cap)
+                || cap
+                    .split_once('.')
+                    .is_some_and(|(cat, _)| env_set.contains(cat))
+            {
+                return Ok(());
+            }
+            return Err(format!(
+                "CapabilityError: missing required capability '{cap}'"
+            ));
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn current_caps() -> Option<Vec<String>> {
+    ACTIVE_CAPS.with(|cell| {
+        let borrow = cell.borrow();
+        if let Some(set) = borrow.as_ref() {
+            let mut out: Vec<String> = set.iter().cloned().collect();
+            out.sort();
+            return Some(out);
+        }
+        env_cap_override().map(|set| {
+            let sorted: BTreeSet<String> = set.into_iter().collect();
+            sorted.into_iter().collect()
+        })
+    })
+}
+
+struct CapGuard {
+    prev: Option<HashSet<String>>,
+}
+
+impl Drop for CapGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        ACTIVE_CAPS.with(|cell| {
+            *cell.borrow_mut() = prev;
+        });
+    }
+}
+
+pub(crate) fn run_with_caps<T>(
+    requested: Vec<String>,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let prev = ACTIVE_CAPS.with(|cell| cell.borrow().clone());
+    let base = prev.clone().or_else(env_cap_override);
+    let req_set = parse_cap_set(requested.iter().map(String::as_str));
+    let attenuated = match base {
+        None => {
+            if req_set.contains("*") || req_set.contains("all") {
+                None
+            } else {
+                Some(req_set)
+            }
+        }
+        Some(outer) => {
+            if req_set.contains("*") || req_set.contains("all") {
+                Some(outer)
+            } else {
+                // Monotonic attenuation: inner scope can NEVER escalate beyond outer capabilities.
+                Some(outer.into_iter().filter(|c| req_set.contains(c)).collect())
+            }
+        }
+    };
+    ACTIVE_CAPS.with(|cell| {
+        *cell.borrow_mut() = attenuated;
+    });
+    let _guard = CapGuard { prev };
+    f()
+}
+
+thread_local! {
+    static PRINT_CAPTURE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn try_capture_print(text: &str) -> bool {
+    PRINT_CAPTURE.with(|cell| {
+        if let Some(buf) = cell.borrow_mut().as_mut() {
+            buf.push_str(text);
+            return true;
+        }
+        false
+    })
+}
+
+pub(crate) fn with_print_capture<T>(f: impl FnOnce() -> T) -> (T, String) {
+    struct PrintCaptureGuard(Option<String>);
+    impl Drop for PrintCaptureGuard {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            PRINT_CAPTURE.with(|cell| {
+                *cell.borrow_mut() = prev;
+            });
+        }
+    }
+    let prev = PRINT_CAPTURE.with(|cell| cell.borrow_mut().replace(String::new()));
+    let _guard = PrintCaptureGuard(prev);
+    let out = f();
+    let captured = PRINT_CAPTURE
+        .with(|cell| cell.borrow_mut().take())
+        .unwrap_or_default();
+    (out, captured)
 }

@@ -34,6 +34,7 @@ mod ir;
 mod jit;
 mod lexer;
 mod lsp;
+mod native_codegen;
 mod parser;
 mod pipeline;
 mod plugin;
@@ -42,6 +43,7 @@ mod py_bridge;
 mod registry;
 mod runtime;
 mod server;
+mod sim_actor;
 mod spirv;
 mod tensor;
 mod tooling;
@@ -267,20 +269,65 @@ pub fn run_cli() -> ExitCode {
             path.and_then(|p| load_source(p.to_string_lossy().as_ref()))
                 .and_then(|s| compile_source(&s).map(|_| println!("OK")))
         }
-        Some("run") => {
-            let path = match a.get(2) {
-                Some(p) => Ok(PathBuf::from(p)),
-                None => project_entry(),
+        Some("run") => (|| -> Result<(), String> {
+            let mut caps_arg: Option<Vec<String>> = None;
+            let mut file_arg: Option<PathBuf> = None;
+            let mut idx = 2usize;
+            while idx < a.len() {
+                if a[idx] == "--caps" {
+                    let raw = a.get(idx + 1).ok_or("missing capability list after --caps")?;
+                    caps_arg = Some(
+                        raw.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
+                    idx += 2;
+                } else if let Some(raw) = a[idx].strip_prefix("--caps=") {
+                    caps_arg = Some(
+                        raw.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
+                    idx += 1;
+                } else if file_arg.is_none() {
+                    file_arg = Some(PathBuf::from(&a[idx]));
+                    idx += 1;
+                } else {
+                    return Err("usage: veyra run [--caps cap1,cap2] [file.vy]".into());
+                }
+            }
+            let p = match file_arg {
+                Some(p) => p,
+                None => project_entry()?,
             };
-            path.and_then(|p| {
+            let manifest_caps: Option<Vec<String>> = caps_arg.or_else(|| {
+                let cwd = env::current_dir().ok()?;
+                let root = crate::project::project_root(&cwd).ok()?;
+                let txt = fs::read_to_string(root.join("veyra.json")).ok()?;
+                let j: serde_json::Value = serde_json::from_str(&txt).ok()?;
+                let arr = j.get("capabilities")?.as_array()?;
+                Some(
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(ToString::to_string))
+                        .collect(),
+                )
+            });
+            let exec = || {
                 if p.extension().and_then(|e| e.to_str()) == Some("vybc") {
                     let bc = fs::read_to_string(&p).map_err(|e| e.to_string())?;
                     run_vybc(&bc)
                 } else {
                     load_source(p.to_string_lossy().as_ref()).and_then(|s| run_source(&s))
                 }
-            })
-        }
+            };
+            if let Some(caps) = manifest_caps {
+                crate::runtime::run_with_caps(caps, exec)
+            } else {
+                exec()
+            }
+        })(),
         Some("lint") => {
             let path = match a.get(2) {
                 Some(p) => Ok(PathBuf::from(p)),
@@ -337,9 +384,22 @@ pub fn run_cli() -> ExitCode {
         Some("aot") => (|| -> Result<(), String> {
             let mut input_arg: Option<PathBuf> = None;
             let mut output_arg: Option<PathBuf> = None;
+            let mut direct = false;
+            let mut direct_fmt: Option<crate::native_codegen::DirectNativeFormat> = None;
             let mut idx = 2usize;
             while idx < a.len() {
-                if a[idx] == "-o" || a[idx] == "--out" {
+                if a[idx] == "--direct" {
+                    direct = true;
+                    idx += 1;
+                } else if a[idx] == "--elf" || a[idx] == "--target=elf64" {
+                    direct = true;
+                    direct_fmt = Some(crate::native_codegen::DirectNativeFormat::Elf64);
+                    idx += 1;
+                } else if a[idx] == "--pe" || a[idx] == "--target=pe64" {
+                    direct = true;
+                    direct_fmt = Some(crate::native_codegen::DirectNativeFormat::Pe64);
+                    idx += 1;
+                } else if a[idx] == "-o" || a[idx] == "--out" {
                     let out = a.get(idx + 1).ok_or("missing output path after -o")?;
                     output_arg = Some(PathBuf::from(out));
                     idx += 2;
@@ -350,14 +410,101 @@ pub fn run_cli() -> ExitCode {
                     output_arg = Some(PathBuf::from(&a[idx]));
                     idx += 1;
                 } else {
-                    return Err("usage: veyra aot [file.vy] [out_exe]".into());
+                    return Err("usage: veyra aot [--direct] [--elf|--pe] [file.vy] [out_exe]".into());
                 }
             }
             let input = match input_arg {
                 Some(p) => p,
                 None => project_entry()?,
             };
-            crate::aot::compile_file_to_native(&input, output_arg.as_deref()).map(|_| ())
+            if direct {
+                crate::native_codegen::compile_file_to_direct_native(
+                    &input,
+                    output_arg.as_deref(),
+                    direct_fmt,
+                )
+                .map(|_| ())
+            } else {
+                crate::aot::compile_file_to_native(&input, output_arg.as_deref()).map(|_| ())
+            }
+        })(),
+        Some("wasm") => (|| -> Result<(), String> {
+            let mut input_arg: Option<PathBuf> = None;
+            let mut output_arg: Option<PathBuf> = None;
+            let mut run_fn: Option<String> = None;
+            let mut run_args: Vec<f64> = Vec::new();
+            let mut disasm = false;
+            let mut idx = 2usize;
+            while idx < a.len() {
+                match a[idx].as_str() {
+                    "-o" | "--out" => {
+                        let out = a.get(idx + 1).ok_or("missing output path after -o")?;
+                        output_arg = Some(PathBuf::from(out));
+                        idx += 2;
+                    }
+                    "--disasm" => {
+                        disasm = true;
+                        idx += 1;
+                    }
+                    "--run" => {
+                        let fn_name = a.get(idx + 1).cloned().unwrap_or_else(|| "main".into());
+                        run_fn = Some(fn_name);
+                        idx += 2;
+                        while idx < a.len() && !a[idx].starts_with('-') {
+                            let val = a[idx].parse::<f64>().map_err(|_| {
+                                format!("invalid numeric wasm argument '{}'", a[idx])
+                            })?;
+                            run_args.push(val);
+                            idx += 1;
+                        }
+                    }
+                    _ if input_arg.is_none() => {
+                        input_arg = Some(PathBuf::from(&a[idx]));
+                        idx += 1;
+                    }
+                    _ => return Err("usage: veyra wasm <file.vy> [-o out.wasm] [--disasm] [--run <fn> [args...]]".into()),
+                }
+            }
+            let input = match input_arg {
+                Some(p) => p,
+                None => project_entry()?,
+            };
+            if !disasm
+                && run_fn.is_none()
+                && input.extension().and_then(|e| e.to_str()) != Some("wasm")
+            {
+                let out = output_arg.unwrap_or_else(|| input.with_extension("wasm"));
+                return crate::native_codegen::compile_file_to_wasm(&input, &out);
+            }
+            let bytes = if input.extension().and_then(|e| e.to_str()) == Some("wasm") {
+                fs::read(&input).map_err(|e| e.to_string())?
+            } else {
+                let src = load_source(input.to_string_lossy().as_ref())?;
+                crate::native_codegen::compile_source_to_wasm(&src)?
+            };
+            if let Some(out) = output_arg {
+                if let Some(parent) = out.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                fs::write(&out, &bytes).map_err(|e| e.to_string())?;
+            } else if !disasm && run_fn.is_none() {
+                let out = input.with_extension("wasm");
+                fs::write(&out, &bytes).map_err(|e| e.to_string())?;
+            }
+            if disasm {
+                println!("{}", crate::native_codegen::wasm_disasm(&bytes)?);
+            }
+            if let Some(fn_name) = run_fn {
+                let (res, _) = crate::native_codegen::wasm_run(&bytes, &fn_name, &run_args)?;
+                if res.fract() == 0.0 && res.abs() < 9.0e15 {
+                    println!("{}", res as i64);
+                } else {
+                    println!("{res}");
+                }
+            }
+            Ok(())
         })(),
         Some("build") => build_project(a.iter().skip(2).any(|x| x == "--native")),
         Some("audit") => pkg_audit(),
@@ -369,6 +516,37 @@ pub fn run_cli() -> ExitCode {
             let port = a.get(3).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8080);
             serve_directory(&dir, port)
         }
+        Some("notebook") => {
+            let dir = a
+                .get(2)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let port = a.get(3).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8787);
+            crate::server::serve_notebook(&dir, port)
+        }
+        Some("ffi") => (|| -> Result<(), String> {
+            match a.get(2).map(String::as_str) {
+                Some("bindgen") => {
+                    let header_path = a.get(3).ok_or("usage: veyra ffi bindgen <header.h> <lib_path> [-o out.vy]")?;
+                    let lib_path = a.get(4).ok_or("usage: veyra ffi bindgen <header.h> <lib_path> [-o out.vy]")?;
+                    let out_path = if a.get(5).map(String::as_str) == Some("-o") {
+                        Some(a.get(6).ok_or("missing path after -o")?.clone())
+                    } else {
+                        None
+                    };
+                    let hdr = fs::read_to_string(header_path).map_err(|e| e.to_string())?;
+                    let generated = crate::plugin::ffi_bindgen(&hdr, lib_path)?;
+                    if let Some(out) = out_path {
+                        fs::write(&out, generated).map_err(|e| e.to_string())?;
+                        println!("wrote {out}");
+                    } else {
+                        print!("{generated}");
+                    }
+                    Ok(())
+                }
+                _ => Err("usage: veyra ffi bindgen <header.h> <lib_path> [-o out.vy]".into()),
+            }
+        })(),
         Some("web") => a.get(2).ok_or("missing routes.json".into()).and_then(|p| {
             let port = a.get(3).and_then(|x| x.parse::<u16>().ok()).unwrap_or(8080);
             serve_routes(Path::new(p), port)
@@ -4103,5 +4281,756 @@ if py_available() {
 
         drop(_guard);
         let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn wasm_compiler_and_stack_vm_roundtrip() {
+        let src = r#"
+fn fib(n: Int) -> Int {
+    if n <= 1 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn sum_skip(n: Int) -> Int {
+    let s = 0;
+    for i in range(0, n) {
+        if i % 2 == 0 { continue; }
+        s = s + i;
+    }
+    return s;
+}
+let out = fib(10) + sum_skip(6);
+print(out);
+return out;
+"#;
+        let bytes = crate::native_codegen::compile_source_to_wasm(src).unwrap();
+        assert_eq!(&bytes[0..8], b"\0asm\x01\0\0\0");
+        let wat = crate::native_codegen::wasm_disasm(&bytes).unwrap();
+        assert!(wat.contains("(export \"fib\""));
+        let (fib10, _) = crate::native_codegen::wasm_run(&bytes, "fib", &[10.0]).unwrap();
+        assert_eq!(fib10, 55.0);
+        let (main_res, prints) = crate::native_codegen::wasm_run(&bytes, "main", &[]).unwrap();
+        assert_eq!(main_res, 64.0);
+        assert_eq!(prints, vec!["64".to_string()]);
+
+        // Also test via Veyra VM builtins
+        let vy = r#"
+let b = wasm_compile("fn sq(x) { return x * x; } return sq(9);");
+let r = wasm_run(b, "main");
+assert(r["result"] == 81);
+let r2 = wasm_run(b, "sq", [12]);
+assert(r2["result"] == 144);
+"#;
+        assert_eq!(run_source(vy), Ok(()));
+    }
+
+    #[test]
+    fn direct_zero_toolchain_native_pe_and_elf() {
+        let src = r#"
+fn fib(n: Int) -> Int {
+    if n <= 1 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+let acc = 0;
+for i in range(0, 6) {
+    if i == 3 { continue; }
+    acc = acc + i;
+}
+let ans = fib(10) + acc;
+print(ans);
+return ans - 25;
+"#;
+        // Verify ELF64 emission on all platforms
+        let elf = crate::native_codegen::compile_source_to_direct_binary(
+            src,
+            crate::native_codegen::DirectNativeFormat::Elf64,
+        )
+        .unwrap();
+        assert_eq!(&elf[0..4], b"\x7FELF");
+        assert_eq!(u16::from_le_bytes([elf[18], elf[19]]), 62); // EM_X86_64
+
+        // Verify PE32+ emission and actually execute it live on Windows x86_64!
+        let dir = env::temp_dir().join("veyra_direct_pe_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let vy_path = dir.join("prog.vy");
+        let exe_path = dir.join("prog.exe");
+        fs::write(&vy_path, src).unwrap();
+        let wasm_out = dir.join("prog.wasm");
+        crate::native_codegen::compile_file_to_wasm(&vy_path, &wasm_out).unwrap();
+        assert!(wasm_out.is_file());
+
+        crate::native_codegen::compile_file_to_direct_native(
+            &vy_path,
+            Some(&exe_path),
+            Some(crate::native_codegen::DirectNativeFormat::Pe64),
+        )
+        .unwrap();
+        let pe_bytes = fs::read(&exe_path).unwrap();
+        assert_eq!(&pe_bytes[0..2], b"MZ");
+
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let output = std::process::Command::new(&exe_path).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(42),
+                "unexpected exit code, stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.trim(), "67");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contracts_and_static_pure_effect_checker() {
+        // 1. Valid @pure, @effect, requires, ensures work cleanly in VM
+        let ok_src = r#"
+@pure
+fn safe_div(a: Int, b: Int) -> Int {
+    requires(b != 0, "divisor must be non-zero");
+    let res = int(a / b);
+    ensures(res * b <= a);
+    return res;
+}
+@effect("io")
+fn log_div(a: Int, b: Int) {
+    let x = safe_div(a, b);
+    print(x);
+}
+assert(safe_div(20, 4) == 5);
+log_div(21, 5);
+"#;
+        assert_eq!(run_source(ok_src), Ok(()));
+
+        // 2. Runtime contract violations report ContractError cleanly
+        let runtime_fail = run_source("fn f(x) { requires(x > 0, \"pos\"); return x; } f(-1);");
+        assert!(runtime_fail.is_err());
+        assert!(runtime_fail.unwrap_err().contains("ContractError: pos"));
+
+        let post_fail =
+            run_source("fn f(x) { let r = x; ensures(r > 10, \"big\"); return r; } f(2);");
+        assert!(post_fail.is_err());
+        assert!(post_fail.unwrap_err().contains("ContractError: big"));
+
+        // 3. Static literal contradiction caught BEFORE execution
+        let static_false = compile_source("fn f() { requires(1 > 5); }");
+        assert!(static_false.is_err());
+        assert!(static_false.unwrap_err().contains("contract error"));
+
+        // 4. Transitive @pure violation (direct or indirect I/O/fs/global mutation) caught statically
+        let impure_io = compile_source("@pure fn bad(x) { print(x); return x; }");
+        assert!(impure_io.is_err());
+        assert!(impure_io.unwrap_err().contains("effect error"));
+
+        let impure_transitive = compile_source(
+            "fn helper() { write_file(\"x.txt\", \"y\"); }\n@pure fn top() { helper(); }",
+        );
+        assert!(impure_transitive.is_err());
+        assert!(impure_transitive.unwrap_err().contains("effect error"));
+
+        let impure_state = compile_source("let g = 1;\n@pure fn mut_g() { g = 2; }");
+        assert!(impure_state.is_err());
+        assert!(impure_state.unwrap_err().contains("effect error"));
+
+        // 5. Undeclared capability in @effect rejected statically
+        let missing_net = compile_source(
+            "@effect(\"io\") fn fetch() { return http_get(\"http://example.com\"); }",
+        );
+        assert!(missing_net.is_err());
+        assert!(missing_net.unwrap_err().contains("effect error"));
+
+        // 6. AOT parity for @pure and contracts
+        let dir = env::temp_dir().join("veyra_contracts_aot_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join(if cfg!(target_os = "windows") {
+            "c.exe"
+        } else {
+            "c"
+        });
+        let aot_src = r#"
+@pure
+fn checked(n: Int) -> Int {
+    requires(n >= 0, "nonneg");
+    let out = n * 2;
+    ensures(out >= 0, "out_nonneg");
+    return out;
+}
+assert(checked(7) == 14);
+"#;
+        crate::aot::compile_source_to_native(aot_src, &exe).unwrap();
+        let status = std::process::Command::new(&exe).status().unwrap();
+        assert!(status.success());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capability_sandbox_and_reproducible_pkg_bundle() {
+        let dir = env::temp_dir().join("veyra_cap_repro_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let data_file = dir.join("note.txt");
+        fs::write(&data_file, "hello-cap").unwrap();
+        let escaped_file = data_file.to_string_lossy().replace('\\', "\\\\");
+
+        // Attenuated capabilities block fs.write & process while permitting fs.read, and cannot escalate!
+        let vy_src = format!(
+            r#"
+assert(cap_current() == "all");
+let ok = cap_restrict(["fs.read"], fn() {{
+    let txt = read_file("{escaped_file}");
+    assert(txt == "hello-cap");
+    let nested_blocked = false;
+    try {{
+        cap_restrict(["fs.write"], fn() {{
+            write_file("{escaped_file}", "pwned");
+        }});
+    }} catch e {{
+        nested_blocked = contains(str(e), "CapabilityError");
+    }}
+    assert(nested_blocked);
+    return true;
+}});
+assert(ok == true);
+assert(cap_current() == "all");
+"#
+        );
+        assert_eq!(run_source(&vy_src), Ok(()));
+
+        // Verify reproducible deterministic .vybc and .vypkg.json SHA-256 across rebuilds
+        fs::write(
+            dir.join("veyra.json"),
+            r#"{"name":"capdemo","version":"1.2.3","entry":"src/main.vy","capabilities":["fs.write","fs.read"]}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("src").join("main.vy"), "let x = 21 * 2;").unwrap();
+
+        let b1 = crate::registry::build_package_bundle(&dir).unwrap();
+        let b2 = crate::registry::build_package_bundle(&dir).unwrap();
+        assert_eq!(
+            serde_json::to_string_pretty(&b1).unwrap(),
+            serde_json::to_string_pretty(&b2).unwrap()
+        );
+        assert_eq!(
+            b1["capabilities"],
+            serde_json::json!(["fs.read", "fs.write"])
+        );
+
+        let bc1 = compile_to_vybc("let x = 21 * 2;").unwrap();
+        let bc2 = compile_to_vybc("let x = 21 * 2;").unwrap();
+        assert_eq!(bc1, bc2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gpu_fused_kernel_single_pass_spirv_and_hlsl() {
+        let vy_src = r#"
+let info_before = gpu_info();
+let before_cnt = info_before["fused_kernels"];
+let ops = ["add", "mul_scalar:2.0", "relu"];
+let insp = gpu_fuse_inspect(ops);
+let spv = insp["spirv_words"];
+assert(len(spv) > 20);
+assert(int(spv[0]) == 119734787);
+assert(contains(insp["hlsl"], "CSMain"));
+
+let y = gpu_fuse(ops, [-3.0, 1.0, 4.0], [1.0, 2.0, -5.0]);
+assert(len(y) == 3);
+assert(abs(y[0] - 0.0) < 0.0001);
+assert(abs(y[1] - 6.0) < 0.0001);
+assert(abs(y[2] - 0.0) < 0.0001);
+
+let ta = tensor([1.0, 4.0], false);
+let tb = tensor([3.0, 4.0], false);
+let ty = gpu_fuse(["sub", "abs", "sigmoid"], ta, tb);
+assert(tensor_shape(ty) == [2]);
+let flat = tensor_values(ty);
+assert(abs(flat[0] - (1.0 / (1.0 + exp(-2.0)))) < 0.0001);
+assert(abs(flat[1] - 0.5) < 0.0001);
+
+let info_after = gpu_info();
+assert(info_after["fused_kernels"] >= before_cnt + 2);
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn py_bridge_dlpack_torch_and_numpy_interop() {
+        if crate::py_bridge::py_eval("1 + 1", None).is_err() {
+            return;
+        }
+        let vy_src = r#"
+let has_np = py_eval("__import__('importlib.util', fromlist=['find_spec']).find_spec('numpy') is not None");
+let has_torch = py_eval("__import__('importlib.util', fromlist=['find_spec']).find_spec('torch') is not None");
+let t = tensor([[1.5, 2.5], [3.5, 4.5]], false);
+let dl = tensor_to_dlpack(t);
+
+if has_np {
+    let np = py_import("numpy");
+    let arr = np.from_dlpack(dl);
+    assert(list(arr.shape) == [2, 2], "np shape: " + str(arr.shape));
+    let s = np.sum(arr);
+    assert(abs(float(s) - 12.0) < 0.0001, "np sum: " + str(s));
+    let back = py_from_dlpack(arr);
+    assert(tensor_shape(back) == [2, 2], "np back shape: " + str(tensor_shape(back)));
+    let flat = tensor_values(back);
+    assert(abs(flat[0] - 1.5) < 0.0001 and abs(flat[3] - 4.5) < 0.0001, "np flat: " + str(flat));
+    py_free(arr);
+    py_free(np);
+}
+py_free(dl);
+
+if has_torch {
+    let torch = py_import("torch");
+    let py_builtins = py_import("builtins");
+    let dl2 = tensor_to_dlpack(t);
+    let pt = torch.from_dlpack(dl2);
+    assert(py_builtins.list(pt.shape) == [2, 2], "torch shape: " + str(py_builtins.list(pt.shape)));
+    let pt_sum = float(pt.sum().item());
+    assert(abs(pt_sum - 12.0) < 0.0001, "torch sum: " + str(pt_sum));
+    let back_t = py_from_dlpack(pt);
+    assert(tensor_shape(back_t) == [2, 2], "torch back shape: " + str(tensor_shape(back_t)));
+    let via_fast = py_to_tensor(pt);
+    assert(tensor_shape(via_fast) == [2, 2], "torch fast shape: " + str(tensor_shape(via_fast)));
+    let ft = tensor_values(via_fast);
+    assert(abs(ft[1] - 2.5) < 0.0001 and abs(ft[2] - 3.5) < 0.0001, "torch flat: " + str(ft));
+    py_free(pt);
+    py_free(dl2);
+    py_free(py_builtins);
+    py_free(torch);
+}
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn vm_mark_sweep_cycle_collector() {
+        let vy_src = r#"
+class Node {
+    fn init(self, label: String) -> Null {
+        self.label = label;
+        self.next = null;
+        return null;
+    }
+}
+
+assert(gc_stats()["paused"] == false);
+assert(gc_pause() == true);
+assert(gc_stats()["paused"] == true);
+assert(gc_resume() == true);
+assert(gc_stats()["paused"] == false);
+
+// Live cyclic root must survive collection.
+let live_a = Node("liveA");
+let live_b = Node("liveB");
+live_a.next = live_b;
+live_b.next = live_a;
+
+fn build_garbage_cycles() -> Null {
+    let i = 0;
+    while i < 12 {
+        let x = Node("dead" + str(i));
+        let y = Node("deadPair" + str(i));
+        x.next = y;
+        y.next = x;
+        i = i + 1;
+    }
+    return null;
+}
+
+build_garbage_cycles();
+let rep1 = gc_collect();
+assert(rep1["collected"] >= 24, "expected dead cycles swept, got " + str(rep1));
+assert(live_a.label == "liveA" and live_a.next.label == "liveB" and live_a.next.next.label == "liveA");
+
+// Dropping one cycle reclaims those 2 cyclic nodes too.
+let orphan_x = Node("ox");
+let orphan_y = Node("oy");
+orphan_x.next = orphan_y;
+orphan_y.next = orphan_x;
+orphan_x = null;
+orphan_y = null;
+let rep2 = gc_collect();
+assert(rep2["collected"] >= 2, "expected dropped orphan cycle swept, got " + str(rep2));
+assert(gc_stats()["collections"] >= 2);
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn deterministic_simulation_replay_and_faults() {
+        let vy_src = r#"
+fn run_trace(seed: Int) -> List {
+    sim_start(seed);
+    assert(sim_now() == 0);
+    sim_advance(25);
+    let r1 = sim_rand();
+    sim_fault("net.send", 1.0);
+    sim_fault("net.rare", 0.0);
+    assert(sim_fault("net.send") == true);
+    assert(sim_fault("net.rare") == false);
+    sim_advance(15);
+    let r2 = sim_rand();
+    sim_log({"step": "done", "t": sim_now()});
+    let log = sim_log();
+    sim_stop();
+    return [r1, r2, log];
+}
+
+let t1 = run_trace(2026);
+let t2 = run_trace(2026);
+let t3 = run_trace(9999);
+assert(t1[0] == t2[0] and t1[1] == t2[1]);
+assert(t1[2] == t2[2]);
+assert(t1[0] != t3[0]);
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn supervised_actors_mailbox_state_and_restart() {
+        let vy_src = r#"
+let counter = actor_spawn(fn(msg, state) {
+    if msg["op"] == "add" {
+        let next = state + msg["n"];
+        return {"state": next, "reply": next};
+    }
+    if msg["op"] == "crash" {
+        throw "transient failure";
+    }
+    if msg["op"] == "get" {
+        return {"state": state, "reply": state};
+    }
+    return {"state": state, "reply": null};
+}, {"init": 100, "max_restarts": 1});
+
+assert(actor_ask(counter, {"op": "add", "n": 25}) == 125);
+assert(actor_send(counter, {"op": "add", "n": 5}) == true);
+assert(actor_ask(counter, {"op": "get"}) == 130);
+
+// First failure triggers supervision restart back to init=100 while staying alive.
+let err1 = "";
+try {
+    actor_ask(counter, {"op": "crash"});
+} catch e {
+    err1 = str(e);
+}
+assert(contains(err1, "restarted 1/1"), "unexpected err1: " + err1);
+let st1 = actor_status(counter);
+assert(st1["alive"] == true and st1["restarts"] == 1 and st1["status"] == "restarted");
+assert(actor_ask(counter, {"op": "get"}) == 100);
+
+// Second failure exceeds max_restarts=1 -> actor transitions to failed and terminates.
+let err2 = "";
+try {
+    actor_ask(counter, {"op": "crash"});
+} catch e {
+    err2 = str(e);
+}
+assert(contains(err2, "exceeded max_restarts=1"), "unexpected err2: " + err2);
+assert(actor_stop(counter) == true);
+let st2 = actor_status(counter);
+assert(st2["alive"] == false and st2["status"] == "failed");
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn ffi_header_bindgen_and_live_cdylib_call() {
+        if std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = env::temp_dir().join("veyra_ffi_bindgen_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rs_path = dir.join("cmath_abi.rs");
+        fs::write(
+            &rs_path,
+            r#"
+#[unsafe(no_mangle)]
+pub extern "C" fn c_add_i32(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn c_fma_f64(x: f64, y: f64, z: f64) -> f64 {
+    x * y + z
+}
+"#,
+        )
+        .unwrap();
+        let lib_path = dir.join(format!(
+            "cmath_abi.{}",
+            crate::plugin::platform_shared_ext()
+        ));
+        crate::plugin::build_rust_plugin(&rs_path, &lib_path).unwrap();
+
+        let header = r#"
+// Sample C API header
+typedef int i32_alias;
+i32_alias c_add_i32(i32_alias a, i32_alias b);
+double c_fma_f64(double x, double y, double z);
+"#;
+        let wrapper = crate::plugin::ffi_bindgen(header, &lib_path.to_string_lossy()).unwrap();
+        let runner = format!(
+            "{wrapper}\nassert(c_add_i32(19, 23) == 42);\nlet f = c_fma_f64(2.5, 4.0, 1.5);\nassert(abs(f - 11.5) < 0.0001);\n"
+        );
+        assert_eq!(run_source(&runner), Ok(()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dap_time_travel_step_back_and_reverse_continue() {
+        use std::collections::VecDeque;
+        use std::io::{BufReader, Read, Write};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        #[derive(Clone, Default)]
+        struct MemPipe {
+            inner: Arc<(Mutex<(VecDeque<u8>, bool)>, Condvar)>,
+        }
+        impl MemPipe {
+            fn close(&self) {
+                let (m, cv) = &*self.inner;
+                let mut g = m.lock().unwrap();
+                g.1 = true;
+                cv.notify_all();
+            }
+        }
+        impl Read for MemPipe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let (m, cv) = &*self.inner;
+                let mut g = m.lock().unwrap();
+                while g.0.is_empty() && !g.1 {
+                    g = cv.wait(g).unwrap();
+                }
+                let mut n = 0;
+                while n < buf.len() {
+                    if let Some(b) = g.0.pop_front() {
+                        buf[n] = b;
+                        n += 1;
+                    } else {
+                        break;
+                    }
+                }
+                Ok(n)
+            }
+        }
+        impl Write for MemPipe {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let (m, cv) = &*self.inner;
+                let mut g = m.lock().unwrap();
+                g.0.extend(buf);
+                cv.notify_all();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let prog = env::temp_dir().join("veyra_dap_timetravel_test.vy");
+        fs::write(
+            &prog,
+            "let x = 1;\nx = 2;\nx = 3;\nx = 4;\nassert(x == 4);\n",
+        )
+        .unwrap();
+
+        let mut c2s = MemPipe::default();
+        let s2c = MemPipe::default();
+        let server_in = c2s.clone();
+        let server_out = s2c.clone();
+        let srv_handle = std::thread::spawn(move || {
+            crate::dap::run_dap_with_io(BufReader::new(server_in), Box::new(server_out))
+        });
+
+        let mut client_reader = BufReader::new(s2c);
+        let mut seq = 1u64;
+        let mut send_req = |cmd: &str, args: serde_json::Value| -> u64 {
+            let id = seq;
+            seq += 1;
+            let payload = serde_json::json!({
+                "seq": id,
+                "type": "request",
+                "command": cmd,
+                "arguments": args
+            });
+            let body = serde_json::to_string(&payload).unwrap();
+            let msg = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+            c2s.write_all(msg.as_bytes()).unwrap();
+            c2s.flush().unwrap();
+            id
+        };
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        fn recv_resp(
+            reader: &mut impl std::io::BufRead,
+            events: &mut Vec<serde_json::Value>,
+            target_cmd: &str,
+        ) -> serde_json::Value {
+            loop {
+                let msg = crate::dap::read_dap_message(reader)
+                    .unwrap()
+                    .expect("expected DAP message");
+                if msg.get("type").and_then(|v| v.as_str()) == Some("response")
+                    && msg.get("command").and_then(|v| v.as_str()) == Some(target_cmd)
+                {
+                    assert_eq!(
+                        msg.get("success").and_then(|v| v.as_bool()),
+                        Some(true),
+                        "DAP command {target_cmd} failed: {msg}"
+                    );
+                    return msg;
+                }
+                events.push(msg);
+            }
+        }
+        fn wait_event(
+            reader: &mut impl std::io::BufRead,
+            events: &mut Vec<serde_json::Value>,
+            target_event: &str,
+        ) -> serde_json::Value {
+            if let Some(pos) = events
+                .iter()
+                .position(|m| m.get("event").and_then(|v| v.as_str()) == Some(target_event))
+            {
+                return events.remove(pos);
+            }
+            loop {
+                let msg = crate::dap::read_dap_message(reader)
+                    .unwrap()
+                    .expect("expected DAP event");
+                if msg.get("type").and_then(|v| v.as_str()) == Some("event")
+                    && msg.get("event").and_then(|v| v.as_str()) == Some(target_event)
+                {
+                    return msg;
+                }
+                events.push(msg);
+            }
+        }
+
+        send_req("initialize", serde_json::json!({"adapterID": "veyra"}));
+        let init_resp = recv_resp(&mut client_reader, &mut events, "initialize");
+        assert_eq!(init_resp["body"]["supportsStepBack"].as_bool(), Some(true));
+        let _ = wait_event(&mut client_reader, &mut events, "initialized");
+
+        send_req(
+            "launch",
+            serde_json::json!({"program": prog.to_string_lossy(), "stopOnEntry": false}),
+        );
+        let _ = recv_resp(&mut client_reader, &mut events, "launch");
+
+        // Breakpoint on line 2 (x = 2;) and line 4 (x = 4;)
+        send_req(
+            "setBreakpoints",
+            serde_json::json!({
+                "source": {"path": prog.to_string_lossy()},
+                "breakpoints": [{"line": 2}, {"line": 4}]
+            }),
+        );
+        let _ = recv_resp(&mut client_reader, &mut events, "setBreakpoints");
+        send_req("configurationDone", serde_json::json!({}));
+        let _ = recv_resp(&mut client_reader, &mut events, "configurationDone");
+
+        // Hits line 2 first (x == 1 before x = 2) -> continue -> hits line 4 (x == 3 before x = 4).
+        let _ = wait_event(&mut client_reader, &mut events, "stopped");
+        send_req("continue", serde_json::json!({"threadId": 1}));
+        let _ = recv_resp(&mut client_reader, &mut events, "continue");
+        let _ = wait_event(&mut client_reader, &mut events, "stopped");
+
+        // Evaluate live line 4: x is 3
+        send_req("evaluate", serde_json::json!({"expression": "x"}));
+        let eval_live = recv_resp(&mut client_reader, &mut events, "evaluate");
+        assert_eq!(eval_live["body"]["result"].as_str(), Some("3"));
+
+        // stepBack one statement -> line 3 (x is 2)!
+        send_req("stepBack", serde_json::json!({"threadId": 1}));
+        let _ = recv_resp(&mut client_reader, &mut events, "stepBack");
+        let _ = wait_event(&mut client_reader, &mut events, "stopped");
+        send_req("evaluate", serde_json::json!({"expression": "x"}));
+        let eval_back = recv_resp(&mut client_reader, &mut events, "evaluate");
+        assert_eq!(eval_back["body"]["result"].as_str(), Some("2"));
+
+        // reverseContinue -> stops back at line 2 breakpoint (x == 1)!
+        send_req("reverseContinue", serde_json::json!({"threadId": 1}));
+        let _ = recv_resp(&mut client_reader, &mut events, "reverseContinue");
+        let _ = wait_event(&mut client_reader, &mut events, "stopped");
+        send_req("evaluate", serde_json::json!({"expression": "x"}));
+        let eval_rev = recv_resp(&mut client_reader, &mut events, "evaluate");
+        assert_eq!(eval_rev["body"]["result"].as_str(), Some("1"));
+
+        send_req("continue", serde_json::json!({"threadId": 1}));
+        let _ = recv_resp(&mut client_reader, &mut events, "continue");
+        let _ = wait_event(&mut client_reader, &mut events, "terminated");
+        send_req("disconnect", serde_json::json!({}));
+        let _ = recv_resp(&mut client_reader, &mut events, "disconnect");
+        c2s.close();
+        srv_handle.join().unwrap().unwrap();
+        let _ = fs::remove_file(&prog);
+    }
+
+    #[test]
+    fn notebook_reactive_stateful_session() {
+        let dir = env::temp_dir().join("veyra_notebook_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let nb_file = dir.join(".veyra-notebook.json");
+        let mut nb = crate::server::NotebookSession::new(Some(nb_file.clone()));
+
+        let r1 = nb.eval_cell(
+            "c1",
+            "let x = 10;\nfn dbl(v) { return v * 2; }\nprint(dbl(x));",
+        );
+        assert_eq!(r1.error, None);
+        assert_eq!(r1.stdout.trim(), "20");
+
+        let r2 = nb.eval_cell("c2", "x = dbl(x) + 5;\nprint(x);");
+        assert_eq!(r2.error, None);
+        assert_eq!(r2.stdout.trim(), "25");
+
+        let r3 = nb.eval_cell("c3", "x * 2");
+        assert_eq!(r3.error, None);
+        assert_eq!(r3.value.as_deref(), Some("50"));
+
+        assert!(nb_file.is_file());
+        nb.reset();
+        let r4 = nb.eval_cell("c4", "x");
+        assert!(r4.error.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jit_setindex_and_return_list_native_execution() {
+        let vy_src = r#"
+fn scale_list(xs: List, factor: Float) -> List {
+    let i = 0;
+    while i < len(xs) {
+        xs[i] = xs[i] * factor + 1.0;
+        i = i + 1;
+    }
+    return xs;
+}
+
+let before = jit_info();
+let k = 0;
+let last = [];
+while k < 20 {
+    last = scale_list([1.0, 2.0, 3.0], 2.0);
+    k = k + 1;
+}
+assert(last == [3, 5, 7], "unexpected jit list result: " + str(last));
+let after = jit_info();
+if jit_available() {
+    assert(after["compiled_functions"] >= before["compiled_functions"]);
+    assert(after["native_calls"] > before["native_calls"]);
+}
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
     }
 }

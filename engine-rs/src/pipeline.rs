@@ -3,7 +3,7 @@
 //
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -206,7 +206,509 @@ pub fn load_source(path: &str) -> Result<String, String> {
     load_source_with_lines(path).map(|(src, _)| src)
 }
 
+pub(crate) fn is_static_effect_decorator(e: &Expr) -> bool {
+    match e {
+        Expr::Var(n) => n == "pure",
+        Expr::Call(n, _) => n == "pure" || n == "effect",
+        Expr::CallExt {
+            callee,
+            method: None,
+            ..
+        } => {
+            matches!(&**callee, Expr::Var(n) if n == "pure" || n == "effect")
+        }
+        _ => false,
+    }
+}
+
+fn const_eval_num(e: &Expr) -> Option<f64> {
+    match e {
+        Expr::Num(n) => Some(*n),
+        Expr::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        Expr::Unary(op, x) if op == "-" => Some(-const_eval_num(x)?),
+        Expr::Unary(op, x) if op == "+" => const_eval_num(x),
+        Expr::Bin(l, op, r) => {
+            let a = const_eval_num(l)?;
+            let b = const_eval_num(r)?;
+            match op.as_str() {
+                "+" => Some(a + b),
+                "-" => Some(a - b),
+                "*" => Some(a * b),
+                "/" if b != 0.0 => Some(a / b),
+                "%" if b != 0.0 => Some(a % b),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn const_eval_bool(e: &Expr) -> Option<bool> {
+    match e {
+        Expr::Bool(b) => Some(*b),
+        Expr::Num(n) => Some(*n != 0.0),
+        Expr::Null => Some(false),
+        Expr::Unary(op, x) if op == "not" || op == "!" => Some(!const_eval_bool(x)?),
+        Expr::Bin(l, op, r) => match op.as_str() {
+            "and" => match const_eval_bool(l) {
+                Some(false) => Some(false),
+                Some(true) => const_eval_bool(r),
+                None => None,
+            },
+            "or" => match const_eval_bool(l) {
+                Some(true) => Some(true),
+                Some(false) => const_eval_bool(r),
+                None => None,
+            },
+            "==" | "!=" | "<" | "<=" | ">" | ">=" => {
+                if let (Some(a), Some(b)) = (const_eval_num(l), const_eval_num(r)) {
+                    Some(match op.as_str() {
+                        "==" => a == b,
+                        "!=" => a != b,
+                        "<" => a < b,
+                        "<=" => a <= b,
+                        ">" => a > b,
+                        ">=" => a >= b,
+                        _ => unreachable!(),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn builtin_effect_tag(name: &str) -> Option<&'static str> {
+    match name {
+        "print" | "println" | "input" => Some("io"),
+        "read_file" | "write_file" | "append_file" | "remove_file" | "path_exists" | "is_file"
+        | "is_dir" | "list_dir" | "mkdir" | "sqlite_open" | "sqlite_exec" | "sqlite_query" => {
+            Some("fs")
+        }
+        "http_request" | "http_get" | "http_post" | "http_serve" | "ws_connect" => Some("net"),
+        "shell" | "spawn_process" | "exit" => Some("process"),
+        "env_get" | "env_set" | "now_ms" | "time_ms" | "rand" | "rand_int" | "uuid_v4" | "cwd" => {
+            Some("env")
+        }
+        "plugin_load" | "plugin_call" | "plugin_build" | "py_import" | "py_call" | "py_eval"
+        | "py_exec" | "wasm_run" => Some("ffi"),
+        "gpu_map" | "gpu_reduce" | "gpu_matmul" | "gpu_fuse" => Some("gpu"),
+        "actor_spawn" | "actor_send" | "actor_ask" | "actor_stop" | "sim_start" | "sim_stop"
+        | "cap_restrict" | "gc_collect" | "gc_pause" | "gc_resume" => Some("state"),
+        _ => None,
+    }
+}
+
+fn verify_effects_and_contracts(ast: &[Stmt], errors: &mut Vec<String>) {
+    struct FnEffectInfo {
+        ceiling: Option<BTreeSet<String>>,
+        direct_effects: BTreeSet<String>,
+        callees: BTreeSet<String>,
+    }
+
+    fn collect_locals(stmts: &[Stmt], out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Let(n, ..) => {
+                    out.insert(n.clone());
+                }
+                Stmt::ForRange(n, _, _, b) | Stmt::ForEach(n, _, b) | Stmt::With(_, n, b) => {
+                    out.insert(n.clone());
+                    collect_locals(b, out);
+                }
+                Stmt::If(_, t, e) => {
+                    collect_locals(t, out);
+                    collect_locals(e, out);
+                }
+                Stmt::While(_, b) => {
+                    collect_locals(b, out);
+                }
+                Stmt::Try(b, err, c, f) => {
+                    out.insert(err.clone());
+                    collect_locals(b, out);
+                    collect_locals(c, out);
+                    collect_locals(f, out);
+                }
+                Stmt::Match(_, arms) => {
+                    for (_, _, b) in arms {
+                        collect_locals(b, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_static_contract_call(name: &str, args: &[Expr], errors: &mut Vec<String>) {
+        if (name == "requires" || name == "ensures")
+            && let Some(cond) = args.first()
+            && const_eval_bool(cond) == Some(false)
+        {
+            let kind = if name == "requires" {
+                "precondition"
+            } else {
+                "postcondition"
+            };
+            errors.push(format!(
+                "contract error: {kind} is statically unsatisfiable"
+            ));
+        }
+    }
+
+    fn scan_expr_effects(
+        e: &Expr,
+        locals: &HashSet<String>,
+        info: &mut FnEffectInfo,
+        errors: &mut Vec<String>,
+    ) {
+        match e {
+            Expr::Call(n, args) => {
+                check_static_contract_call(n, args, errors);
+                if let Some(tag) = builtin_effect_tag(n) {
+                    info.direct_effects.insert(tag.to_string());
+                } else {
+                    info.callees.insert(n.clone());
+                }
+                for a in args {
+                    scan_expr_effects(a, locals, info, errors);
+                }
+            }
+            Expr::CallExt {
+                callee,
+                method,
+                args,
+            } => {
+                let pos: Vec<Expr> = args
+                    .iter()
+                    .filter_map(|a| match a {
+                        CallArg::Pos(x) | CallArg::Kw(_, x) => Some(x.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if method.is_none()
+                    && let Expr::Var(n) = callee.as_ref()
+                {
+                    check_static_contract_call(n, &pos, errors);
+                    if let Some(tag) = builtin_effect_tag(n) {
+                        info.direct_effects.insert(tag.to_string());
+                    } else {
+                        info.callees.insert(n.clone());
+                    }
+                } else {
+                    scan_expr_effects(callee, locals, info, errors);
+                }
+                for a in args {
+                    match a {
+                        CallArg::Pos(x)
+                        | CallArg::Star(x)
+                        | CallArg::Kw(_, x)
+                        | CallArg::KwStar(x) => scan_expr_effects(x, locals, info, errors),
+                    }
+                }
+            }
+            Expr::List(xs) => {
+                for x in xs {
+                    scan_expr_effects(x, locals, info, errors);
+                }
+            }
+            Expr::Map(ps) => {
+                for (k, v) in ps {
+                    scan_expr_effects(k, locals, info, errors);
+                    scan_expr_effects(v, locals, info, errors);
+                }
+            }
+            Expr::Index(a, b) | Expr::Bin(a, _, b) => {
+                scan_expr_effects(a, locals, info, errors);
+                scan_expr_effects(b, locals, info, errors);
+            }
+            Expr::Ternary(a, b, c) => {
+                scan_expr_effects(a, locals, info, errors);
+                scan_expr_effects(b, locals, info, errors);
+                scan_expr_effects(c, locals, info, errors);
+            }
+            Expr::Member(o, _) | Expr::Unary(_, o) | Expr::Await(o) => {
+                scan_expr_effects(o, locals, info, errors);
+            }
+            Expr::MethodCall(o, _, args) => {
+                scan_expr_effects(o, locals, info, errors);
+                for a in args {
+                    scan_expr_effects(a, locals, info, errors);
+                }
+            }
+            Expr::ChainedCmp(f, rest) => {
+                scan_expr_effects(f, locals, info, errors);
+                for (_, r) in rest {
+                    scan_expr_effects(r, locals, info, errors);
+                }
+            }
+            Expr::CallExpr(f, args) => {
+                scan_expr_effects(f, locals, info, errors);
+                for a in args {
+                    scan_expr_effects(a, locals, info, errors);
+                }
+            }
+            Expr::Lambda(ps, _, body) => {
+                let mut inner_locals = locals.clone();
+                for (p, _) in ps {
+                    inner_locals.insert(p.clone());
+                }
+                collect_locals(body, &mut inner_locals);
+                scan_stmts_effects(body, &inner_locals, info, errors);
+            }
+            Expr::ListComp(val, var, it, cond) => {
+                scan_expr_effects(it, locals, info, errors);
+                let mut inner = locals.clone();
+                inner.insert(var.clone());
+                scan_expr_effects(val, &inner, info, errors);
+                if let Some(c) = cond {
+                    scan_expr_effects(c, &inner, info, errors);
+                }
+            }
+            Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Var(_) => {}
+        }
+    }
+
+    fn scan_stmts_effects(
+        stmts: &[Stmt],
+        locals: &HashSet<String>,
+        info: &mut FnEffectInfo,
+        errors: &mut Vec<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Let(_, _, e, _) | Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Yield(e) => {
+                    scan_expr_effects(e, locals, info, errors);
+                }
+                Stmt::Assign(target, e) => {
+                    if !locals.contains(target) {
+                        info.direct_effects.insert("state".into());
+                    }
+                    scan_expr_effects(e, locals, info, errors);
+                }
+                Stmt::SetMember(obj, _, val) => {
+                    if let Expr::Var(v) = obj
+                        && !locals.contains(v)
+                    {
+                        info.direct_effects.insert("state".into());
+                    }
+                    scan_expr_effects(obj, locals, info, errors);
+                    scan_expr_effects(val, locals, info, errors);
+                }
+                Stmt::SetIndex(obj, idx, val) => {
+                    if let Expr::Var(v) = obj
+                        && !locals.contains(v)
+                    {
+                        info.direct_effects.insert("state".into());
+                    }
+                    scan_expr_effects(obj, locals, info, errors);
+                    scan_expr_effects(idx, locals, info, errors);
+                    scan_expr_effects(val, locals, info, errors);
+                }
+                Stmt::If(c, t, e) => {
+                    scan_expr_effects(c, locals, info, errors);
+                    scan_stmts_effects(t, locals, info, errors);
+                    scan_stmts_effects(e, locals, info, errors);
+                }
+                Stmt::While(c, b) => {
+                    scan_expr_effects(c, locals, info, errors);
+                    scan_stmts_effects(b, locals, info, errors);
+                }
+                Stmt::ForRange(_, a, b, body) => {
+                    scan_expr_effects(a, locals, info, errors);
+                    scan_expr_effects(b, locals, info, errors);
+                    scan_stmts_effects(body, locals, info, errors);
+                }
+                Stmt::ForEach(_, it, body) | Stmt::With(it, _, body) => {
+                    scan_expr_effects(it, locals, info, errors);
+                    scan_stmts_effects(body, locals, info, errors);
+                }
+                Stmt::Try(b, _, c, f) => {
+                    scan_stmts_effects(b, locals, info, errors);
+                    scan_stmts_effects(c, locals, info, errors);
+                    scan_stmts_effects(f, locals, info, errors);
+                }
+                Stmt::Match(sub, arms) => {
+                    scan_expr_effects(sub, locals, info, errors);
+                    for (_, g, b) in arms {
+                        if let Some(ge) = g {
+                            scan_expr_effects(ge, locals, info, errors);
+                        }
+                        scan_stmts_effects(b, locals, info, errors);
+                    }
+                }
+                Stmt::Return(Some(e)) => scan_expr_effects(e, locals, info, errors),
+                Stmt::Return(None)
+                | Stmt::Break
+                | Stmt::Continue
+                | Stmt::SourceLine(_)
+                | Stmt::Fn(..)
+                | Stmt::AsyncFn(..)
+                | Stmt::DecoratedFn(..)
+                | Stmt::Class(..) => {}
+            }
+        }
+    }
+
+    fn parse_effect_ceiling(decs: &[Expr], errors: &mut Vec<String>) -> Option<BTreeSet<String>> {
+        let mut ceiling: Option<BTreeSet<String>> = None;
+        for d in decs {
+            match d {
+                Expr::Var(n) if n == "pure" => {
+                    ceiling.get_or_insert_with(BTreeSet::new);
+                }
+                Expr::Call(n, args) if n == "pure" && args.is_empty() => {
+                    ceiling.get_or_insert_with(BTreeSet::new);
+                }
+                Expr::Call(n, args) if n == "effect" => {
+                    let set = ceiling.get_or_insert_with(BTreeSet::new);
+                    for a in args {
+                        if let Expr::Str(s) = a {
+                            set.insert(s.clone());
+                        } else {
+                            errors.push(
+                                "effect error: @effect(...) requires String capability arguments"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                Expr::CallExt {
+                    callee,
+                    method: None,
+                    args,
+                } if matches!(&**callee, Expr::Var(n) if n == "pure" || n == "effect") => {
+                    let set = ceiling.get_or_insert_with(BTreeSet::new);
+                    if matches!(&**callee, Expr::Var(n) if n == "effect") {
+                        for a in args {
+                            if let CallArg::Pos(Expr::Str(s)) = a {
+                                set.insert(s.clone());
+                            } else {
+                                errors.push(
+                                    "effect error: @effect(...) requires String arguments".into(),
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        ceiling
+    }
+
+    fn collect_fns(
+        stmts: &[Stmt],
+        map: &mut HashMap<String, FnEffectInfo>,
+        errors: &mut Vec<String>,
+    ) {
+        let mut top_only_dummy = FnEffectInfo {
+            ceiling: None,
+            direct_effects: BTreeSet::new(),
+            callees: BTreeSet::new(),
+        };
+        let top_locals = HashSet::new();
+        for s in stmts {
+            match s {
+                Stmt::Fn(name, params, _, body) | Stmt::AsyncFn(name, params, _, body) => {
+                    let mut locals: HashSet<String> =
+                        params.iter().map(|(p, _)| p.clone()).collect();
+                    collect_locals(body, &mut locals);
+                    let mut info = FnEffectInfo {
+                        ceiling: None,
+                        direct_effects: BTreeSet::new(),
+                        callees: BTreeSet::new(),
+                    };
+                    scan_stmts_effects(body, &locals, &mut info, errors);
+                    map.insert(name.clone(), info);
+                    collect_fns(body, map, errors);
+                }
+                Stmt::DecoratedFn(decs, name, params, _, body) => {
+                    let ceiling = parse_effect_ceiling(decs, errors);
+                    let mut locals: HashSet<String> =
+                        params.iter().map(|(p, _)| p.clone()).collect();
+                    collect_locals(body, &mut locals);
+                    let mut info = FnEffectInfo {
+                        ceiling,
+                        direct_effects: BTreeSet::new(),
+                        callees: BTreeSet::new(),
+                    };
+                    scan_stmts_effects(body, &locals, &mut info, errors);
+                    map.insert(name.clone(), info);
+                    collect_fns(body, map, errors);
+                }
+                Stmt::Class(_, _, _, _, body) => collect_fns(body, map, errors),
+                other => scan_stmts_effects(
+                    std::slice::from_ref(other),
+                    &top_locals,
+                    &mut top_only_dummy,
+                    errors,
+                ),
+            }
+        }
+    }
+
+    let mut fn_map: HashMap<String, FnEffectInfo> = HashMap::new();
+    collect_fns(ast, &mut fn_map, errors);
+
+    // Fixed-point transitive effect propagation over user call graph.
+    let mut effs: HashMap<String, BTreeSet<String>> = fn_map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.direct_effects.clone()))
+        .collect();
+    loop {
+        let mut changed = false;
+        let names: Vec<String> = fn_map.keys().cloned().collect();
+        for caller in names {
+            let callees = fn_map[&caller].callees.clone();
+            let mut merged = effs[&caller].clone();
+            for callee in callees {
+                if let Some(ce) = effs.get(&callee) {
+                    for e in ce {
+                        if merged.insert(e.clone()) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            effs.insert(caller, merged);
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for (name, info) in &fn_map {
+        if let Some(allowed) = &info.ceiling {
+            let actual = &effs[name];
+            let disallowed: Vec<String> = actual.difference(allowed).cloned().collect();
+            if !disallowed.is_empty() {
+                if allowed.is_empty() {
+                    errors.push(format!(
+                        "effect error: @pure function '{name}' performs disallowed effect(s): {}",
+                        disallowed.join(", ")
+                    ));
+                } else {
+                    errors.push(format!(
+                        "effect error: function '{name}' uses undeclared effect(s): {}",
+                        disallowed.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
+    semantic_check_ast_with_globals(ast, &[])
+}
+
+pub(crate) fn semantic_check_ast_with_globals(
+    ast: &[Stmt],
+    predeclared: &[String],
+) -> Result<(), String> {
     fn known(scopes: &[HashSet<String>], name: &str) -> bool {
         scopes.iter().rev().any(|s| s.contains(name))
     }
@@ -460,7 +962,9 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                 }
                 Stmt::DecoratedFn(decorators, _, params, _, body) => {
                     for dec in decorators {
-                        check_expr(dec, &scopes, errors);
+                        if !is_static_effect_decorator(dec) {
+                            check_expr(dec, &scopes, errors);
+                        }
                     }
                     let mut nested = scopes.clone();
                     nested.push(params.iter().map(|(name, _)| name.clone()).collect());
@@ -515,8 +1019,12 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
     ] {
         root.insert(builtin_name.to_string());
     }
+    for name in predeclared {
+        root.insert(name.clone());
+    }
     let mut errors = vec![];
     check_block(ast, &[root], &mut errors);
+    verify_effects_and_contracts(ast, &mut errors);
     errors.sort();
     errors.dedup();
     if errors.is_empty() {
@@ -536,9 +1044,35 @@ pub(crate) fn compile_source_unoptimized(src: &str) -> Result<Vec<Op>, String> {
 }
 
 pub(crate) fn compile_source_with_debug(src: &str) -> Result<(Vec<Op>, CompiledDebug), String> {
+    compile_source_with_debug_and_globals(src, &[])
+}
+
+pub(crate) fn compile_source_with_debug_and_globals(
+    src: &str,
+    predeclared: &[String],
+) -> Result<(Vec<Op>, CompiledDebug), String> {
     let t = lex_with_lines(src)?;
     let ast = Parser::new_with_debug_lines(t).program()?;
-    semantic_check_ast(&ast)?;
+    semantic_check_ast_with_globals(&ast, predeclared)?;
+    let mut c = Compiler::new();
+    c.emit_stmts(&ast)?;
+    Ok(c.finish_with_debug())
+}
+
+pub(crate) fn compile_notebook_cell_with_globals(
+    src: &str,
+    predeclared: &[String],
+) -> Result<(Vec<Op>, CompiledDebug), String> {
+    let t = lex_with_lines(src)?;
+    let mut ast = Parser::new_with_debug_lines(t).program()?;
+    semantic_check_ast_with_globals(&ast, predeclared)?;
+    if !src.trim().ends_with(';') {
+        if let Some(last) = ast.last_mut() {
+            if let Stmt::Expr(expr) = last.clone() {
+                *last = Stmt::Return(Some(expr));
+            }
+        }
+    }
     let mut c = Compiler::new();
     c.emit_stmts(&ast)?;
     Ok(c.finish_with_debug())
