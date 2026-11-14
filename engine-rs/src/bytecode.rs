@@ -62,6 +62,7 @@ pub(crate) enum Op {
             Vec<Op>,
         )>,
     ),
+    BuildClass(String, usize, Vec<Op>),
     Return,
     Yield,
     PushHandler(usize, String),
@@ -121,6 +122,9 @@ pub(crate) fn collect_referenced_names(code: &[Op], out: &mut std::collections::
                     collect_referenced_names(body, out);
                 }
             }
+            Op::BuildClass(_, _, body) => {
+                collect_referenced_names(body, out);
+            }
             _ => {}
         }
     }
@@ -128,8 +132,61 @@ pub(crate) fn collect_referenced_names(code: &[Op], out: &mut std::collections::
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClassDef {
-    pub(crate) parent: Option<String>,
+    pub(crate) bases: Vec<String>,
+    pub(crate) metaclass: Option<String>,
+    pub(crate) mro: Vec<String>,
+    pub(crate) attrs: HashMap<String, Val>,
     pub(crate) methods: HashMap<String, FunctionDef>,
+}
+
+pub(crate) fn compute_c3_mro<F>(
+    cls_name: &str,
+    bases: &[String],
+    mut get_mro: F,
+) -> Result<Vec<String>, String>
+where
+    F: FnMut(&str) -> Result<Vec<String>, String>,
+{
+    if bases.is_empty() {
+        return Ok(vec![cls_name.to_string()]);
+    }
+    let mut seqs: Vec<Vec<String>> = Vec::with_capacity(bases.len() + 1);
+    for b in bases {
+        seqs.push(get_mro(b)?);
+    }
+    seqs.push(bases.to_vec());
+    let mut out = vec![cls_name.to_string()];
+    loop {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.is_empty() {
+            break;
+        }
+        let mut chosen: Option<String> = None;
+        for seq in &seqs {
+            let cand = &seq[0];
+            let in_any_tail = seqs
+                .iter()
+                .any(|other| other[1..].iter().any(|x| x == cand));
+            if !in_any_tail {
+                chosen = Some(cand.clone());
+                break;
+            }
+        }
+        let Some(head) = chosen else {
+            return Err(format!(
+                "Cannot create a consistent method resolution order (MRO) for bases of {cls_name}"
+            ));
+        };
+        if !out.contains(&head) {
+            out.push(head.clone());
+        }
+        for seq in &mut seqs {
+            if seq.first().is_some_and(|x| x == &head) {
+                seq.remove(0);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +320,12 @@ fn encode_ops(code: &[Op]) -> JsonValue {
                     "params": params.iter().map(|(p, t)| json!([p, t])).collect::<Vec<_>>(),
                     "ret": ret,
                     "async": is_async,
+                    "body": encode_ops(body)
+                }),
+                Op::BuildClass(name, base_count, body) => json!({
+                    "op": "BuildClass",
+                    "name": name,
+                    "base_count": base_count,
                     "body": encode_ops(body)
                 }),
                 Op::DefClass(name, parent, methods) => json!({
@@ -489,6 +552,19 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
                     .unwrap_or(false),
                 decode_ops(item.get("body").ok_or("vybc: Def missing body")?)?,
             ),
+            "BuildClass" => {
+                let name = item
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or("vybc: BuildClass missing name")?
+                    .to_string();
+                let base_count = item
+                    .get("base_count")
+                    .and_then(json_as_usize)
+                    .ok_or("vybc: BuildClass missing base_count")?;
+                let body = decode_ops(item.get("body").ok_or("vybc: BuildClass missing body")?)?;
+                Op::BuildClass(name, base_count, body)
+            }
             "DefClass" => {
                 let name = item
                     .get("name")

@@ -8,3 +8,4 @@ dist/
 *.vyc
 
 gate-report.txt
+/cache/

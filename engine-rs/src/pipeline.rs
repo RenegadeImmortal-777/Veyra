@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 
-use crate::ast::{CallArg, Expr, Stmt};
+use crate::ast::{CallArg, Expr, Pattern, SeqElem, Stmt};
 use crate::bytecode::{Op, decode_bytecode, encode_bytecode};
 use crate::compiler::{CompiledDebug, Compiler};
 use crate::dap::DebugMap;
@@ -63,9 +63,43 @@ pub(crate) fn load_source_with_lines(
                 };
                 let b = a + 1 + b_rel;
                 let rel = &rest[a + 1..b];
+                if let Some(py_mod) = rel.strip_prefix("py:") {
+                    let after_q = rest[b + 1..].trim_start();
+                    let (alias, remainder) = if let Some(after_as) = after_q.strip_prefix("as ") {
+                        let a_trim = after_as.trim_start();
+                        let end_id = a_trim
+                            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                            .unwrap_or(a_trim.len());
+                        (&a_trim[..end_id], &a_trim[end_id..])
+                    } else {
+                        (py_mod.rsplit('.').next().unwrap_or(py_mod), after_q)
+                    };
+                    if is_valid_ident(alias)
+                        && !src.contains(&format!("let {alias} "))
+                        && !src.contains(&format!("let {alias}="))
+                        && seen_pkgs.insert(format!("py:{py_mod}:{alias}"))
+                    {
+                        push_line(
+                            &mut out,
+                            origins,
+                            &format!("let {alias} = py_import(\"{py_mod}\");"),
+                            &full,
+                            line_no,
+                        );
+                    } else {
+                        push_line(&mut out, origins, "", &full, line_no);
+                    }
+                    had_use = true;
+                    let trimmed = remainder.trim_start();
+                    rest = trimmed.strip_prefix(';').unwrap_or(trimmed).trim_start();
+                    continue;
+                }
                 let mut is_pkg = false;
                 let mut native_only_pkg = false;
-                let target = if !rel.contains('/') && !rel.contains('\\') && !rel.ends_with(".vy") {
+                let is_pkg_spec = !rel.ends_with(".vy")
+                    && !rel.contains('\\')
+                    && (!rel.contains('/') || rel.starts_with('@'));
+                let target = if is_pkg_spec {
                     if let Ok(root) = project_root(base) {
                         let manifest_path = root.join("veyra.json");
                         let manifest: JsonValue = serde_json::from_str(
@@ -74,19 +108,48 @@ pub(crate) fn load_source_with_lines(
                         .map_err(|e| e.to_string())?;
                         if let Some(meta) = manifest.get("packages").and_then(|p| p.get(rel)) {
                             is_pkg = true;
+                            let vdir = crate::registry::vendor_pkg_dir(&root, rel);
+                            let (pkg_dir, ws_entry) = if vdir.is_dir() {
+                                (vdir, None)
+                            } else if let Some((ws_dir, ws_manifest)) =
+                                crate::registry::find_workspace_package(&root, rel)
+                            {
+                                (
+                                    ws_dir,
+                                    ws_manifest
+                                        .get("entry")
+                                        .and_then(JsonValue::as_str)
+                                        .map(str::to_string),
+                                )
+                            } else {
+                                (vdir, None)
+                            };
                             let entry = meta
                                 .get("entry")
                                 .and_then(JsonValue::as_str)
+                                .or(ws_entry.as_deref())
                                 .unwrap_or("main.vy");
-                            let candidate = root.join("vendor").join(rel).join(entry);
-                            if !candidate.is_file()
-                                && root.join("vendor").join(rel).join("veyra.json").is_file()
-                            {
+                            let candidate = pkg_dir.join(entry);
+                            if !candidate.is_file() && pkg_dir.join("veyra.json").is_file() {
+                                native_only_pkg = true;
+                            }
+                            candidate
+                        } else if let Some((ws_dir, ws_manifest)) =
+                            crate::registry::find_workspace_package(&root, rel)
+                        {
+                            is_pkg = true;
+                            let entry = ws_manifest
+                                .get("entry")
+                                .and_then(JsonValue::as_str)
+                                .unwrap_or("main.vy");
+                            let candidate = ws_dir.join(entry);
+                            if !candidate.is_file() && ws_dir.join("veyra.json").is_file() {
                                 native_only_pkg = true;
                             }
                             candidate
                         } else {
-                            let pkg_manifest = root.join("vendor").join(rel).join("veyra.json");
+                            let pkg_manifest =
+                                crate::registry::vendor_pkg_dir(&root, rel).join("veyra.json");
                             if pkg_manifest.is_file() {
                                 is_pkg = true;
                                 native_only_pkg = true;
@@ -233,6 +296,64 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
             }
         }
     }
+    fn check_pattern(
+        pat: &Pattern,
+        scopes: &[HashSet<String>],
+        bound: &mut HashSet<String>,
+        errors: &mut Vec<String>,
+    ) {
+        match pat {
+            Pattern::Wildcard => {}
+            Pattern::Capture(name) => {
+                bound.insert(name.clone());
+            }
+            Pattern::Literal(e) => check_expr(e, scopes, errors),
+            Pattern::Or(alts) => {
+                for alt in alts {
+                    let mut alt_bound = bound.clone();
+                    check_pattern(alt, scopes, &mut alt_bound, errors);
+                }
+                if let Some(first) = alts.first() {
+                    let mut first_bound = HashSet::new();
+                    check_pattern(first, scopes, &mut first_bound, errors);
+                    bound.extend(first_bound);
+                }
+            }
+            Pattern::As(inner, name) => {
+                check_pattern(inner, scopes, bound, errors);
+                bound.insert(name.clone());
+            }
+            Pattern::Seq(elems) => {
+                for el in elems {
+                    match el {
+                        SeqElem::Pat(p) => check_pattern(p, scopes, bound, errors),
+                        SeqElem::Star(Some(name)) => {
+                            bound.insert(name.clone());
+                        }
+                        SeqElem::Star(None) => {}
+                    }
+                }
+            }
+            Pattern::Map { entries, rest } => {
+                for (k, v) in entries {
+                    check_expr(k, scopes, errors);
+                    check_pattern(v, scopes, bound, errors);
+                }
+                if let Some(r) = rest {
+                    bound.insert(r.clone());
+                }
+            }
+            Pattern::Class { cls, pos, kw } => {
+                check_expr(cls, scopes, errors);
+                for p in pos {
+                    check_pattern(p, scopes, bound, errors);
+                }
+                for (_, p) in kw {
+                    check_pattern(p, scopes, bound, errors);
+                }
+            }
+        }
+    }
     fn check_block(stmts: &[Stmt], parent: &[HashSet<String>], errors: &mut Vec<String>) {
         let mut scopes = parent.to_vec();
         let mut local = HashSet::new();
@@ -241,7 +362,7 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                 Stmt::Fn(n, _, _, _)
                 | Stmt::AsyncFn(n, _, _, _)
                 | Stmt::DecoratedFn(_, n, _, _, _)
-                | Stmt::Class(n, _, _) => {
+                | Stmt::Class(n, _, _, _, _) => {
                     local.insert(n.clone());
                 }
                 _ => {}
@@ -299,11 +420,20 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                 }
                 Stmt::Match(subject, cases) => {
                     check_expr(subject, &scopes, errors);
-                    for (pattern, body) in cases {
-                        if let Some(pattern) = pattern {
-                            check_expr(pattern, &scopes, errors);
+                    let mut after_match = HashSet::new();
+                    for (pattern, guard, body) in cases {
+                        let mut pat_bound = HashSet::new();
+                        check_pattern(pattern, &scopes, &mut pat_bound, errors);
+                        let mut nested = scopes.clone();
+                        nested.push(pat_bound.clone());
+                        if let Some(g) = guard {
+                            check_expr(g, &nested, errors);
                         }
-                        check_block(body, &scopes, errors);
+                        check_block(body, &nested, errors);
+                        after_match.extend(pat_bound);
+                    }
+                    if let Some(cur) = scopes.last_mut() {
+                        cur.extend(after_match);
                     }
                 }
                 Stmt::Try(body, n, handler, finally) => {
@@ -328,38 +458,63 @@ pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
                     nested.push(params.iter().map(|(name, _)| name.clone()).collect());
                     check_block(body, &nested, errors);
                 }
-                Stmt::DecoratedFn(decorator, _, params, _, body) => {
-                    if !known(&scopes, decorator) {
-                        errors.push(format!("undefined decorator '{decorator}'"));
+                Stmt::DecoratedFn(decorators, _, params, _, body) => {
+                    for dec in decorators {
+                        check_expr(dec, &scopes, errors);
                     }
                     let mut nested = scopes.clone();
                     nested.push(params.iter().map(|(name, _)| name.clone()).collect());
                     check_block(body, &nested, errors);
                 }
-                Stmt::Class(_, parent, body) => {
-                    if let Some(p) = parent {
-                        if !known(&scopes, p) {
-                            errors.push(format!("unknown parent class '{p}'"));
+                Stmt::Class(_, bases, metaclass, decorators, body) => {
+                    for b in bases {
+                        check_expr(b, &scopes, errors);
+                    }
+                    if let Some(m) = metaclass {
+                        check_expr(m, &scopes, errors);
+                    }
+                    for d in decorators {
+                        check_expr(d, &scopes, errors);
+                    }
+                    let mut cls_attr_scope = HashSet::new();
+                    for item in body {
+                        if let Stmt::Assign(attr, _) = item {
+                            cls_attr_scope.insert(attr.clone());
                         }
                     }
-                    for method in body {
-                        match method {
-                            Stmt::Fn(_, params, _, method_body)
-                            | Stmt::AsyncFn(_, params, _, method_body) => {
-                                let mut nested = scopes.clone();
-                                nested.push(params.iter().map(|(name, _)| name.clone()).collect());
-                                check_block(method_body, &nested, errors);
-                            }
-                            _ => {}
-                        }
-                    }
+                    let mut cls_scopes = scopes.clone();
+                    cls_scopes.push(cls_attr_scope);
+                    check_block(body, &cls_scopes, errors);
                 }
                 Stmt::Return(Some(e)) => check_expr(e, &scopes, errors),
                 Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::SourceLine(_) => {}
             }
         }
     }
-    let root = HashSet::new();
+    let mut root = HashSet::new();
+    for builtin_name in [
+        "object",
+        "type",
+        "property",
+        "staticmethod",
+        "classmethod",
+        "super",
+        "isinstance",
+        "issubclass",
+        "mro",
+        "delattr",
+        "getattr",
+        "hasattr",
+        "setattr",
+        "int",
+        "float",
+        "str",
+        "bool",
+        "list",
+        "dict",
+    ] {
+        root.insert(builtin_name.to_string());
+    }
     let mut errors = vec![];
     check_block(ast, &[root], &mut errors);
     errors.sort();

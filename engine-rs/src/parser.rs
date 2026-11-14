@@ -2,7 +2,7 @@
 //
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
-use crate::ast::{CallArg, Expr, Stmt};
+use crate::ast::{CallArg, Expr, Pattern, SeqElem, Stmt};
 use crate::lexer::Tok;
 
 pub(crate) struct Parser {
@@ -38,6 +38,43 @@ impl Parser {
             i: 0,
             track_lines: true,
         }
+    }
+    fn parse_class_stmt(&mut self, decorators: Vec<Expr>) -> Result<Stmt, String> {
+        let name = match self.bump() {
+            Tok::Id(s) => s,
+            x => return Err(format!("expected class name, got {x:?}")),
+        };
+        let mut bases = Vec::new();
+        let mut metaclass = None;
+        let has_parens = self.eat(&Tok::Lp);
+        let has_colon = !has_parens && self.eat(&Tok::Colon);
+        if has_parens || has_colon {
+            loop {
+                if has_parens {
+                    if matches!(self.cur(), Tok::Rp | Tok::Eof) {
+                        break;
+                    }
+                } else if matches!(self.cur(), Tok::Lb | Tok::Eof) {
+                    break;
+                }
+                if matches!(self.cur(), Tok::Id(k) if k == "metaclass")
+                    && matches!(self.t.get(self.i + 1), Some(Tok::Eq))
+                {
+                    self.i += 2;
+                    metaclass = Some(self.postfix()?);
+                } else {
+                    bases.push(self.postfix()?);
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            if has_parens {
+                self.need(&Tok::Rp, "expected ')' after class bases")?;
+            }
+        }
+        let body = self.block()?;
+        Ok(Stmt::Class(name, bases, metaclass, decorators, body))
     }
     fn line(&self) -> usize {
         self.lines.get(self.i).copied().unwrap_or(0)
@@ -199,27 +236,17 @@ impl Parser {
             return Ok(Stmt::Let(name, ty, e, is_const));
         }
         if self.eat(&Tok::Class) {
-            let name = match self.bump() {
-                Tok::Id(s) => s,
-                x => return Err(format!("expected class name, got {x:?}")),
-            };
-            let parent = if self.eat(&Tok::Colon) {
-                match self.bump() {
-                    Tok::Id(s) => Some(s),
-                    x => return Err(format!("expected parent class name, got {x:?}")),
-                }
-            } else {
-                None
-            };
-            let body = self.block()?;
-            return Ok(Stmt::Class(name, parent, body));
+            return self.parse_class_stmt(Vec::new());
         }
         if self.eat(&Tok::At) {
-            let decorator = match self.bump() {
-                Tok::Id(s) => s,
-                x => return Err(format!("expected decorator name, got {x:?}")),
-            };
-            self.need(&Tok::Fn, "expected 'fn' after decorator")?;
+            let mut decorators = vec![self.postfix()?];
+            while self.eat(&Tok::At) {
+                decorators.push(self.postfix()?);
+            }
+            if self.eat(&Tok::Class) {
+                return self.parse_class_stmt(decorators);
+            }
+            self.need(&Tok::Fn, "expected 'fn' or 'class' after decorator")?;
             let name = match self.bump() {
                 Tok::Id(s) => s,
                 x => return Err(format!("expected function name, got {x:?}")),
@@ -240,7 +267,7 @@ impl Parser {
                 body = default_inits;
             }
             return Ok(Stmt::DecoratedFn(
-                decorator,
+                decorators,
                 name,
                 params,
                 return_type,
@@ -437,14 +464,14 @@ impl Parser {
             let mut cases = vec![];
             while !self.eat(&Tok::Rb) {
                 self.need(&Tok::Case, "expected 'case' in match")?;
-                let pattern = if matches!(self.cur(), Tok::Id(s) if s == "_") {
-                    self.i += 1;
-                    None
-                } else {
+                let pattern = self.parse_pattern()?;
+                let guard = if self.eat(&Tok::If) {
                     Some(self.expr()?)
+                } else {
+                    None
                 };
                 let body = self.block()?;
-                cases.push((pattern, body));
+                cases.push((pattern, guard, body));
             }
             return Ok(Stmt::Match(subject, cases));
         }
@@ -1083,5 +1110,305 @@ impl Parser {
             }
             x => Err(self.fmt_err(format!("expected expression, got {x:?}"))),
         }
+    }
+
+    fn pattern_bound_names(pat: &Pattern, out: &mut std::collections::BTreeSet<String>) {
+        match pat {
+            Pattern::Wildcard | Pattern::Literal(_) => {}
+            Pattern::Capture(name) => {
+                out.insert(name.clone());
+            }
+            Pattern::Or(alts) => {
+                if let Some(first) = alts.first() {
+                    Self::pattern_bound_names(first, out);
+                }
+            }
+            Pattern::As(inner, name) => {
+                Self::pattern_bound_names(inner, out);
+                out.insert(name.clone());
+            }
+            Pattern::Seq(elems) => {
+                for el in elems {
+                    match el {
+                        SeqElem::Pat(p) => Self::pattern_bound_names(p, out),
+                        SeqElem::Star(Some(name)) => {
+                            out.insert(name.clone());
+                        }
+                        SeqElem::Star(None) => {}
+                    }
+                }
+            }
+            Pattern::Map { entries, rest } => {
+                for (_, p) in entries {
+                    Self::pattern_bound_names(p, out);
+                }
+                if let Some(r) = rest {
+                    out.insert(r.clone());
+                }
+            }
+            Pattern::Class { pos, kw, .. } => {
+                for p in pos {
+                    Self::pattern_bound_names(p, out);
+                }
+                for (_, p) in kw {
+                    Self::pattern_bound_names(p, out);
+                }
+            }
+        }
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, String> {
+        let mut pat = self.parse_or_pattern()?;
+        while self.eat(&Tok::As) {
+            let name = match self.bump() {
+                Tok::Id(s) if s != "_" => s,
+                Tok::Id(_) => {
+                    return Err(self.fmt_err("cannot use '_' as an 'as' pattern target".into()));
+                }
+                x => return Err(self.fmt_err(format!("expected identifier after 'as', got {x:?}"))),
+            };
+            pat = Pattern::As(Box::new(pat), name);
+        }
+        Ok(pat)
+    }
+
+    fn parse_or_pattern(&mut self) -> Result<Pattern, String> {
+        let first = self.parse_closed_pattern()?;
+        if !self.eat(&Tok::Pipe) {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        loop {
+            alts.push(self.parse_closed_pattern()?);
+            if !self.eat(&Tok::Pipe) {
+                break;
+            }
+        }
+        let mut expected = std::collections::BTreeSet::new();
+        Self::pattern_bound_names(&alts[0], &mut expected);
+        for alt in &alts[1..] {
+            let mut got = std::collections::BTreeSet::new();
+            Self::pattern_bound_names(alt, &mut got);
+            if got != expected {
+                return Err(self.fmt_err(
+                    "alternative patterns in '|' must bind the same set of variable names".into(),
+                ));
+            }
+        }
+        Ok(Pattern::Or(alts))
+    }
+
+    fn parse_pattern_seq_elems(&mut self, close: Tok) -> Result<Vec<SeqElem>, String> {
+        let mut elems = Vec::new();
+        let mut seen_star = false;
+        while !self.eat(&close) {
+            if self.eat(&Tok::Star) {
+                if seen_star {
+                    return Err(self.fmt_err("multiple starred targets in sequence pattern".into()));
+                }
+                seen_star = true;
+                let name = match self.bump() {
+                    Tok::Id(s) if s == "_" => None,
+                    Tok::Id(s) => Some(s),
+                    x => {
+                        return Err(self
+                            .fmt_err(format!("expected identifier or '_' after '*', got {x:?}")));
+                    }
+                };
+                elems.push(SeqElem::Star(name));
+            } else {
+                elems.push(SeqElem::Pat(self.parse_pattern()?));
+            }
+            if self.eat(&close) {
+                break;
+            }
+            self.need(&Tok::Comma, "expected ',' in sequence pattern")?;
+            if self.eat(&close) {
+                break;
+            }
+        }
+        Ok(elems)
+    }
+
+    fn parse_pattern_key_expr(&mut self) -> Result<Expr, String> {
+        match self.bump() {
+            Tok::Num(n) => Ok(Expr::Num(n)),
+            Tok::Str(s) => Ok(Expr::Str(s)),
+            Tok::True => Ok(Expr::Bool(true)),
+            Tok::False => Ok(Expr::Bool(false)),
+            Tok::Null => Ok(Expr::Null),
+            Tok::Minus => match self.bump() {
+                Tok::Num(n) => Ok(Expr::Unary("-".into(), Box::new(Expr::Num(n)))),
+                x => Err(self.fmt_err(format!("expected number after '-' in pattern, got {x:?}"))),
+            },
+            Tok::Id(name) => {
+                let mut expr = Expr::Var(name);
+                self.need(
+                    &Tok::Dot,
+                    "map pattern key identifier must be a dotted constant (e.g. Mod.KEY)",
+                )?;
+                loop {
+                    let attr = match self.bump() {
+                        Tok::Id(s) => s,
+                        x => {
+                            return Err(self.fmt_err(format!("expected attribute name, got {x:?}")));
+                        }
+                    };
+                    expr = Expr::Member(Box::new(expr), attr);
+                    if !self.eat(&Tok::Dot) {
+                        break;
+                    }
+                }
+                Ok(expr)
+            }
+            x => Err(self.fmt_err(format!("invalid key in mapping pattern, got {x:?}"))),
+        }
+    }
+
+    fn parse_closed_pattern(&mut self) -> Result<Pattern, String> {
+        if self.eat(&Tok::Ls) {
+            let elems = self.parse_pattern_seq_elems(Tok::Rs)?;
+            return Ok(Pattern::Seq(elems));
+        }
+        if self.eat(&Tok::Lb) {
+            let mut entries = Vec::new();
+            let mut rest = None;
+            while !self.eat(&Tok::Rb) {
+                if self.eat(&Tok::StarStar) {
+                    let rname = match self.bump() {
+                        Tok::Id(s) if s == "_" => {
+                            return Err(
+                                self.fmt_err("'**_' is not allowed in mapping patterns".into())
+                            );
+                        }
+                        Tok::Id(s) => s,
+                        x => {
+                            return Err(self.fmt_err(format!(
+                                "expected identifier after '**' in mapping pattern, got {x:?}"
+                            )));
+                        }
+                    };
+                    rest = Some(rname);
+                    let _ = self.eat(&Tok::Comma);
+                    self.need(&Tok::Rb, "expected '}' after mapping rest pattern")?;
+                    break;
+                }
+                let key = self.parse_pattern_key_expr()?;
+                self.need(&Tok::Colon, "expected ':' after mapping pattern key")?;
+                let val_pat = self.parse_pattern()?;
+                entries.push((key, val_pat));
+                if self.eat(&Tok::Rb) {
+                    break;
+                }
+                self.need(&Tok::Comma, "expected ',' in mapping pattern")?;
+            }
+            return Ok(Pattern::Map { entries, rest });
+        }
+        if self.eat(&Tok::Lp) {
+            if self.eat(&Tok::Rp) {
+                return Ok(Pattern::Seq(Vec::new()));
+            }
+            if matches!(self.cur(), Tok::Star) {
+                let elems = self.parse_pattern_seq_elems(Tok::Rp)?;
+                return Ok(Pattern::Seq(elems));
+            }
+            let first = self.parse_pattern()?;
+            if self.eat(&Tok::Comma) {
+                let mut elems = vec![SeqElem::Pat(first)];
+                let mut more = self.parse_pattern_seq_elems(Tok::Rp)?;
+                elems.append(&mut more);
+                return Ok(Pattern::Seq(elems));
+            }
+            self.need(&Tok::Rp, "expected ')' after parenthesized pattern")?;
+            return Ok(first);
+        }
+        match self.bump() {
+            Tok::Num(n) => Ok(Pattern::Literal(Expr::Num(n))),
+            Tok::Str(s) => Ok(Pattern::Literal(Expr::Str(s))),
+            Tok::True => Ok(Pattern::Literal(Expr::Bool(true))),
+            Tok::False => Ok(Pattern::Literal(Expr::Bool(false))),
+            Tok::Null => Ok(Pattern::Literal(Expr::Null)),
+            Tok::Minus => match self.bump() {
+                Tok::Num(n) => Ok(Pattern::Literal(Expr::Unary(
+                    "-".into(),
+                    Box::new(Expr::Num(n)),
+                ))),
+                x => Err(self.fmt_err(format!("expected number after '-' in pattern, got {x:?}"))),
+            },
+            Tok::Id(name) => {
+                if self.eat(&Tok::Dot) {
+                    let mut expr = Expr::Var(name);
+                    loop {
+                        let attr = match self.bump() {
+                            Tok::Id(s) => s,
+                            x => {
+                                return Err(
+                                    self.fmt_err(format!("expected attribute name, got {x:?}"))
+                                );
+                            }
+                        };
+                        expr = Expr::Member(Box::new(expr), attr);
+                        if !self.eat(&Tok::Dot) {
+                            break;
+                        }
+                    }
+                    if self.eat(&Tok::Lp) {
+                        return self.parse_class_pattern(expr);
+                    }
+                    return Ok(Pattern::Literal(expr));
+                }
+                if self.eat(&Tok::Lp) {
+                    if name == "_" {
+                        return Err(self.fmt_err("'_' cannot be used as a class pattern".into()));
+                    }
+                    return self.parse_class_pattern(Expr::Var(name));
+                }
+                if name == "_" {
+                    Ok(Pattern::Wildcard)
+                } else {
+                    Ok(Pattern::Capture(name))
+                }
+            }
+            x => Err(self.fmt_err(format!("expected pattern, got {x:?}"))),
+        }
+    }
+
+    fn parse_class_pattern(&mut self, cls: Expr) -> Result<Pattern, String> {
+        let mut pos = Vec::new();
+        let mut kw = Vec::new();
+        let mut seen_kw = false;
+        let mut seen_kw_names = std::collections::HashSet::new();
+        while !self.eat(&Tok::Rp) {
+            if matches!(self.cur(), Tok::Id(_)) && self.t.get(self.i + 1) == Some(&Tok::Eq) {
+                let k = match self.bump() {
+                    Tok::Id(s) => s,
+                    _ => unreachable!(),
+                };
+                self.bump(); // '='
+                if !seen_kw_names.insert(k.clone()) {
+                    return Err(self.fmt_err(format!(
+                        "duplicate keyword attribute '{k}' in class pattern"
+                    )));
+                }
+                seen_kw = true;
+                let vp = self.parse_pattern()?;
+                kw.push((k, vp));
+            } else {
+                if seen_kw {
+                    return Err(
+                        self.fmt_err("positional subpattern follows keyword subpattern".into())
+                    );
+                }
+                pos.push(self.parse_pattern()?);
+            }
+            if self.eat(&Tok::Rp) {
+                break;
+            }
+            self.need(&Tok::Comma, "expected ',' in class pattern")?;
+            if self.eat(&Tok::Rp) {
+                break;
+            }
+        }
+        Ok(Pattern::Class { cls, pos, kw })
     }
 }

@@ -1,6 +1,6 @@
 # Veyra Package Index
 
-Registry packages: **68**
+Registry packages: **74**
 
 | Package | Version | Entry |
 |---|---:|---|
@@ -14,13 +14,14 @@ Registry packages: **68**
 | vybase64 | 0.1.0 | vybase64.vy |
 | vycache | 0.1.0 | vycache.vy |
 | vycollections | 0.1.0 | vycollections.vy |
+| vycomplex | 0.1.0 | vycomplex.vy |
 | vyconcurrent | 0.2.0 | vyconcurrent.vy |
 | vyconfig | 0.1.0 | vyconfig.vy |
 | vycrypto | 0.1.0 | vycrypto.vy |
 | vycsv | 0.1.0 | vycsv.vy |
 | vydata | 0.4.0 | vydata.vy |
 | vydatetime | 0.1.0 | vydatetime.vy |
-| vydecimal | 0.1.0 | vydecimal.vy |
+| vydecimal | 0.2.0 | vydecimal.vy |
 | vydiff | 0.1.0 | vydiff.vy |
 | vyencoding | 0.1.0 | vyencoding.vy |
 | vyetl | 0.1.0 | vyetl.vy |
@@ -28,12 +29,15 @@ Registry packages: **68**
 | vyframe | 0.2.0 | vyframe.vy |
 | vyfs | 0.1.0 | vyfs.vy |
 | vyfunctional | 0.1.0 | vyfunctional.vy |
+| vyfunctools | 0.1.0 | vyfunctools.vy |
 | vygpu | 0.1.0 | vygpu.vy |
+| vygraph | 0.1.0 | vygraph.vy |
 | vygui | 0.1.0 | vygui.vy |
 | vyhash | 0.1.0 | vyhash.vy |
 | vyhello | 0.1.0 | src/main.vy |
 | vyhttp | 0.2.0 | vyhttp.vy |
 | vyiter | 0.1.0 | vyiter.vy |
+| vyitertools | 0.1.0 | vyitertools.vy |
 | vyjit | 0.1.0 | vyjit.vy |
 | vyjson | 0.1.0 | vyjson.vy |
 | vylinalg | 0.1.0 | vylinalg.vy |
@@ -57,6 +61,7 @@ Registry packages: **68**
 | vyrequest | 0.1.0 | vyrequest.vy |
 | vyscience | 0.2.0 | vyscience.vy |
 | vysecurity | 0.1.0 | vysecurity.vy |
+| vysemver | 0.1.0 | vysemver.vy |
 | vyserde | 0.1.0 | vyserde.vy |
 | vysets | 0.1.0 | vysets.vy |
 | vysqlite | 0.2.0 | vysqlite.vy |
@@ -68,6 +73,7 @@ Registry packages: **68**
 | vytext | 0.1.0 | vytext.vy |
 | vytime | 0.1.0 | vytime.vy |
 | vytoml | 0.1.0 | vytoml.vy |
+| vytyping | 0.1.0 | vytyping.vy |
 | vyuuid | 0.1.0 | vyuuid.vy |
 | vyvalidate | 0.1.0 | vyvalidate.vy |
 | vyviz | 0.1.0 | vyviz.vy |

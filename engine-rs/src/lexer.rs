@@ -65,6 +65,7 @@ pub(crate) enum Tok {
     Gt,
     Ge,
     Bang,
+    Pipe,
     Arrow,
     Eof,
 }
@@ -376,6 +377,10 @@ pub(crate) fn lex_with_lines(src: &str) -> Result<Vec<(Tok, usize)>, String> {
             '!' => two!('=', Tok::Ne, Tok::Bang),
             '<' => two!('=', Tok::Le, Tok::Lt),
             '>' => two!('=', Tok::Ge, Tok::Gt),
+            '|' => {
+                out.push((Tok::Pipe, line));
+                i += 1
+            }
             _ => return Err(format!("line {line}: unexpected character {c:?}")),
         }
     }

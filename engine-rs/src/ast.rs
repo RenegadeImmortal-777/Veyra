@@ -62,16 +62,16 @@ pub(crate) enum Stmt {
         Vec<Stmt>,
     ),
     DecoratedFn(
-        String,
+        Vec<Expr>,
         String,
         Vec<(String, Option<String>)>,
         Option<String>,
         Vec<Stmt>,
     ),
-    Class(String, Option<String>, Vec<Stmt>),
+    Class(String, Vec<Expr>, Option<Expr>, Vec<Expr>, Vec<Stmt>),
     SetMember(Expr, String, Expr),
     SetIndex(Expr, Expr, Expr),
-    Match(Expr, Vec<(Option<Expr>, Vec<Stmt>)>),
+    Match(Expr, Vec<(Pattern, Option<Expr>, Vec<Stmt>)>),
     With(Expr, String, Vec<Stmt>),
     Return(Option<Expr>),
     Yield(Expr),
@@ -79,4 +79,29 @@ pub(crate) enum Stmt {
     Continue,
     /// Debug-only statement marker carrying 1-based source line number.
     SourceLine(usize),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SeqElem {
+    Pat(Pattern),
+    Star(Option<String>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum Pattern {
+    Wildcard,
+    Capture(String),
+    Literal(Expr),
+    Or(Vec<Pattern>),
+    As(Box<Pattern>, String),
+    Seq(Vec<SeqElem>),
+    Map {
+        entries: Vec<(Expr, Pattern)>,
+        rest: Option<String>,
+    },
+    Class {
+        cls: Expr,
+        pos: Vec<Pattern>,
+        kw: Vec<(String, Pattern)>,
+    },
 }

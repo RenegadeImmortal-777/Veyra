@@ -23,6 +23,9 @@ pub(crate) fn optimize_bytecode(code: Vec<Op>) -> Vec<Op> {
                     .collect();
                 Op::DefClass(name, parent, opt_methods)
             }
+            Op::BuildClass(name, base_count, body) => {
+                Op::BuildClass(name, base_count, optimize_bytecode(body))
+            }
             other => other,
         })
         .collect();

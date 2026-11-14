@@ -8,7 +8,7 @@ provenance and marked as such.
 ## Current release
 
 **Veyra 12.0 "Sovereign"** — the native Rust Horizon engine + self-hosted Veyra
-compiler (`compiler-vy`), verified on **2026-11-08**.
+compiler (`compiler-vy`), verified on **2026-11-14**.
 
 | Where | Value |
 |---|---|
@@ -35,16 +35,16 @@ way to misread the project.
 
 ## Verification status
 
-Last full gate run: **2026-11-13**. Every gate passed (**8/8**).
+Last full gate run: **2026-11-14**. Every gate passed (**8/8**).
 
 | Gate | Result |
 |---|---|
 | `cargo fmt --check` | PASS |
-| `cargo test` | PASS — 90 passed, 0 failed |
+| `cargo test` | PASS — 99 passed, 0 failed |
 | `cargo check --no-default-features` | PASS |
 | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | `cargo build --release` | PASS |
-| `scripts/package-matrix.ps1` | PASS — 68/68 packages checked & executed |
+| `scripts/package-matrix.ps1` | PASS — 74/74 packages checked & executed |
 | `scripts/ecosystem-gate.ps1` | PASS |
 | `scripts/release-check.ps1` | PASS (`bin/veyra-native.exe` synced) |
 
@@ -58,24 +58,26 @@ The engine source is modularized under `engine-rs/src/`:
   method cache, automatic hot-function promotion into `jit.rs`, and `Arc<Mutex<Val>>`
   closure upvalue cell management, while built-in operations live in
   `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
-- `jit.rs` provides Veyra's in-memory **x86_64 SSE2 native machine-code JIT compiler**
-  (`W^X` executable allocation, CFG type/stack verification, self-recursion `call rel32`,
-  libm helpers, and `jit_*` builtins) for hot numeric/boolean functions.
-- `gpu.rs` provides Veyra's **DirectCompute / Direct3D 11 (`cs_5_0` HLSL) GPU compute
-  backend** (loading `dxgi.dll`, `d3d11.dll`, `d3dcompiler_47.dll` with multi-threaded
+- `jit.rs` provides Veyra's in-memory **multi-architecture x86_64 & aarch64 native machine-code JIT compiler**
+  (`W^X` executable allocation, CFG type/stack verification, self-recursion `call rel32`, inter-function calls,
+  list indexing/slicing, libm helpers, and `jit_*` builtins).
+- `gpu.rs` provides Veyra's **universal Vulkan SPIR-V & Direct3D 11 (`cs_5_0` HLSL) `f64`/`f32` GPU compute
+  backend** (`vulkan-1.dll`/`libvulkan.so.1`, `dxgi.dll`, `d3d11.dll`, `d3dcompiler_47.dll` with multi-threaded
   CPU fallback), accelerating `gpu_*` ops, custom HLSL (`gpu_run_hlsl`), and
   `tensor_to(t, "gpu")` device execution.
 - `plugin.rs` and `registry.rs` implement Veyra's `veyra_plugin_v1` native `cdylib`
-  extension ABI (`plugin_load`, `plugin_call`, `plugin_build`, seamless `use "<pkg>"`
-  import), HMAC-SHA256 package signing (`keygen`/`sign`/`verify`), `.vypkg` bundles
-  (`pack`/`unpack`), semver constraints, `veyra.lock` format 3, and HTTP registry
-  publishing/serving (`veyra pkg serve`, `POST /publish`).
+  extension ABI (flat and per-platform `"native"` target maps, `plugin_load`, `plugin_call`,
+  `plugin_build`, seamless `use "<pkg>"` import), HMAC-SHA256 package signing (`keygen`/`sign`/`verify`),
+  `.vypkg` bundles (`pack`/`unpack`), scoped `@org/pkg` + semver constraints, `veyra.lock` format 3,
+  federated registries (`VEYRA_REGISTRY_URLS`) with offline cache (`VEYRA_OFFLINE=1`), monorepo
+  `"workspaces"`, `veyra pkg py-bridge`, and HTTP registry publishing/serving (`veyra pkg serve`, `POST /publish`).
 - `aot.rs` implements native AOT compilation (`veyra aot`, `veyra build --native`) via
-  standalone optimized Rust codegen compiled by `rustc` (supporting `async fn`/`await`/`gather`,
-  `yield` generators + generator expressions, `**kwargs`/chained calls, dunders, and Python interop).
-- `py_bridge.rs` provides a persistent stdio JSON-RPC bridge to Python 3 (`py_available`,
-  `py_import`, `py_call`, `py_get`, `py_set`, `py_dir`, `py_eval`, `py_exec`) with transparent
-  member, method, index, and call handle routing across VM and native AOT binaries.
+  standalone optimized Rust codegen compiled by `rustc` (supporting C3 MRO/`super()`/descriptors/metaclasses,
+  full structural `match`/`case`, `BigInt`/`BigDecimal`/`Complex`/`FFT`, `async fn`/`await`/`gather`,
+  `yield` generators + generator expressions, `**kwargs`/chained calls, dunders, and CPython C-API interop).
+- `py_bridge.rs` provides in-process CPython C-API bindings (`python3xx.dll`/`libpython3`, zero-copy PEP 3118
+  buffer `py_to_tensor`) with subprocess fallback (`py_available`, `py_import`, `py_call`, `py_get`, `py_set`,
+  `py_dir`, `py_eval`, `py_exec`) across VM and native AOT binaries.
 - `dap.rs` and `lsp.rs` implement the native DAP debugger and LSP server consumed by
   the VS Code extension (`tooling/vscode/`).
 - See [docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md) and [WAY_FORWARD.md](WAY_FORWARD.md)
@@ -98,9 +100,12 @@ Native, without Python:
 
 - **Language**: typed functions and recursion, default parameters and `*rest`
   varargs, ternary expressions (`a if cond else b`), closures with shared mutable
-  lexical upvalues (`Arc<Mutex<Val>>` cells), classes with inheritance and static/runtime
-  type enforcement, unwind-safe `try`/`catch`/`finally` and `with ... as ...`
-  context managers, generators, decorators, list comprehensions, `match`/`case`,
+  lexical upvalues (`Arc<Mutex<Val>>` cells), classes with C3 MRO multiple inheritance,
+  `super()`, descriptors (`@property`), metaclasses, stacked decorators, and static/runtime
+  type enforcement, arbitrary-precision `BigInt`/`BigDecimal`/`Complex`/`FFT`, unwind-safe
+  `try`/`catch`/`finally` and `with ... as ...` context managers, generators, comprehensions,
+  full structural `match`/`case` pattern matching (literals, `*rest` sequences, `**rest` maps,
+  class patterns with positional/keyword fields, `|`, `as`, `if` guards),
   short-circuit `and`/`or`, right-associative `**`, tuple `(a, b)` and set `{a, b}`
   literals, f-strings, compound assignments (`+=`, `-=`, `*=`, `/=`), list/map index
   mutation (`xs[i] = v`, `m[k] = v`), 1/2/3-arg `range(...)`, async functions with
@@ -109,8 +114,8 @@ Native, without Python:
   expressions (`(x * x for x in xs)`), class dunders (`__add__`, `__sub__`, `__mul__`, `__eq__`,
   `__getitem__`, `__setitem__`, `__len__`, `__str__`, `__repr__`, `__call__`), expanded Python-parity
   builtins/methods (`repr`, `callable`, `divmod`, `getattr`, `hasattr`, `setattr`, `sorted`/`min`/`max`
-  with `key=`, variadic `zip`, `enumerate(..., start=...)`, `print(..., sep=..., end=...)`), and live
-  Python 3 library interop (`py_import`, `py_call`, `py_get`, `py_set`, `py_dir`, `py_eval`, `py_exec`).
+  with `key=`, variadic `zip`, `enumerate(..., start=...)`, `print(..., sep=..., end=...)`), and in-process
+  CPython C-API + PEP 3118 buffer interop (`py_import`, `py_call`, `py_get`, `py_set`, `py_dir`, `py_eval`, `py_exec`, `py_to_tensor`).
 - **Bytecode, VM & Native AOT**: portable `veyra-bc-v1` (`.vybc`) bytecode
   serialization with SHA-256 tamper verification, multi-pass bytecode optimizer
   (`ir.rs`), flat `CallFrame` + indexed local slot VM (`vm.rs`), pure-Veyra
@@ -132,10 +137,12 @@ Native, without Python:
   layers (`tensor_scale`, `tensor_cross_entropy`, `tensor_layer_norm`, `tensor_conv1d`,
   `tensor_conv2d`, `tensor_attention`, `tensor_multihead_attention`), and checkpoint
   save/load serialization.
-- **Packages**: an offline registry by default, hosted & self-hosted HTTP registry
+- **Packages**: offline registry by default, federated registries (`VEYRA_REGISTRY_URLS`)
+  with offline disk cache (`VEYRA_OFFLINE=1`), hosted & self-hosted HTTP registry
   (`veyra pkg serve`, `POST /publish`, `.vypkg` bundles), HMAC-SHA256 signing &
-  verification, semver constraints, `veyra.lock` format 3, `veyra_plugin_v1` native
-  binary plugins, recursive dependencies with cycle protection, and 68 shipped
+  verification, scoped `@org/pkg` + semver constraints, monorepo `"workspaces"`,
+  `veyra.lock` format 3, flat and per-platform `veyra_plugin_v1` native binary plugins,
+  `veyra pkg py-bridge`, recursive dependencies with cycle protection, and 74 shipped
   packages verified both statically and at runtime by `scripts/package-matrix.ps1`.
 - **Tooling**: `run`/`check`/`lint`/`fmt`/`test`/`build`/`aot`/`repl`/`disasm`,
   `bench`/`profile`/`doc`, line-aware LSP diagnostics and navigation (completion,
@@ -154,12 +161,12 @@ Native, without Python:
   split into `engine-rs/src/builtins/` and `lib.rs` is separated from `main.rs`.
 - `compiler-vy/src/main.vy` implements the pure-Veyra self-hosted `.vybc` compiler
   verified to a 3-stage fixpoint.
-
-## Remaining long-horizon directions
-
-- Broaden the `jit.rs` native backend to additional instruction architectures (ARM64/AArch64) and heap/string/collection operations (numeric loops/recursion run natively on x86_64 today; non-numeric code executes via bytecode VM or `aot.rs`).
-- Expand `gpu.rs` hardware compute coverage to Vulkan/Metal on Linux and macOS alongside Windows Direct3D 11 (`cs_5_0`).
-- Community-hosted mirror federation and registry web UI on top of Veyra's signed `.vypkg` protocol (`veyra pkg keygen`/`sign`/`verify`/`serve`).
+- Sovereign parity extensions (Pillars 1-5): in-process CPython C-API + PEP 3118
+  zero-copy tensor buffers (`py_bridge.rs`), universal Vulkan SPIR-V + Direct3D 11 `f64`/`f32`
+  GPU compute (`gpu.rs`), multi-arch x86_64/aarch64 + list slicing + inter-call JIT (`jit.rs`),
+  `BigInt`/`BigDecimal`/`Complex`/`FFT`, C3 MRO/`super()`/descriptors/metaclasses, full structural
+  `match`/`case` pattern matching, upgraded `vydecimal` `0.2.0` + 6 new packages (74 total), and
+  federated registry/workspaces/scoped packages/platform native plugins/`veyra pkg py-bridge` (`registry.rs`).
 
 ## Repository map
 
@@ -168,7 +175,7 @@ Native, without Python:
 | `engine-rs/` | Native Rust Horizon engine (`lib.rs`, `main.rs`, `builtins/`, `ir.rs`, `vm.rs`, `jit.rs`, `gpu.rs`, `plugin.rs`, `registry.rs`, `aot.rs`, etc.) |
 | `compiler-vy/` | Pure-Veyra self-hosted compiler emitting `veyra-bc-v1` (`.vybc`) |
 | `bin/` | Built native launcher (`bin/veyra-native.exe`) |
-| `packages/` | 68 native Veyra packages |
+| `packages/` | 74 native Veyra packages |
 | `registry/` | Registry index |
 | `stdlib/` | Veyra-written standard library modules |
 | `spec/` | Architecture and language specification |

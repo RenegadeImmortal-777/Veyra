@@ -94,21 +94,40 @@ impl Vm {
                     &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
                 )
                 .map_err(|e| e.to_string())?;
-                let meta = manifest
-                    .get("packages")
-                    .and_then(|p| p.get(&package))
-                    .ok_or(format!("package '{package}' is not installed"))?;
-                let pkg_dir = root.join("vendor").join(&package);
+                let vdir = crate::registry::vendor_pkg_dir(&root, &package);
+                let ws_match = if !vdir.is_dir() {
+                    crate::registry::find_workspace_package(&root, &package)
+                } else {
+                    None
+                };
+                let manifest_meta = manifest.get("packages").and_then(|p| p.get(&package));
+                if manifest_meta.is_none() && ws_match.is_none() {
+                    return Err(format!("package '{package}' is not installed"));
+                }
+                let (pkg_dir, ws_entry) = match ws_match {
+                    Some((ws_dir, ws_manifest)) => (
+                        ws_dir,
+                        ws_manifest
+                            .get("entry")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string),
+                    ),
+                    None => (vdir, None),
+                };
                 let pkg_manifest_path = pkg_dir.join("veyra.json");
-                let entry = meta
-                    .get("entry")
+                let entry_owned = manifest_meta
+                    .and_then(|m| m.get("entry"))
                     .and_then(JsonValue::as_str)
-                    .unwrap_or("main.vy");
+                    .map(str::to_string)
+                    .or(ws_entry)
+                    .unwrap_or_else(|| "main.vy".to_string());
+                let entry = entry_owned.as_str();
                 let path = pkg_dir.join(entry);
                 let module_vm = if path.is_file() {
                     let source = load_source(path.to_string_lossy().as_ref())?;
                     let mut mvm = Vm::new(compile_source(&source)?);
                     mvm.objects = self.objects.clone();
+                    mvm.class_objects = self.class_objects.clone();
                     mvm.run()?;
                     mvm
                 } else if pkg_manifest_path.is_file() {
@@ -117,17 +136,23 @@ impl Vm {
                     let source = load_source(path.to_string_lossy().as_ref())?;
                     let mut mvm = Vm::new(compile_source(&source)?);
                     mvm.objects = self.objects.clone();
+                    mvm.class_objects = self.class_objects.clone();
                     mvm.run()?;
                     mvm
                 };
-                for (class_name, class_def) in module_vm.classes.iter() {
-                    Arc::make_mut(&mut self.classes)
-                        .entry(class_name.clone())
-                        .or_insert_with(|| class_def.clone());
-                }
                 let local_names: HashSet<String> = module_vm.funcs.keys().cloned().collect();
                 let module_id = FUNCTION_IDS.fetch_add(1, Ordering::Relaxed);
                 let prefix = format!("@module:{package}:{module_id}:");
+                for (class_name, class_def) in module_vm.classes.iter() {
+                    let mut cloned_cls = class_def.clone();
+                    for method_def in cloned_cls.methods.values_mut() {
+                        let mcode = Arc::make_mut(&mut method_def.code);
+                        namespace_module_ops(mcode, &local_names, &prefix);
+                    }
+                    Arc::make_mut(&mut self.classes)
+                        .entry(class_name.clone())
+                        .or_insert(cloned_cls);
+                }
                 let mut exports = vec![];
                 for (name, def_ref) in module_vm.funcs.iter() {
                     let mut def = def_ref.clone();
@@ -161,13 +186,15 @@ impl Vm {
                         exports.push((Val::Str(name), value));
                     }
                 }
-                // Bind any native `veyra_plugin_v1` shared library declared by vendor/<pkg>/veyra.json
-                let pkg_dir = root.join("vendor").join(&package);
+                // Bind any native `veyra_plugin_v1` shared library declared by package veyra.json
                 let pkg_manifest_path = pkg_dir.join("veyra.json");
                 if pkg_manifest_path.is_file() {
                     if let Ok(pkg_txt) = fs::read_to_string(&pkg_manifest_path) {
                         if let Ok(pkg_json) = serde_json::from_str::<JsonValue>(&pkg_txt) {
-                            if let Some(native) = pkg_json.get("native") {
+                            if let Some(native) = pkg_json
+                                .get("native")
+                                .and_then(crate::registry::select_native_spec)
+                            {
                                 let ext = crate::plugin::platform_shared_ext();
                                 let raw_lib = native
                                     .get("library")
@@ -287,16 +314,7 @@ impl Vm {
                         )?
                         .truthy()
                     }
-                    Val::Object(id) => {
-                        let cls = self
-                            .objects
-                            .lock()
-                            .map_err(|_| "object heap poisoned")?
-                            .get(id)
-                            .map(|o| o.class_name.clone());
-                        cls.and_then(|c| self.find_method_cached(&c, "__call__"))
-                            .is_some()
-                    }
+                    Val::Object(_) => self.is_callable_val(&a[0]),
                     _ => false,
                 };
                 Val::Bool(ok)
@@ -323,49 +341,13 @@ impl Vm {
                     Val::Str(s) => s,
                     _ => return Err("getattr attribute name must be String".into()),
                 };
-                if crate::py_bridge::is_py_handle(&a[0]) {
-                    match crate::py_bridge::py_get(&a[0], attr) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            if a.len() == 3 {
-                                a[2].clone()
-                            } else {
-                                return Err(e);
-                            }
-                        }
-                    }
-                } else {
-                    match &a[0] {
-                        Val::Object(id) => {
-                            let val = self
-                                .objects
-                                .lock()
-                                .map_err(|_| "object heap poisoned")?
-                                .get(id)
-                                .and_then(|o| o.fields.get(attr).cloned());
-                            match val {
-                                Some(v) => v,
-                                None if a.len() == 3 => a[2].clone(),
-                                None => return Err(format!("undefined field '{attr}'")),
-                            }
-                        }
-                        Val::Map(pairs) => {
-                            if let Some((_, v)) =
-                                pairs.iter().find(|(k, _)| *k == Val::Str(attr.clone()))
-                            {
-                                v.clone()
-                            } else if a.len() == 3 {
-                                a[2].clone()
-                            } else {
-                                return Err(format!("undefined attribute '{attr}'"));
-                            }
-                        }
-                        _ => {
-                            if a.len() == 3 {
-                                a[2].clone()
-                            } else {
-                                return Err("getattr expects Object, Map, or Python object".into());
-                            }
+                match self.vm_get_attr(&a[0], attr) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if a.len() == 3 {
+                            a[2].clone()
+                        } else {
+                            return Err(e);
                         }
                     }
                 }
@@ -378,30 +360,7 @@ impl Vm {
                     Val::Str(s) => s,
                     _ => return Err("hasattr attribute name must be String".into()),
                 };
-                if crate::py_bridge::is_py_handle(&a[0]) {
-                    Val::Bool(crate::py_bridge::py_hasattr(&a[0], attr)?)
-                } else {
-                    let yes = match &a[0] {
-                        Val::Object(id) => {
-                            let (has_field, cls) = {
-                                let objs =
-                                    self.objects.lock().map_err(|_| "object heap poisoned")?;
-                                objs.get(id)
-                                    .map(|o| {
-                                        (o.fields.contains_key(attr), Some(o.class_name.clone()))
-                                    })
-                                    .unwrap_or((false, None))
-                            };
-                            has_field
-                                || cls
-                                    .and_then(|c| self.find_method_cached(&c, attr))
-                                    .is_some()
-                        }
-                        Val::Map(pairs) => pairs.iter().any(|(k, _)| *k == Val::Str(attr.clone())),
-                        _ => false,
-                    };
-                    Val::Bool(yes)
-                }
+                Val::Bool(self.vm_has_attr(&a[0], attr)?)
             }
             "setattr" => {
                 if a.len() != 3 {
@@ -411,28 +370,153 @@ impl Vm {
                     Val::Str(s) => s.clone(),
                     _ => return Err("setattr attribute name must be String".into()),
                 };
-                if crate::py_bridge::is_py_handle(&a[0]) {
-                    let _ = crate::py_bridge::py_set(&a[0], &attr, &a[2])?;
-                    Val::Null
-                } else if let Val::Object(id) = a[0] {
-                    let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-                    let data = heap.get_mut(&id).ok_or("dangling object")?;
-                    data.fields.insert(attr, a[2].clone());
-                    Val::Null
-                } else {
-                    return Err("setattr expects Object or Python object".into());
+                self.vm_set_attr(&a[0], attr, a[2].clone())?;
+                Val::Null
+            }
+            "delattr" => {
+                if a.len() != 2 {
+                    return Err("delattr expects (obj, name)".into());
                 }
+                let attr = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("delattr attribute name must be String".into()),
+                };
+                self.vm_del_attr(&a[0], attr)?;
+                Val::Null
             }
             "type_of" => self.type_of_val(&a)?,
+            "type" => {
+                if a.len() == 1 {
+                    let cls_name = match &a[0] {
+                        Val::Num(n) => {
+                            if n.fract() == 0.0 {
+                                "int".to_string()
+                            } else {
+                                "float".to_string()
+                            }
+                        }
+                        Val::Str(_) => "str".to_string(),
+                        Val::Bool(_) => "bool".to_string(),
+                        Val::Null => "null".to_string(),
+                        Val::List(_) => "list".to_string(),
+                        Val::Map(_) => "dict".to_string(),
+                        Val::Function(_) => "function".to_string(),
+                        Val::Generator(_) => "object".to_string(),
+                        Val::Object(id) => self
+                            .objects
+                            .lock()
+                            .map_err(|_| "object heap poisoned")?
+                            .get(id)
+                            .map(|o| o.class_name.clone())
+                            .unwrap_or_else(|| "object".into()),
+                    };
+                    self.class_object_val(&cls_name)?
+                } else if a.len() == 3 {
+                    let Val::Str(ref cls_name) = a[0] else {
+                        return Err("type(name, bases, namespace) name must be String".into());
+                    };
+                    self.dynamic_type_create(cls_name, &a[1], &a[2])?
+                } else {
+                    return Err(
+                        "type expects 1 argument (obj) or 3 arguments (name, bases, namespace)"
+                            .into(),
+                    );
+                }
+            }
             "is_instance" | "isinstance" => {
                 if a.len() != 2 {
-                    return Err("is_instance expects value,type".into());
+                    return Err("isinstance expects (value, class_or_type)".into());
                 }
-                let ty = match &a[1] {
-                    Val::Str(s) => s,
-                    _ => return Err("type must be String".into()),
+                let matched = match &a[1] {
+                    Val::Str(s) => self.value_matches(&a[0], s),
+                    Val::List(items) => {
+                        let mut ok = false;
+                        for item in items {
+                            let target = match item {
+                                Val::Str(s) => s.clone(),
+                                _ => self.resolve_class_name_arg(item)?,
+                            };
+                            if self.value_matches(&a[0], &target) {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        ok
+                    }
+                    other => {
+                        let target = self.resolve_class_name_arg(other)?;
+                        self.value_matches(&a[0], &target)
+                    }
                 };
-                Val::Bool(self.value_matches(&a[0], ty))
+                Val::Bool(matched)
+            }
+            "issubclass" => {
+                if a.len() != 2 {
+                    return Err("issubclass expects (cls, class_or_tuple)".into());
+                }
+                let sub = self.resolve_class_name_arg(&a[0])?;
+                let matched = match &a[1] {
+                    Val::List(items) => {
+                        let mut ok = false;
+                        for item in items {
+                            let sup = self.resolve_class_name_arg(item)?;
+                            if self.class_is_a(&sub, &sup) {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        ok
+                    }
+                    other => {
+                        let sup = self.resolve_class_name_arg(other)?;
+                        self.class_is_a(&sub, &sup)
+                    }
+                };
+                Val::Bool(matched)
+            }
+            "super" => self.make_super_obj(&a)?,
+            "property" => {
+                if a.len() > 3 {
+                    return Err("property expects at most 3 arguments (fget, fset, fdel)".into());
+                }
+                let fget = a.first().cloned().unwrap_or(Val::Null);
+                let fset = a.get(1).cloned().unwrap_or(Val::Null);
+                let fdel = a.get(2).cloned().unwrap_or(Val::Null);
+                self.make_property_obj(fget, fset, fdel)?
+            }
+            "staticmethod" => {
+                if a.len() != 1 {
+                    return Err("staticmethod expects 1 callable argument".into());
+                }
+                self.make_descriptor_wrapper("__staticmethod__", a[0].clone())?
+            }
+            "classmethod" => {
+                if a.len() != 1 {
+                    return Err("classmethod expects 1 callable argument".into());
+                }
+                self.make_descriptor_wrapper("__classmethod__", a[0].clone())?
+            }
+            "mro" => {
+                if a.len() != 1 {
+                    return Err("mro expects 1 class argument".into());
+                }
+                let cls_name = self.resolve_class_name_arg(&a[0])?;
+                let mro = self
+                    .classes
+                    .get(&cls_name)
+                    .map(|c| {
+                        if c.mro.is_empty() {
+                            vec![cls_name.clone(), "object".into()]
+                        } else {
+                            c.mro.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| vec![cls_name, "object".into()]);
+                let mut out = Vec::with_capacity(mro.len());
+                for c in &mro {
+                    out.push(self.class_object_val(c)?);
+                }
+                Val::List(out)
             }
             "has_field" => {
                 if a.len() != 2 {
@@ -453,46 +537,141 @@ impl Vm {
                         .unwrap_or(false),
                 )
             }
+            "__pat_seq_split" => {
+                let [
+                    val,
+                    Val::Num(before_n),
+                    Val::Bool(has_star),
+                    Val::Num(after_n),
+                ] = a.as_slice()
+                else {
+                    return Err("__pat_seq_split expects (val, before, has_star, after)".into());
+                };
+                if let Val::List(items) = val {
+                    let before = *before_n as usize;
+                    let after = *after_n as usize;
+                    let len = items.len();
+                    if *has_star {
+                        if len < before + after {
+                            Val::Null
+                        } else {
+                            let mut out = Vec::with_capacity(before + 1 + after);
+                            out.extend_from_slice(&items[..before]);
+                            out.push(Val::List(items[before..(len - after)].to_vec()));
+                            out.extend_from_slice(&items[(len - after)..]);
+                            Val::List(out)
+                        }
+                    } else if len != before {
+                        Val::Null
+                    } else {
+                        Val::List(items.clone())
+                    }
+                } else {
+                    Val::Null
+                }
+            }
+            "__pat_is_map" => {
+                if a.len() != 1 {
+                    return Err("__pat_is_map expects 1 argument".into());
+                }
+                Val::Bool(matches!(&a[0], Val::Map(_)))
+            }
+            "__pat_map_get" => {
+                if a.len() != 2 {
+                    return Err("__pat_map_get expects (subject, key)".into());
+                }
+                if let Val::Map(pairs) = &a[0] {
+                    if let Some((_, v)) = pairs.iter().rev().find(|(k, _)| *k == a[1]) {
+                        Val::List(vec![v.clone()])
+                    } else {
+                        Val::Null
+                    }
+                } else {
+                    Val::Null
+                }
+            }
+            "__pat_map_rest" => {
+                if a.len() != 2 {
+                    return Err("__pat_map_rest expects (subject, excluded_keys)".into());
+                }
+                let (Val::Map(pairs), Val::List(excluded)) = (&a[0], &a[1]) else {
+                    return Err("__pat_map_rest expects (Map, List)".into());
+                };
+                let rest: Vec<(Val, Val)> = pairs
+                    .iter()
+                    .filter(|(k, _)| !excluded.iter().any(|ek| ek == k))
+                    .cloned()
+                    .collect();
+                Val::Map(rest)
+            }
+            "__pat_class_pos" => {
+                let [val, cls, Val::Num(pos_n)] = a.as_slice() else {
+                    return Err("__pat_class_pos expects (subject, cls, pos_len)".into());
+                };
+                self.pat_class_pos(val, cls, *pos_n as usize)?
+            }
+            "__pat_class_kw" => {
+                if a.len() != 2 {
+                    return Err("__pat_class_kw expects (subject, attr)".into());
+                }
+                let Val::Str(attr) = &a[1] else {
+                    return Err("__pat_class_kw attribute name must be String".into());
+                };
+                match self.vm_get_attr(&a[0], attr) {
+                    Ok(v) => Val::List(vec![v]),
+                    Err(_) => Val::Null,
+                }
+            }
             "int" => {
                 if a.len() != 1 {
                     return Err("int expects 1 argument".into());
                 }
-                Val::Num(match &a[0] {
-                    Val::Num(n) => n.trunc(),
-                    Val::Bool(b) => {
-                        if *b {
-                            1.0
-                        } else {
-                            0.0
+                if crate::py_bridge::is_py_handle(&a[0]) {
+                    let built = crate::py_bridge::py_import("builtins")?;
+                    crate::py_bridge::py_call_method(&built, "int", &[a[0].clone()], None)?
+                } else {
+                    Val::Num(match &a[0] {
+                        Val::Num(n) => n.trunc(),
+                        Val::Bool(b) => {
+                            if *b {
+                                1.0
+                            } else {
+                                0.0
+                            }
                         }
-                    }
-                    Val::Str(s) => s
-                        .trim()
-                        .parse::<f64>()
-                        .map_err(|_| "int could not parse String")?
-                        .trunc(),
-                    _ => return Err("int supports Number/Bool/String".into()),
-                })
+                        Val::Str(s) => s
+                            .trim()
+                            .parse::<f64>()
+                            .map_err(|_| "int could not parse String")?
+                            .trunc(),
+                        _ => return Err("int supports Number/Bool/String".into()),
+                    })
+                }
             }
             "float" => {
                 if a.len() != 1 {
                     return Err("float expects 1 argument".into());
                 }
-                Val::Num(match &a[0] {
-                    Val::Num(n) => *n,
-                    Val::Bool(b) => {
-                        if *b {
-                            1.0
-                        } else {
-                            0.0
+                if crate::py_bridge::is_py_handle(&a[0]) {
+                    let built = crate::py_bridge::py_import("builtins")?;
+                    crate::py_bridge::py_call_method(&built, "float", &[a[0].clone()], None)?
+                } else {
+                    Val::Num(match &a[0] {
+                        Val::Num(n) => *n,
+                        Val::Bool(b) => {
+                            if *b {
+                                1.0
+                            } else {
+                                0.0
+                            }
                         }
-                    }
-                    Val::Str(s) => s
-                        .trim()
-                        .parse::<f64>()
-                        .map_err(|_| "float could not parse String")?,
-                    _ => return Err("float supports Number/Bool/String".into()),
-                })
+                        Val::Str(s) => s
+                            .trim()
+                            .parse::<f64>()
+                            .map_err(|_| "float could not parse String")?,
+                        _ => return Err("float supports Number/Bool/String".into()),
+                    })
+                }
             }
             "bool" => {
                 if a.len() != 1 {

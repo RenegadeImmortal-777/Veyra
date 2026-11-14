@@ -30,6 +30,7 @@ use rusqlite::Connection;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
+use crate::bigint::{BigArg, BigOut, eval_bigint_builtin, is_bigint_builtin};
 use crate::bytecode::{ClassDef, FunctionDef, ObjectData, Op};
 use crate::pipeline::{compile_source, load_source};
 use crate::project::project_root;
@@ -51,12 +52,56 @@ use crate::value::{
 use crate::value::{json_stringify_value, val_to_sql_value};
 use crate::vm::{Vm, collect_generator, generators, resume_generator};
 
+fn val_to_big_arg(v: &Val) -> BigArg {
+    match v {
+        Val::Str(s) => BigArg::Str(s.clone()),
+        Val::Num(n) => BigArg::Num(*n),
+        Val::List(xs) => BigArg::List(xs.iter().map(val_to_big_arg).collect()),
+        Val::Map(pairs) => {
+            let mut re = None;
+            let mut im = 0.0;
+            for (k, val) in pairs {
+                if let (Val::Str(ks), Val::Num(x)) = (k, val) {
+                    if ks == "re" {
+                        re = Some(*x);
+                    } else if ks == "im" {
+                        im = *x;
+                    }
+                }
+            }
+            match re {
+                Some(r) => BigArg::Complex(r, im),
+                None => BigArg::Other,
+            }
+        }
+        _ => BigArg::Other,
+    }
+}
+
+fn big_out_to_val(out: BigOut) -> Val {
+    match out {
+        BigOut::Str(s) => Val::Str(s),
+        BigOut::Num(n) => Val::Num(n),
+        BigOut::StrPair(q, r) => Val::List(vec![Val::Str(q), Val::Str(r)]),
+        BigOut::Complex(r, i) => Val::List(vec![Val::Num(r), Val::Num(i)]),
+        BigOut::ComplexList(zs) => Val::List(
+            zs.into_iter()
+                .map(|(r, i)| Val::List(vec![Val::Num(r), Val::Num(i)]))
+                .collect(),
+        ),
+    }
+}
+
 impl Vm {
     pub(crate) fn call_builtin_math_text_fs(
         &mut self,
         n: &str,
         a: Vec<Val>,
     ) -> Result<Option<Val>, String> {
+        if is_bigint_builtin(n) {
+            let bargs: Vec<BigArg> = a.iter().map(val_to_big_arg).collect();
+            return Ok(eval_bigint_builtin(n, &bargs)?.map(big_out_to_val));
+        }
         let v = match n {
             "json_stringify" => {
                 if a.len() != 1 {

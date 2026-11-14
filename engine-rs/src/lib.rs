@@ -23,6 +23,7 @@ pub const VERSION: &str = "12.0.0-sovereign";
 
 mod aot;
 mod ast;
+mod bigint;
 mod builtins;
 mod bytecode;
 mod cli;
@@ -41,6 +42,7 @@ mod py_bridge;
 mod registry;
 mod runtime;
 mod server;
+mod spirv;
 mod tensor;
 mod tooling;
 mod value;
@@ -62,7 +64,8 @@ pub use crate::pipeline::{compile_to_vybc, disasm_source, load_source, run_sourc
 use crate::project::{build_project, fmt_source, project_entry, project_packages, test_project};
 use crate::registry::{
     pkg_add, pkg_audit, pkg_build_plugin, pkg_info, pkg_install, pkg_keygen, pkg_list, pkg_pack,
-    pkg_publish, pkg_remove, pkg_search, pkg_sign, pkg_tree, pkg_unpack, pkg_update, pkg_verify,
+    pkg_publish, pkg_py_bridge, pkg_remove, pkg_search, pkg_sign, pkg_tree, pkg_unpack, pkg_update,
+    pkg_verify,
 };
 #[cfg(test)]
 use crate::runtime::export_function_object;
@@ -202,6 +205,23 @@ pub fn run_cli() -> ExitCode {
                 .ok_or("missing bundle path".into())
                 .and_then(|p| pkg_unpack(Path::new(p), a.get(4).map(Path::new))),
             Some("build-plugin") => pkg_build_plugin(a.get(3).map(Path::new)),
+            Some("py-bridge") => {
+                let mut pip_install = false;
+                let mut positional = Vec::new();
+                for arg in a.iter().skip(3) {
+                    if arg == "--pip-install" {
+                        pip_install = true;
+                    } else {
+                        positional.push(arg.as_str());
+                    }
+                }
+                let out_dir = positional.get(1).copied().map(Path::new);
+                positional
+                    .first()
+                    .copied()
+                    .ok_or_else(|| "missing Python/PyPI package name".to_string())
+                    .and_then(|pypi_name| pkg_py_bridge(pypi_name, out_dir, pip_install))
+            }
             Some("serve") => {
                 let dir = a
                     .get(3)
@@ -223,7 +243,7 @@ pub fn run_cli() -> ExitCode {
                 .ok_or("missing package name".into())
                 .and_then(|n| pkg_remove(n)),
             _ => Err(
-                "usage: veyra pkg <list|search|info|tree|installed|install|update|publish|keygen|sign|verify|pack|unpack|build-plugin|serve|add|remove> [args]"
+                "usage: veyra pkg <list|search|info|tree|installed|install|update|publish|keygen|sign|verify|pack|unpack|build-plugin|py-bridge|serve|add|remove> [args]"
                     .into(),
             ),
         },
@@ -2090,6 +2110,65 @@ assert(repr(box) != "");
     }
 
     #[test]
+    fn inprocess_cpython_and_zero_copy_numpy_torch_buffers() {
+        let src = r#"
+let info = py_info();
+assert(info["available"]);
+assert(info["mode"] == "in-process-capi");
+assert(info["zero_copy_buffer"]);
+
+let np = py_import("numpy");
+let arr = np.array([[1.5, 2.5, 3.5], [4.5, 5.5, 6.5]], dtype=np.float64);
+let t = py_to_tensor(arr);
+assert(tensor_shape(t) == [2, 3]);
+assert(tensor_values(t) == [1.5, 2.5, 3.5, 4.5, 5.5, 6.5]);
+
+let t2 = tensor_add(t, t);
+let back = tensor_to_py(t2);
+assert(list(back.shape) == [2, 3]);
+assert(float(back.sum()) == 48.0);
+
+let raw_i32 = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32).T;
+let ti = py_to_tensor(raw_i32);
+assert(tensor_shape(ti) == [3, 2]);
+assert(tensor_values(ti) == [1, 4, 2, 5, 3, 6]);
+assert(py_free(arr));
+assert(not py_free(arr));
+assert(py_free(back));
+assert(py_free(raw_i32));
+
+let torch = py_import("torch");
+let th = torch.tensor([[2.0, 4.0], [6.0, 8.0]]).numpy();
+let tt = py_to_tensor(th);
+assert(tensor_shape(tt) == [2, 2]);
+assert(tensor_values(tt) == [2, 4, 6, 8]);
+assert(py_free(th));
+"#;
+        assert_eq!(run_source(src), Ok(()));
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("veyra_use_py_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("main.vy");
+        fs::write(
+            &script,
+            r#"use "py:math";
+use "py:collections" as col;
+assert(math.sqrt(25) == 5);
+let c = col.Counter(["a", "b", "a"]);
+assert(c["a"] == 2);
+"#,
+        )
+        .unwrap();
+        let loaded = load_source(script.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(run_source(&loaded), Ok(()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn aot_full_python_parity_async_generators_dunders_and_py_bridge() {
         let src = r#"
 fn make_mul(k) {
@@ -2242,7 +2321,10 @@ print("PARITY_OUT", async_vals, aw_res, make_mul(4)(5), (lambda z: z + 1)(41), g
 
     #[test]
     fn jit_executes_hot_loops_and_self_recursion_natively() {
-        assert_eq!(crate::jit::jit_available(), cfg!(target_arch = "x86_64"));
+        assert_eq!(
+            crate::jit::jit_available(),
+            cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+        );
         let src = r#"
 fn sum_squares(n) {
     let acc = 0.0;
@@ -2305,7 +2387,163 @@ assert(info["native_calls"] >= 20);
     }
 
     #[test]
+    fn jit_inter_calls_list_slices_and_aarch64_encoder() {
+        let src = r#"
+fn jit_square(x) {
+    return x * x;
+}
+
+fn jit_hypot2(a, b) {
+    return jit_square(a) + jit_square(b);
+}
+
+fn jit_is_even(n) {
+    if n == 0 {
+        return true;
+    }
+    return jit_is_odd(n - 1);
+}
+
+fn jit_is_odd(n) {
+    if n == 0 {
+        return false;
+    }
+    return jit_is_even(n - 1);
+}
+
+fn jit_dot(a, b) {
+    let i = 0;
+    let s = 0.0;
+    let n = len(a);
+    while i < n {
+        s = s + a[i] * b[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn jit_tail_plus_outer(xs) {
+    return xs[-1] + jit_hypot2(xs[0], xs[1]);
+}
+
+assert(jit_compile(jit_hypot2) == true);
+assert(jit_compile(jit_is_even) == true);
+assert(jit_compile(jit_dot) == true);
+assert(jit_compile(jit_tail_plus_outer) == true);
+
+let before_calls = jit_info()["native_calls"];
+let k = 0;
+let h = 0.0;
+let d = 0.0;
+let tail_sum = 0.0;
+let ev = false;
+let od = false;
+let xs = [3.0, 4.0, 5.0, 10.0];
+let ys = [2.0, -1.0, 4.0, 0.5];
+while k < 24 {
+    h = jit_hypot2(3.0, 4.0);
+    d = jit_dot(xs, ys);
+    tail_sum = jit_tail_plus_outer(xs);
+    ev = jit_is_even(12);
+    od = jit_is_odd(13);
+    k = k + 1;
+}
+assert(abs(h - 25.0) < 0.0001);
+assert(abs(d - 27.0) < 0.0001);
+assert(abs(tail_sum - 35.0) < 0.0001);
+assert(ev == true);
+assert(od == true);
+assert(jit_info()["native_calls"] > before_calls + 40);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+
+        // Out-of-bounds index inside a compiled List-JIT function must cleanly fall back to VM error.
+        let oob_src = r#"
+fn jit_bad_idx(xs, idx) {
+    return xs[idx];
+}
+assert(jit_compile(jit_bad_idx) == true);
+let r = 0.0;
+let i = 0;
+while i < 12 {
+    r = jit_bad_idx([10.0, 20.0], 0);
+    i = i + 1;
+}
+assert(r == 10.0);
+let _ = jit_bad_idx([10.0, 20.0], 99);
+"#;
+        let oob_err = run_source(oob_src).expect_err("expected OOB list index error");
+        assert!(
+            oob_err.contains("out of range"),
+            "unexpected err: {oob_err}"
+        );
+
+        // Verify unconditional ARM64 (aarch64) instruction word emitter on inter-call + list indexing.
+        let compiled_bc = crate::pipeline::compile_source(src).unwrap();
+        let mut fn_map = std::collections::HashMap::new();
+        for op in &compiled_bc {
+            if let crate::bytecode::Op::Def(fname, params, rty, is_async, body) = op {
+                let is_gen = body.iter().any(|o| matches!(o, crate::bytecode::Op::Yield));
+                fn_map.insert(
+                    fname.clone(),
+                    crate::bytecode::FunctionDef {
+                        params: std::sync::Arc::new(params.clone()),
+                        return_type: rty.clone(),
+                        is_async: *is_async,
+                        is_generator: is_gen,
+                        code: std::sync::Arc::new(body.clone()),
+                        captures: std::sync::Arc::new(std::collections::HashMap::new()),
+                        capture_types: std::sync::Arc::new(std::collections::HashMap::new()),
+                        upvalues: std::sync::Arc::new(std::collections::HashMap::new()),
+                        local_count: crate::bytecode::compute_local_count(body, params.len()),
+                        param_named: std::sync::Arc::new(vec![true; params.len()]),
+                        debug_name: fname.clone(),
+                        debug_scope: 0,
+                    },
+                );
+            }
+        }
+        let arm_words = crate::jit::debug_emit_aarch64(
+            "jit_tail_plus_outer",
+            fn_map.get("jit_tail_plus_outer").unwrap(),
+            &|n| fn_map.get(n).cloned(),
+        )
+        .unwrap();
+        assert_eq!(arm_words[0], 0xA9BF_7BFD); // STP X29, X30, [SP, #-16]!
+        assert_eq!(arm_words[1], 0x9100_03FD); // MOV X29, SP
+        assert_eq!(arm_words[arm_words.len() - 1], 0xD65F_03C0); // RET
+        assert!(arm_words.contains(&0xD63F_0200)); // BLR X16 (inter-function / runtime helper call)
+        assert!(arm_words.contains(&0x1E61_2800)); // FADD D0, D0, D1
+    }
+
+    fn test_gpu_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct GpuStateResetGuard<'a> {
+        _guard: std::sync::MutexGuard<'a, ()>,
+    }
+
+    impl<'a> GpuStateResetGuard<'a> {
+        fn enter() -> Self {
+            let guard = test_gpu_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let _ = crate::gpu::gpu_set_backend("auto");
+            let _ = crate::gpu::gpu_set_precision("f32");
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for GpuStateResetGuard<'_> {
+        fn drop(&mut self) {
+            let _ = crate::gpu::gpu_set_backend("auto");
+            let _ = crate::gpu::gpu_set_precision("f32");
+        }
+    }
+
+    #[test]
     fn gpu_compute_and_tensor_device_parity() {
+        let _gpu_guard = GpuStateResetGuard::enter();
         let mut src = String::from(
             r#"
 let info = gpu_info();
@@ -2374,6 +2612,149 @@ assert(after["shaders_compiled"] >= 1);
             );
         }
         assert_eq!(run_source(&src), Ok(()));
+    }
+
+    #[test]
+    fn gpu_vulkan_spirv_and_d3d11_f64_kernels() {
+        let _gpu_guard = GpuStateResetGuard::enter();
+        let backends = crate::gpu::gpu_backends();
+        assert!(backends.iter().any(|b| b == "cpu"));
+
+        // Verify SPIR-V generator + Vulkan compute path when Vulkan is available on this host.
+        let ewise_words = crate::spirv::spirv_ewise();
+        assert!(!ewise_words.is_empty());
+        assert_eq!(ewise_words[0], 0x0723_0203);
+        let words_literal = ewise_words
+            .iter()
+            .map(|w| w.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let has_vulkan = backends.iter().any(|b| b == "vulkan");
+        let has_d3d11 = backends.iter().any(|b| b == "d3d11");
+
+        let mut src = String::from(
+            r#"
+let bs = gpu_backends();
+assert(len(bs) >= 1);
+assert(gpu_precision() == "f32");
+"#,
+        );
+
+        if has_vulkan {
+            src.push_str(&format!(
+                r#"
+assert(gpu_set_backend("vulkan") == "vulkan");
+let vinfo = gpu_info();
+assert(vinfo["available"] == true);
+assert(vinfo["backend"] == "vulkan-compute" or vinfo["backend"] == "vulkan-cpu");
+assert(contains(str(vinfo["api_version"]), "."));
+let before_vk = vinfo["dispatches"];
+
+let mm = gpu_matmul([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]);
+assert(abs(mm[0][0] - 58.0) < 0.001);
+assert(abs(mm[0][1] - 64.0) < 0.001);
+assert(abs(mm[1][0] - 139.0) < 0.001);
+assert(abs(mm[1][1] - 154.0) < 0.001);
+
+let va = gpu_vec_add([1.25, -2.5, 3.5], [2.75, 4.5, -1.5]);
+assert(abs(va[0] - 4.0) < 0.0001 and abs(va[1] - 2.0) < 0.0001 and abs(va[2] - 2.0) < 0.0001);
+let vs = gpu_vec_sub([5.0, 1.0], [2.0, 3.5]);
+assert(abs(vs[0] - 3.0) < 0.0001 and abs(vs[1] + 2.5) < 0.0001);
+let vm = gpu_vec_mul([2.5, -3.0], [4.0, 2.0]);
+assert(abs(vm[0] - 10.0) < 0.0001 and abs(vm[1] + 6.0) < 0.0001);
+let vr = gpu_relu([-3.0, 0.0, 2.25]);
+assert(abs(vr[0]) < 0.0001 and abs(vr[2] - 2.25) < 0.0001);
+let vsig = gpu_sigmoid([0.0, 2.0]);
+assert(abs(vsig[0] - 0.5) < 0.0001 and abs(vsig[1] - 0.880797) < 0.0005);
+let vsc = gpu_scale([1.5, -2.0], 3.0);
+assert(abs(vsc[0] - 4.5) < 0.0001 and abs(vsc[1] + 6.0) < 0.0001);
+
+let vg = gpu_gelu([-2.0, 0.0, 1.0, 2.0]);
+assert(abs(vg[0] + 0.045402) < 0.001);
+assert(abs(vg[1]) < 0.0001);
+assert(abs(vg[2] - 0.841192) < 0.001);
+assert(abs(vg[3] - 1.954598) < 0.001);
+
+let vsm = gpu_softmax([[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]]);
+assert(abs(vsm[0][0] - 0.090031) < 0.001 and abs(vsm[0][1] - 0.244728) < 0.001 and abs(vsm[0][2] - 0.665241) < 0.001);
+assert(abs(vsm[1][0] - 0.333333) < 0.001);
+
+let vln = gpu_layernorm([[1.0, 2.0, 3.0], [10.0, 10.0, 10.0]]);
+assert(abs(vln[0][0] + 1.224735) < 0.002 and abs(vln[0][1]) < 0.001 and abs(vln[0][2] - 1.224735) < 0.002);
+assert(abs(vln[1][0]) < 0.001 and abs(vln[1][2]) < 0.001);
+
+let spv_words = [{words_literal}];
+let spv_out = gpu_run_spirv(spv_words, [1.5, -2.0, 3.0, 0.5], [4.0, 3.0, -2.0, 8.0], 4, [4, 2, 0, 0], 1, 1, 1);
+assert(abs(spv_out[0] - 6.0) < 0.0001);
+assert(abs(spv_out[1] + 6.0) < 0.0001);
+assert(abs(spv_out[2] + 6.0) < 0.0001);
+assert(abs(spv_out[3] - 4.0) < 0.0001);
+
+let after_vk = gpu_info();
+assert(after_vk["dispatches"] > before_vk);
+"#,
+            ));
+        }
+
+        if has_d3d11 {
+            src.push_str(
+                r#"
+assert(gpu_set_backend("d3d11") == "d3d11");
+let dln = gpu_layernorm([[1.0, 2.0, 3.0]]);
+assert(abs(dln[0][0] + 1.224735) < 0.002 and abs(dln[0][2] - 1.224735) < 0.002);
+let dg = gpu_gelu([0.0, 1.0]);
+assert(abs(dg[0]) < 0.0001 and abs(dg[1] - 0.841192) < 0.001);
+"#,
+            );
+        }
+
+        // Test f64 precision mode (uses hardware D3D11 doubles if supported, otherwise CPU f64)
+        src.push_str(
+            r#"
+assert(gpu_set_precision("f64") == "f64");
+assert(gpu_precision() == "f64");
+let hi_prec = gpu_vec_add([100000000.0, 1.0], [0.125, 2.5]);
+assert(hi_prec[0] == 100000000.125);
+assert(hi_prec[1] == 3.5);
+let hi_mm = gpu_matmul([[100000000.0, 1.0]], [[1.0], [0.125]]);
+assert(hi_mm[0][0] == 100000000.125);
+assert(gpu_set_precision("f32") == "f32");
+assert(gpu_set_backend("auto") == "auto");
+"#,
+        );
+        assert_eq!(run_source(&src), Ok(()));
+
+        // Also test vygpu package wrapper end-to-end via run_file
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let vygpu_vy = repo_root
+            .join("packages")
+            .join("vygpu")
+            .join("vygpu.vy")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_vy = env::temp_dir().join(format!("veyra_vygpu_pkg_{stamp}.vy"));
+        let pkg_src = format!(
+            r#"
+use "{vygpu_vy}";
+let b = backends();
+assert(len(b) >= 1);
+let g = gelu([0.0, 1.0]);
+assert(abs(g[0]) < 0.0001 and abs(g[1] - 0.841192) < 0.001);
+let ln = layernorm([[2.0, 4.0, 6.0]]);
+assert(abs(ln[0][1]) < 0.001);
+assert(precision() == "f32");
+"#
+        );
+        fs::write(&tmp_vy, pkg_src).unwrap();
+        let loaded = load_source(tmp_vy.to_string_lossy().as_ref());
+        let _ = fs::remove_file(&tmp_vy);
+        let res = loaded.and_then(|s| run_source(&s));
+        assert_eq!(res, Ok(()));
     }
 
     #[test]
@@ -2702,6 +3083,9 @@ assert(abs(jr["last"] - 45.0) < 0.0001);
 
 let gm = vygpu.matmul([[1.0, 2.0], [3.0, 4.0]], [[2.0, 0.0], [1.0, 2.0]]);
 assert(abs(gm[0][0] - 4.0) < 0.001);
+assert(len(vygpu.backends()) >= 1);
+assert(abs(vygpu.gelu([1.0])[0] - 0.841192) < 0.001);
+assert(abs(vygpu.layernorm([[1.0, 2.0, 3.0]])[0][1]) < 0.001);
 assert(vyplugin.abi_version() == 1);
 
 let c = vycache.create(2);
@@ -2750,5 +3134,974 @@ assert(vydecimal.format(vydecimal.mul(vydecimal.from_str("1.25", 2), vydecimal.f
         drop(_guard);
 
         let _ = fs::remove_dir_all(proj);
+    }
+
+    #[test]
+    fn bigint_decimal_complex_and_fft_parity() {
+        let src = r#"
+let p256 = big_pow(2, 256);
+assert(p256 == "115792089237316195423570985008687907853269984665640564039457584007913129639936");
+assert(big_bits(p256) == 257);
+assert(big_bits(big_sub(p256, 1)) == 256);
+
+let a = big_add(p256, "12345678901234567890123456789");
+let d = bigint("0xdeadbeefcafebabe123456789");
+let qr = big_divmod(a, d);
+assert(big_add(big_mul(qr[0], d), qr[1]) == a);
+assert(big_cmp(qr[1], d) < 0);
+assert(big_gcd(big_mul(d, "97"), big_mul(d, "101")) == d);
+assert(big_powmod("2", "256", "9999999967") == big_rem(p256, "9999999967"));
+
+assert(dec_add(dec("0.1"), dec("0.2")) == dec("0.3"));
+assert(dec_mul("12345678901234567890.12345", "100000") == "1234567890123456789012345");
+let third_100 = dec_div("1", "3", 100);
+assert(len(third_100) == 102);
+assert(starts_with(third_100, "0.33333333333333333333"));
+assert(ends_with(third_100, "33333333333333333333"));
+let sq2 = dec_sqrt("2", 50);
+assert(sq2 == "1.41421356237309504880168872420969807856967187537695");
+assert(dec_quantize("0.3", 4) == "0.3000");
+assert(dec_round("3.14159", 2) == "3.14");
+assert(dec_cmp("1e-20", "0.00000000000000000002") < 0);
+
+let z1 = complex(3, 4);
+let z2 = complex(1, -2);
+assert(cabs(z1) == 5.0);
+let zp = cmul(z1, z2);
+assert(zp[0] == 11.0 and zp[1] == -2.0);
+let zq = cdiv(zp, z2);
+assert(abs(zq[0] - 3.0) < 0.000000001 and abs(zq[1] - 4.0) < 0.000000001);
+
+let f4 = fft([1, 0, -1, 0]);
+assert(abs(f4[0][0]) < 0.000000001 and abs(f4[1][0] - 2.0) < 0.000000001 and abs(f4[3][0] - 2.0) < 0.000000001);
+let r4 = ifft(f4);
+assert(abs(r4[0][0] - 1.0) < 0.000000001 and abs(r4[2][0] + 1.0) < 0.000000001);
+
+// Prime length N=7 Bluestein FFT + IFFT exact round-trip
+let sig7 = [1.5, -2.25, 3.0, 0.5, -1.0, 4.25, -0.75];
+let r7 = ifft(fft(sig7));
+let i = 0;
+while i < len(sig7) {
+    assert(abs(r7[i][0] - sig7[i]) < 0.000000001);
+    assert(abs(r7[i][1]) < 0.000000001);
+    i = i + 1;
+}
+"#;
+        assert_eq!(run_source(src), Ok(()));
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("veyra_bigint_aot_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let exe_path = dir.join(if cfg!(target_os = "windows") {
+            "bigint_aot.exe"
+        } else {
+            "bigint_aot"
+        });
+        crate::aot::compile_source_to_native(src, &exe_path).unwrap();
+        let out = std::process::Command::new(&exe_path).output().unwrap();
+        assert!(
+            out.status.success(),
+            "native bigint AOT stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oop_mro_super_descriptors_and_metaclasses_parity() {
+        let src = r#"
+// 1. C3 MRO + Cooperative super() + Diamond Inheritance
+class A {
+    fn tag(self) {
+        return ["A"];
+    }
+}
+class B(A) {
+    fn tag(self) {
+        return ["B"] + super().tag();
+    }
+}
+class C(A) {
+    fn tag(self) {
+        return ["C"] + super().tag();
+    }
+}
+class D(B, C) {
+    fn tag(self) {
+        return ["D"] + super().tag();
+    }
+}
+let d = D();
+assert(d.tag() == ["D", "B", "C", "A"]);
+assert(isinstance(d, D) and isinstance(d, A) and isinstance(d, [int, C]));
+assert(issubclass(D, A) and issubclass(D, object));
+assert(type(d) == D and type(D) == type and type(42) == int);
+let m = mro(D);
+assert(len(m) == 5 and m[0] == D and m[1] == B and m[2] == C and m[3] == A and m[4] == object);
+assert(D.__mro__ == m and D.__name__ == "D");
+
+// Legacy single-parent ':' inheritance still supports super() & MRO
+class LegacySub: C {
+    fn tag(self) {
+        return ["L"] + super().tag();
+    }
+}
+assert(LegacySub().tag() == ["L", "C", "A"]);
+
+// 2. @property + @x.setter + @x.deleter + @staticmethod + @classmethod
+class Temp {
+    scale = 1.8;
+    fn __init__(self, c) {
+        self._c = c;
+        self._deleted = false;
+    }
+    @property
+    fn c(self) {
+        return self._c;
+    }
+    @c.setter
+    fn c(self, value) {
+        self._c = value;
+    }
+    @c.deleter
+    fn c(self) {
+        self._deleted = true;
+        self._c = 0;
+    }
+    @staticmethod
+    fn freezing() {
+        return 0;
+    }
+    @classmethod
+    fn from_fahrenheit(cls, f) {
+        return cls((f - 32) / cls.scale);
+    }
+}
+class KelvinTemp(Temp) {
+    scale = 1.8;
+}
+let t = Temp(25);
+assert(t.c == 25);
+t.c = 100;
+assert(t.c == 100);
+delattr(t, "c");
+assert(t._deleted == true and t.c == 0);
+assert(Temp.freezing() == 0 and t.freezing() == 0);
+let kt = KelvinTemp.from_fahrenheit(212);
+assert(isinstance(kt, KelvinTemp) and abs(kt.c - 100) < 0.000001);
+
+// 3. Custom Data Descriptor Protocol + Non-Data Descriptor Precedence
+class Positive {
+    fn __init__(self, slot) {
+        self.slot = slot;
+    }
+    fn __get__(self, inst, owner) {
+        if inst == null {
+            return self;
+        }
+        return getattr(inst, self.slot, 0);
+    }
+    fn __set__(self, inst, val) {
+        if val < 0 {
+            throw "must be non-negative";
+        }
+        setattr(inst, self.slot, val);
+    }
+}
+class NonData {
+    fn __get__(self, inst, owner) {
+        return "from_nondata";
+    }
+}
+class Account {
+    balance = Positive("_balance");
+    label = NonData();
+    fn __init__(self, bal) {
+        self.balance = bal;
+    }
+}
+let acc = Account(50);
+assert(acc.balance == 50);
+acc.balance = 120;
+assert(acc.balance == 120);
+let caught = false;
+try {
+    acc.balance = -5;
+} catch e {
+    caught = true;
+}
+assert(caught);
+assert(acc.label == "from_nondata");
+acc.label = "custom";
+assert(acc.label == "custom");
+
+// 4. __getattr__, __setattr__ (with super().__setattr__), __new__
+class DynamicRecord {
+    fn __new__(cls, *args) {
+        let inst = super().__new__(cls);
+        inst.created_by_new = true;
+        return inst;
+    }
+    fn __init__(self, name) {
+        self.name = name;
+    }
+    fn __setattr__(self, k, v) {
+        super().__setattr__(k, v);
+        super().__setattr__("_last_set", k);
+    }
+    fn __getattr__(self, name) {
+        return "missing:" + name;
+    }
+}
+let rec = DynamicRecord("alpha");
+assert(rec.created_by_new == true and rec.name == "alpha" and rec._last_set == "name");
+assert(rec.anything == "missing:anything");
+
+// 5. Stacked Decorators & Dynamic type(name, bases, ns)
+fn add_two(f) {
+    fn w(x) {
+        return f(x) + 2;
+    }
+    return w;
+}
+fn mul_three(f) {
+    fn w(x) {
+        return f(x) * 3;
+    }
+    return w;
+}
+@add_two
+@mul_three
+fn base_op(x) {
+    return x + 1;
+}
+// Order: add_two(mul_three(base_op))(4) = ((4+1)*3)+2 = 17
+assert(base_op(4) == 17);
+
+fn dyn_init(self, x) {
+    self.x = x;
+}
+fn dyn_double(self) {
+    return self.x * 2;
+}
+let DynBox = type("DynBox", [object], {"__init__": dyn_init, "double": dyn_double, "kind": "dynamic"});
+let db = DynBox(21);
+assert(isinstance(db, DynBox) and db.double() == 42 and DynBox.kind == "dynamic");
+
+// 6. Custom Metaclass (__new__, __init__, __call__) + Class Decorator
+let cls_reg = [];
+fn register_cls(cls) {
+    cls.decorated_flag = true;
+    cls_reg.push(cls.__name__);
+    return cls;
+}
+class TrackMeta(type) {
+    fn __new__(mcs, name, bases, ns) {
+        let mod_ns = {};
+        for k in ns {
+            mod_ns[k] = ns[k];
+        }
+        mod_ns["META_NAME"] = "meta_" + name;
+        return super().__new__(mcs, name, bases, mod_ns);
+    }
+    fn __init__(cls, name, bases, ns) {
+        cls.INITED = true;
+    }
+    fn __call__(cls, *args) {
+        let inst = super().__call__(*args);
+        inst.meta_tagged = true;
+        return inst;
+    }
+}
+@register_cls
+class Service(metaclass=TrackMeta) {
+    fn __init__(self, port) {
+        self.port = port;
+    }
+}
+assert(Service.META_NAME == "meta_Service" and Service.INITED == true and Service.decorated_flag == true);
+assert(cls_reg == ["Service"]);
+assert(isinstance(Service, TrackMeta) and isinstance(Service, type));
+let svc = Service(8080);
+assert(svc.port == 8080 and svc.meta_tagged == true and type(svc) == Service);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("veyra_oop_aot_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let exe_path = dir.join(if cfg!(target_os = "windows") {
+            "oop_aot.exe"
+        } else {
+            "oop_aot"
+        });
+        crate::aot::compile_source_to_native(src, &exe_path).unwrap();
+        let out = std::process::Command::new(&exe_path).output().unwrap();
+        assert!(
+            out.status.success(),
+            "native OOP AOT stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // Inconsistent C3 MRO must fail cleanly in both VM and AOT binary execution
+        let bad_mro = r#"
+class X {}
+class Y {}
+class Z1(X, Y) {}
+class Z2(Y, X) {}
+class Bad(Z1, Z2) {}
+"#;
+        let vm_err = run_source(bad_mro).unwrap_err();
+        assert!(vm_err.contains("MRO"), "expected MRO error, got: {vm_err}");
+
+        let dir2 = env::temp_dir().join(format!("veyra_bad_mro_aot_{stamp}"));
+        fs::create_dir_all(&dir2).unwrap();
+        let exe2 = dir2.join(if cfg!(target_os = "windows") {
+            "bad_mro.exe"
+        } else {
+            "bad_mro"
+        });
+        crate::aot::compile_source_to_native(bad_mro, &exe2).unwrap();
+        let out2 = std::process::Command::new(&exe2).output().unwrap();
+        assert!(
+            !out2.status.success(),
+            "expected inconsistent MRO binary to fail"
+        );
+        let stderr2 = String::from_utf8_lossy(&out2.stderr);
+        assert!(
+            stderr2.contains("MRO"),
+            "expected AOT MRO error, got: {stderr2}"
+        );
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn match_structural_patterns_parity() {
+        let src = r#"
+class Colors {
+    RED = "red";
+    GREEN = "green";
+}
+
+class Point {
+    fn init(self, x, y) {
+        self.x = x;
+        self.y = y;
+    }
+
+    @property
+    fn mag2(self) {
+        return self.x * self.x + self.y * self.y;
+    }
+}
+
+class Reordered {
+    __match_args__ = ["b", "a"];
+    fn init(self, a, b) {
+        self.a = a;
+        self.b = b;
+    }
+}
+
+fn classify(item) {
+    match item {
+        case 1 | 2 | 3 {
+            return "small:" + str(item);
+        }
+        case Colors.RED {
+            return "const:red";
+        }
+        case [1, x] | [2, x] {
+            return "orseq:" + str(x);
+        }
+        case [first, *mid, last] if len(mid) > 0 {
+            return "seq:" + str(first) + ":" + str(len(mid)) + ":" + str(last);
+        }
+        case [a, b] as pair {
+            return "pair:" + str(pair);
+        }
+        case {"op": "add", "args": [a, b]} {
+            return "add:" + str(a + b);
+        }
+        case {"op": op, **rest} {
+            return "op:" + str(op) + ":" + str(rest["n"]);
+        }
+        case Point(0, y=py) if py > 0 {
+            return "ypos:" + str(py);
+        }
+        case Point(px, py, mag2=m2) {
+            return "pt:" + str(px) + "," + str(py) + ":" + str(m2);
+        }
+        case Reordered(first_b, second_a) {
+            return "re:" + str(first_b) + "," + str(second_a);
+        }
+        case int(n) if n > 100 {
+            return "big_int:" + str(n);
+        }
+        case str(s) {
+            return "str:" + s;
+        }
+        case _ if false {
+            return "never";
+        }
+        case _ {
+            return "fallback";
+        }
+    }
+}
+
+assert(classify(2) == "small:2");
+assert(classify("red") == "const:red");
+assert(classify([2, 42]) == "orseq:42");
+assert(classify([10, 20, 30, 40]) == "seq:10:2:40");
+assert(classify([7, 8]) == "pair:[7, 8]");
+assert(classify({"op": "add", "args": [3, 9], "extra": true}) == "add:12");
+assert(classify({"op": "mul", "n": 5, "k": 1}) == "op:mul:5");
+assert(classify(Point(0, 9)) == "ypos:9");
+assert(classify(Point(3, 4)) == "pt:3,4:25");
+assert(classify(Reordered(10, 20)) == "re:20,10");
+assert(classify(250) == "big_int:250");
+assert(classify(50) == "fallback");
+assert(classify("hello") == "str:hello");
+
+// Failed sub-patterns must not leak/commit partial captures into later branches
+let outside = 999;
+match [1, 2] {
+    case [outside, 99] { assert(false); }
+    case _ {}
+}
+assert(outside == 999);
+
+// Top-level structural match & negative integer literals
+let top_res = "";
+match {"k": -5} {
+    case {"k": -5} { top_res = "neg5"; }
+    case _ { top_res = "no"; }
+}
+assert(top_res == "neg5");
+"#;
+
+        assert_eq!(run_source(src), Ok(()));
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("veyra_match_aot_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let exe_path = dir.join(if cfg!(target_os = "windows") {
+            "match_aot.exe"
+        } else {
+            "match_aot"
+        });
+        crate::aot::compile_source_to_native(src, &exe_path).unwrap();
+        let out = std::process::Command::new(&exe_path).output().unwrap();
+        assert!(
+            out.status.success(),
+            "native match AOT stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_6_sovereign_packages_and_vydecimal_end_to_end() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let reg_txt =
+            fs::read_to_string(workspace_root.join("registry").join("index.json")).unwrap();
+        let reg_json: JsonValue = serde_json::from_str(&reg_txt).unwrap();
+        assert!(
+            reg_json["packages"].as_object().unwrap().len() >= 74,
+            "expected at least 74 registered packages"
+        );
+
+        let proj = env::temp_dir().join(format!("veyra_new6pkgs_{stamp}"));
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(
+            proj.join("veyra.json"),
+            r#"{"name":"new6pkgs","version":"0.1.0","entry":"src/main.vy"}"#,
+        )
+        .unwrap();
+
+        let home_str = workspace_root.to_string_lossy().to_string();
+        let _guard = EnvCwdGuard::enter(
+            &proj,
+            &[
+                ("VEYRA_HOME", Some(&home_str)),
+                ("VEYRA_REGISTRY_URL", None),
+            ],
+        );
+
+        for name in [
+            "vydecimal",
+            "vycomplex",
+            "vyitertools",
+            "vyfunctools",
+            "vytyping",
+            "vygraph",
+            "vysemver",
+        ] {
+            crate::registry::pkg_add(name).unwrap();
+        }
+
+        let main_vy = proj.join("src/main.vy");
+        fs::write(
+            &main_vy,
+            r#"
+use "vydecimal";
+use "vycomplex";
+use "vyitertools";
+use "vyfunctools";
+use "vytyping";
+use "vygraph";
+use "vysemver";
+
+// 1. Upgraded vydecimal (arbitrary precision + Decimal OOP class)
+let da = vydecimal.parse("0.1");
+let db = vydecimal.parse("0.2");
+assert(vydecimal.format(vydecimal.add(da, db)) == "0.3");
+let one_third = vydecimal.div(vydecimal.parse("1"), vydecimal.parse("3"), 30);
+assert(starts_with(vydecimal.format(one_third), "0.33333333333333333333"));
+let sq2 = vydecimal.sqrt(vydecimal.parse("2"), 20);
+assert(starts_with(vydecimal.format(sq2), "1.414213562373095"));
+let d_obj = vydecimal.Decimal("1.25") + vydecimal.Decimal("2.75");
+assert(d_obj.str() == "4");
+
+// 2. vycomplex
+let z1 = vycomplex.make(3, 4);
+let z2 = vycomplex.Complex(1, -2);
+let z3 = vycomplex.Complex(2, 5);
+let zsum = z2 + z3;
+assert(zsum.__str__() == "3+3j");
+assert(vycomplex.abs_val(z1) == 5.0);
+assert(vycomplex.pow_int(vycomplex.make(0, 1), 2) == [-1.0, 0.0]);
+
+// 3. vyitertools
+assert(vyitertools.chain([[1, 2], [3], [4, 5]]) == [1, 2, 3, 4, 5]);
+assert(vyitertools.batched([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]);
+assert(vyitertools.pairwise([10, 20, 30]) == [[10, 20], [20, 30]]);
+assert(vyitertools.accumulate([1, 2, 3, 4], fn(a, b) { return a + b; }) == [1, 3, 6, 10]);
+assert(len(vyitertools.combinations([1, 2, 3, 4], 2)) == 6);
+assert(len(vyitertools.permutations([1, 2, 3], 2)) == 6);
+
+// 4. vyfunctools
+let inc = fn(x) { return x + 1; };
+let dbl = fn(x) { return x * 2; };
+let f_comp = vyfunctools.compose(dbl, inc);
+assert(f_comp(4) == 10);
+assert(vyfunctools.pipe(3, [inc, dbl, inc]) == 9);
+assert(vyfunctools.reduce(fn(a, b) { return a + b; }, [1, 2, 3, 4], 10) == 20);
+let add3 = fn(a, b, c) { return a + b + c; };
+let p5 = vyfunctools.partial(add3, [5]);
+assert(p5(10, 20) == 35);
+let calls = 0;
+let fib_slow = fn(n) {
+    calls = calls + 1;
+    return n * n;
+};
+let fib_m = vyfunctools.memoize(fib_slow);
+assert(fib_m(9) == 81 and fib_m(9) == 81 and calls == 1);
+let lru = vyfunctools.lru_cache(2, fib_slow);
+assert(lru(2) == 4 and lru(3) == 9 and lru(2) == 4 and calls == 3);
+
+// 5. vytyping
+let user_schema = vytyping.typed_dict({
+    "name": "str",
+    "age": vytyping.optional("int"),
+    "roles": vytyping.list_of(vytyping.literal_of(["admin", "user"]))
+});
+assert(vytyping.assert_schema({"name": "Ada", "age": 36, "roles": ["admin"]}, user_schema));
+assert(not vytyping.matches({"name": "Ada", "roles": ["guest"]}, user_schema));
+
+// 6. vygraph
+let g = vygraph.new_graph(true);
+g = vygraph.add_edge(g, "a", "b", 2);
+g = vygraph.add_edge(g, "a", "c", 5);
+g = vygraph.add_edge(g, "b", "c", 1);
+g = vygraph.add_edge(g, "c", "d", 3);
+assert(vygraph.toposort(g) == ["a", "b", "c", "d"]);
+assert(vygraph.shortest_path(g, "a", "d") == ["a", "b", "c", "d"]);
+assert(vygraph.dijkstra(g, "a")["dist"]["d"] == 6.0);
+
+// 7. vysemver
+assert(vysemver.compare("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0);
+assert(vysemver.compare("1.0.0-rc.1", "1.0.0") < 0);
+assert(vysemver.satisfies("1.4.2", "^1.2.0"));
+assert(not vysemver.satisfies("2.0.0", "^1.2.0"));
+assert(vysemver.max_satisfying(["1.0.0", "1.4.2", "2.0.0"], ">=1.0.0 <2.0.0") == "1.4.2");
+assert(vysemver.bump_minor("1.4.2") == "1.5.0");
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_source(main_vy.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(run_source(&loaded), Ok(()));
+        drop(_guard);
+
+        let _ = fs::remove_dir_all(proj);
+    }
+
+    #[test]
+    fn pillar5_scoped_packages_workspaces_platform_native_and_py_bridge() {
+        use crate::registry::{
+            current_platform_key, parse_pkg_spec, pkg_add, pkg_audit, pkg_index, pkg_install,
+            pkg_py_bridge, pkg_remove, select_native_spec,
+        };
+        use sha2::{Digest, Sha256};
+
+        // 1. Scoped semver spec parsing
+        assert_eq!(
+            parse_pkg_spec("@acme/core@^1.2.0").unwrap(),
+            ("@acme/core", Some("^1.2.0"))
+        );
+        assert_eq!(parse_pkg_spec("@acme/core").unwrap(), ("@acme/core", None));
+        assert!(parse_pkg_spec("@acme/").is_err());
+
+        // 2. Per-platform native spec selector
+        let plat = current_platform_key();
+        let nat_map = serde_json::json!({
+            plat.clone(): { "library": "custom_plat.dll", "source": "src/plat.rs" },
+            "other-arch": { "library": "other.so" }
+        });
+        let picked = select_native_spec(&nat_map).unwrap();
+        assert_eq!(
+            picked.get("library").and_then(|v| v.as_str()),
+            Some("custom_plat.dll")
+        );
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let work = env::temp_dir().join(format!("veyra_pillar5_local_{stamp}"));
+        let reg_good = work.join("reg_good");
+        let reg_pkg_src = work.join("src_scoped_utils");
+        let monorepo = work.join("monorepo");
+        let ws_core = monorepo.join("packages").join("core");
+        let ws_app = monorepo.join("apps").join("web");
+        let home_dir = work.join("veyra_home");
+
+        fs::create_dir_all(&reg_good).unwrap();
+        fs::create_dir_all(&reg_pkg_src).unwrap();
+        fs::create_dir_all(ws_core.join("src")).unwrap();
+        fs::create_dir_all(ws_app.join("src")).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+
+        // Scoped package stored in secondary federated registry with per-platform native artifact
+        fs::write(
+            reg_pkg_src.join("veyra.json"),
+            r#"{"name":"@acme/utils","version":"1.2.3","entry":"utils.vy","packages":{}}"#,
+        )
+        .unwrap();
+        fs::write(
+            reg_pkg_src.join("utils.vy"),
+            "fn triple(x: Int) -> Int {\n    return x * 3;\n}\n",
+        )
+        .unwrap();
+        let fake_native_bytes = b"veyra-platform-native-stub";
+        fs::write(reg_good.join("native_stub.bin"), fake_native_bytes).unwrap();
+        let mut nat_hash = Sha256::new();
+        nat_hash.update(fake_native_bytes);
+        let nat_sha = format!("{:x}", nat_hash.finalize());
+        let reg_index = serde_json::json!({
+            "registry_version": 1,
+            "packages": {
+                "@acme/utils": {
+                    "version": "1.2.3",
+                    "entry": "utils.vy",
+                    "source": "../src_scoped_utils",
+                    "native": {
+                        plat: {
+                            "library": "native_stub.bin",
+                            "url": "native_stub.bin",
+                            "sha256": nat_sha
+                        }
+                    }
+                }
+            }
+        });
+        fs::write(
+            reg_good.join("index.json"),
+            serde_json::to_string_pretty(&reg_index).unwrap(),
+        )
+        .unwrap();
+
+        // Monorepo workspace root + core package + app consuming both workspace & @acme/utils
+        fs::write(
+            monorepo.join("veyra.json"),
+            serde_json::json!({
+                "name": "acme-monorepo",
+                "version": "0.1.0",
+                "workspaces": ["packages/*", "apps/*"],
+                "packages": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            ws_core.join("veyra.json"),
+            r#"{"name":"@acme/core","version":"2.0.0","entry":"src/lib.vy","packages":{}}"#,
+        )
+        .unwrap();
+        fs::write(
+            ws_core.join("src").join("lib.vy"),
+            "fn base_val() -> Int {\n    return 14;\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            ws_app.join("veyra.json"),
+            serde_json::json!({
+                "name": "web-app",
+                "version": "0.1.0",
+                "entry": "src/main.vy",
+                "packages": {
+                    "@acme/core": "^2.0.0"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let app_main = ws_app.join("src").join("main.vy");
+        fs::write(
+            &app_main,
+            r#"use "@acme/utils";
+use "@acme/core";
+let u = import_package("@acme/utils");
+let c = import_package("@acme/core");
+assert(u.triple(c.base_val()) == 42);
+"#,
+        )
+        .unwrap();
+
+        let bad_reg = work.join("does_not_exist").join("index.json");
+        let reg_urls = format!("{};{}", bad_reg.display(), reg_good.display());
+        let home_str = home_dir.to_string_lossy().into_owned();
+
+        let _guard = EnvCwdGuard::enter(
+            &ws_app,
+            &[
+                ("VEYRA_REGISTRY_URLS", Some(reg_urls.as_str())),
+                ("VEYRA_REGISTRY_URL", None),
+                ("VEYRA_HOME", Some(home_str.as_str())),
+                ("VEYRA_OFFLINE", None),
+            ],
+        );
+
+        // Federated index fails over from missing first registry to second registry
+        let (_, idx) = pkg_index().unwrap();
+        assert!(
+            idx.get("packages")
+                .and_then(|p| p.get("@acme/utils"))
+                .is_some()
+        );
+
+        // Add scoped package via federated registry + platform native artifact + lockfile audit
+        pkg_add("@acme/utils@^1.0.0").unwrap();
+        assert!(
+            ws_app
+                .join("vendor")
+                .join("@acme")
+                .join("utils")
+                .join("native_stub.bin")
+                .is_file()
+        );
+
+        // Install from monorepo root restores workspace member @acme/core into apps/web/vendor/@acme/core
+        env::set_current_dir(&monorepo).unwrap();
+        pkg_install().unwrap();
+        assert!(
+            ws_app
+                .join("vendor")
+                .join("@acme")
+                .join("core")
+                .join("src")
+                .join("lib.vy")
+                .is_file()
+        );
+
+        env::set_current_dir(&ws_app).unwrap();
+        pkg_audit().unwrap();
+
+        // Generate py-bridge wrapper for Python stdlib `math` inside ws_app
+        pkg_py_bridge("math", None, false).unwrap();
+        let py_math_dir = ws_app.join("vendor").join("py_math");
+        assert!(py_math_dir.join("py_math.vy").is_file());
+        fs::write(
+            ws_app.join("src").join("bridge_check.vy"),
+            r#"use "@acme/utils";
+use "@acme/core";
+use "py_math";
+let u = import_package("@acme/utils");
+let c = import_package("@acme/core");
+let pym = import_package("py_math");
+assert(u.triple(c.base_val()) == 42);
+if py_available() {
+    assert(pym.call("sqrt", [16]) == 4.0);
+}
+"#,
+        )
+        .unwrap();
+
+        let src = load_source(app_main.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(run_source(&src), Ok(()));
+        let bridge_src = load_source(
+            ws_app
+                .join("src")
+                .join("bridge_check.vy")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        assert_eq!(run_source(&bridge_src), Ok(()));
+
+        // Scoped package removal cleans up vendor/@acme/@... cleanly
+        pkg_remove("@acme/utils").unwrap();
+        assert!(!ws_app.join("vendor").join("@acme").join("utils").exists());
+        assert!(ws_app.join("vendor").join("@acme").join("core").is_dir());
+
+        drop(_guard);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[cfg(feature = "native-services")]
+    #[test]
+    fn pillar5_http_federated_registry_failover_and_offline_cache() {
+        use crate::registry::{pkg_add, pkg_index};
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let work = env::temp_dir().join(format!("veyra_pillar5_http_{stamp}"));
+        let srv_home = work.join("srv_home");
+        let client_home = work.join("client_home");
+        let app_a = work.join("app_a");
+        let app_b = work.join("app_b");
+
+        fs::create_dir_all(srv_home.join("registry")).unwrap();
+        fs::create_dir_all(srv_home.join("packages").join("fedlib")).unwrap();
+        fs::create_dir_all(&client_home).unwrap();
+        fs::create_dir_all(app_a.join("src")).unwrap();
+        fs::create_dir_all(app_b.join("src")).unwrap();
+
+        fs::write(
+            srv_home.join("packages").join("fedlib").join("veyra.json"),
+            r#"{"name":"fedlib","version":"1.0.0","entry":"lib.vy","packages":{}}"#,
+        )
+        .unwrap();
+        fs::write(
+            srv_home.join("packages").join("fedlib").join("lib.vy"),
+            "fn ping() -> Int {\n    return 99;\n}\n",
+        )
+        .unwrap();
+        let bundle =
+            crate::registry::build_package_bundle(&srv_home.join("packages").join("fedlib"))
+                .unwrap();
+        fs::create_dir_all(srv_home.join("bundles")).unwrap();
+        fs::write(
+            srv_home.join("bundles").join("fedlib.vypkg.json"),
+            serde_json::to_string_pretty(&bundle).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            srv_home.join("registry").join("index.json"),
+            serde_json::json!({
+                "registry_version": 1,
+                "packages": {
+                    "fedlib": {
+                        "version": "1.0.0",
+                        "entry": "lib.vy",
+                        "bundle_path": "/bundles/fedlib.vypkg.json"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let srv_url = format!("http://127.0.0.1:{port}");
+        let srv_home_thread = srv_home.clone();
+        std::thread::spawn(move || {
+            let _ = crate::server::serve_registry(&srv_home_thread, port);
+        });
+        let mut ready = false;
+        for _ in 0..40 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            ready,
+            "federated registry server failed to listen on {srv_url}"
+        );
+
+        for app in [&app_a, &app_b] {
+            fs::write(
+                app.join("veyra.json"),
+                r#"{"name":"app","version":"0.1.0","entry":"src/main.vy","packages":{}}"#,
+            )
+            .unwrap();
+            fs::write(
+                app.join("src").join("main.vy"),
+                "use \"fedlib\";\nlet f = import_package(\"fedlib\");\nassert(f.ping() == 99);\n",
+            )
+            .unwrap();
+        }
+
+        // Allocate an unused closed port for primary failing registry
+        let dead_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead_probe.local_addr().unwrap().port();
+        drop(dead_probe);
+        let fed_urls = format!("http://127.0.0.1:{dead_port},{srv_url}");
+        let home_str = client_home.to_string_lossy().into_owned();
+
+        let _guard = EnvCwdGuard::enter(
+            &app_a,
+            &[
+                ("VEYRA_REGISTRY_URLS", Some(fed_urls.as_str())),
+                ("VEYRA_REGISTRY_URL", None),
+                ("VEYRA_HOME", Some(home_str.as_str())),
+                ("VEYRA_OFFLINE", None),
+            ],
+        );
+
+        let (_, idx) = pkg_index().unwrap();
+        assert!(idx.get("packages").and_then(|p| p.get("fedlib")).is_some());
+        pkg_add("fedlib").unwrap();
+        assert!(app_a.join("vendor").join("fedlib").join("lib.vy").is_file());
+
+        // Populate offline cache verified under VEYRA_HOME/cache
+        assert!(client_home.join("cache").join("registries").is_dir());
+        assert!(client_home.join("cache").join("artifacts").is_dir());
+
+        // Offline mode installs into app_b purely from disk cache
+        unsafe { env::set_var("VEYRA_OFFLINE", "1") };
+        unsafe { env::set_var("VEYRA_REGISTRY_URLS", &srv_url) };
+        env::set_current_dir(&app_b).unwrap();
+        pkg_add("fedlib").unwrap();
+        let src_b =
+            load_source(app_b.join("src").join("main.vy").to_string_lossy().as_ref()).unwrap();
+        assert_eq!(run_source(&src_b), Ok(()));
+
+        drop(_guard);
+        let _ = fs::remove_dir_all(work);
     }
 }

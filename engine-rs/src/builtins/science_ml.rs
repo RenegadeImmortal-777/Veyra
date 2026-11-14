@@ -1699,6 +1699,135 @@ impl Vm {
                     crate::gpu::gpu_run_hlsl(src, entry, &buf_a, &buf_b, out_len, gx, gy, gz)?;
                 nums_to_val(out)
             }
+            "gpu_backends" => {
+                if !a.is_empty() {
+                    return Err("gpu_backends expects 0 arguments".into());
+                }
+                Val::List(
+                    crate::gpu::gpu_backends()
+                        .into_iter()
+                        .map(Val::Str)
+                        .collect(),
+                )
+            }
+            "gpu_set_backend" => {
+                if a.len() != 1 {
+                    return Err("gpu_set_backend expects backend name String".into());
+                }
+                let Val::Str(name) = &a[0] else {
+                    return Err("gpu_set_backend expects String".into());
+                };
+                Val::Str(crate::gpu::gpu_set_backend(name)?)
+            }
+            "gpu_precision" => {
+                if !a.is_empty() {
+                    return Err("gpu_precision expects 0 arguments".into());
+                }
+                Val::Str(crate::gpu::gpu_precision().into())
+            }
+            "gpu_set_precision" => {
+                if a.len() != 1 {
+                    return Err(
+                        "gpu_set_precision expects precision String ('f32' or 'f64')".into(),
+                    );
+                }
+                let Val::Str(name) = &a[0] else {
+                    return Err("gpu_set_precision expects String".into());
+                };
+                Val::Str(crate::gpu::gpu_set_precision(name)?)
+            }
+            "gpu_gelu" => {
+                if a.len() != 1 {
+                    return Err("gpu_gelu expects numeric list or tensor".into());
+                }
+                if let Ok(id) = tensor_id(&a[0]) {
+                    let t = tensor_snapshot(id)?;
+                    let out = crate::gpu::gpu_ewise_f64(&t.data, &[], 6, 0.0);
+                    tensor_store_on_device(out, t.shape, false, TensorOp::Leaf, "gpu")?
+                } else {
+                    let xs = as_num_list(&a[0])?;
+                    nums_to_val(crate::gpu::gpu_ewise_f64(&xs, &[], 6, 0.0))
+                }
+            }
+            "gpu_layernorm" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("gpu_layernorm expects (data_or_tensor[, eps])".into());
+                }
+                let eps = match a.get(1) {
+                    None => 1e-5,
+                    Some(Val::Num(e)) if *e > 0.0 && e.is_finite() => *e,
+                    _ => return Err("gpu_layernorm eps must be a positive finite Number".into()),
+                };
+                if let Ok(id) = tensor_id(&a[0]) {
+                    let t = tensor_snapshot(id)?;
+                    let (rows, cols) = match t.shape.as_slice() {
+                        [n] => (1usize, *n),
+                        [r, c] => (*r, *c),
+                        _ => return Err("gpu_layernorm expects 1D or 2D tensor".into()),
+                    };
+                    let out = crate::gpu::gpu_layernorm_f64(&t.data, rows, cols, eps);
+                    tensor_store_on_device(out, t.shape, false, TensorOp::Leaf, "gpu")?
+                } else if let Ok(mat) = as_matrix(&a[0]) {
+                    let rows = mat.len();
+                    let cols = mat[0].len();
+                    let flat: Vec<f64> = mat.into_iter().flatten().collect();
+                    let out = crate::gpu::gpu_layernorm_f64(&flat, rows, cols, eps);
+                    matrix_to_val(out.chunks(cols).map(|r| r.to_vec()).collect())
+                } else {
+                    let xs = as_num_list(&a[0])?;
+                    if xs.is_empty() {
+                        return Err("gpu_layernorm requires non-empty input".into());
+                    }
+                    let cols = xs.len();
+                    nums_to_val(crate::gpu::gpu_layernorm_f64(&xs, 1, cols, eps))
+                }
+            }
+            "gpu_run_spirv" => {
+                if a.len() < 4 || a.len() > 8 {
+                    return Err(
+                        "gpu_run_spirv expects (words,buf_a,buf_b,out_len[,push_words,gx,gy,gz])"
+                            .into(),
+                    );
+                }
+                let parse_u32s = |val: &Val, label: &str| -> Result<Vec<u32>, String> {
+                    let Val::List(items) = val else {
+                        return Err(format!("{label} must be List of integers"));
+                    };
+                    items
+                        .iter()
+                        .map(|x| match x {
+                            Val::Num(n)
+                                if *n >= 0.0 && n.fract() == 0.0 && *n <= u32::MAX as f64 =>
+                            {
+                                Ok(*n as u32)
+                            }
+                            _ => Err(format!("{label} entries must be uint32 integers")),
+                        })
+                        .collect()
+                };
+                let words = parse_u32s(&a[0], "spirv words")?;
+                let buf_a = as_num_list(&a[1])?;
+                let buf_b = as_num_list(&a[2])?;
+                let out_len = parse_pos_int(Some(&a[3]), 1, "gpu_run_spirv out_len")?;
+                let (push_words, dim_idx) = match a.get(4) {
+                    Some(Val::List(_)) => (parse_u32s(&a[4], "push_words")?, 5),
+                    _ => (Vec::new(), 4),
+                };
+                let gx = parse_pos_int(a.get(dim_idx), out_len.div_ceil(64).max(1), "gx")? as u32;
+                let gy = parse_pos_int(a.get(dim_idx + 1), 1, "gy")? as u32;
+                let gz = parse_pos_int(a.get(dim_idx + 2), 1, "gz")? as u32;
+                let out = crate::gpu::gpu_run_spirv(
+                    &words,
+                    &buf_a,
+                    &buf_b,
+                    out_len,
+                    &push_words,
+                    gx,
+                    gy,
+                    gz,
+                )?;
+                nums_to_val(out)
+            }
             _ => return Ok(None),
         };
         Ok(Some(v))

@@ -56,7 +56,7 @@ pub(crate) fn symbols_file(path: &Path) -> Result<(), String> {
                     ret.map(|r| format!(" -> {r}")).unwrap_or_default()
                 );
             }
-            Stmt::DecoratedFn(decorator, name, params, ret, _) => {
+            Stmt::DecoratedFn(decorators, name, params, ret, _) => {
                 let ps = params
                     .iter()
                     .map(|(n, t)| match t {
@@ -66,19 +66,25 @@ pub(crate) fn symbols_file(path: &Path) -> Result<(), String> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!(
-                    "  @{decorator} fn {name}({ps}){}",
+                    "  @({} decorators) fn {name}({ps}){}",
+                    decorators.len(),
                     ret.map(|r| format!(" -> {r}")).unwrap_or_default()
                 );
             }
-            Stmt::Class(name, parent, body) => {
+            Stmt::Class(name, bases, _, _, body) => {
                 println!(
                     "  class {name}{}",
-                    parent.map(|p| format!(": {p}")).unwrap_or_default()
+                    if bases.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({} bases)", bases.len())
+                    }
                 );
                 for item in body {
                     match item {
                         Stmt::Fn(method, params, ret, _)
-                        | Stmt::AsyncFn(method, params, ret, _) => {
+                        | Stmt::AsyncFn(method, params, ret, _)
+                        | Stmt::DecoratedFn(_, method, params, ret, _) => {
                             let ps = params
                                 .iter()
                                 .map(|(n, t)| match t {
@@ -193,7 +199,7 @@ pub(crate) fn doc_file(path: &Path) -> Result<(), String> {
                 let ret = return_type.unwrap_or_else(|| "Any".into());
                 out.push_str(&format!("## fn {name}({rendered}) -> {ret}\n\n"));
             }
-            Stmt::DecoratedFn(decorator, name, params, return_type, _) => {
+            Stmt::DecoratedFn(_, name, params, return_type, _) => {
                 let rendered = params
                     .iter()
                     .map(|(n, t)| match t {
@@ -203,19 +209,19 @@ pub(crate) fn doc_file(path: &Path) -> Result<(), String> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let ret = return_type.unwrap_or_else(|| "Any".into());
-                out.push_str(&format!(
-                    "## @{decorator} fn {name}({rendered}) -> {ret}\n\n"
-                ));
+                out.push_str(&format!("## @decorated fn {name}({rendered}) -> {ret}\n\n"));
             }
-            Stmt::Class(name, parent, body) => {
-                match parent {
-                    Some(p) => out.push_str(&format!("## class {name}: {p}\n\n")),
-                    None => out.push_str(&format!("## class {name}\n\n")),
+            Stmt::Class(name, bases, _, _, body) => {
+                if bases.is_empty() {
+                    out.push_str(&format!("## class {name}\n\n"));
+                } else {
+                    out.push_str(&format!("## class {name} ({} bases)\n\n", bases.len()));
                 }
                 for item in body {
                     match item {
                         Stmt::Fn(method, params, return_type, _)
-                        | Stmt::AsyncFn(method, params, return_type, _) => {
+                        | Stmt::AsyncFn(method, params, return_type, _)
+                        | Stmt::DecoratedFn(_, method, params, return_type, _) => {
                             let rendered = params
                                 .iter()
                                 .map(|(n, t)| match t {

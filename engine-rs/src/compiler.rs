@@ -3,8 +3,16 @@
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::ast::{CallArg, Expr, Stmt};
+static CLOSURE_UID: AtomicUsize = AtomicUsize::new(1);
+
+fn unique_closure_key(prefix: &str, name: &str) -> String {
+    let id = CLOSURE_UID.fetch_add(1, Ordering::Relaxed);
+    format!("__{prefix}_{name}_{id}")
+}
+
+use crate::ast::{CallArg, Expr, Pattern, SeqElem, Stmt};
 use crate::bytecode::Op;
 use crate::value::Val;
 
@@ -136,17 +144,34 @@ fn collect_all_ids_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
             }
             Stmt::Match(e, cases) => {
                 collect_all_ids_expr(e, out);
-                for (p, body) in cases {
-                    if let Some(pe) = p {
-                        collect_all_ids_expr(pe, out);
+                for (p, g, body) in cases {
+                    collect_all_ids_pattern(p, out);
+                    if let Some(ge) = g {
+                        collect_all_ids_expr(ge, out);
                     }
                     collect_all_ids_stmts(body, out);
                 }
             }
-            Stmt::Fn(_, _, _, body)
-            | Stmt::AsyncFn(_, _, _, body)
-            | Stmt::DecoratedFn(_, _, _, _, body)
-            | Stmt::Class(_, _, body) => {
+            Stmt::Fn(name, _, _, body) | Stmt::AsyncFn(name, _, _, body) => {
+                out.insert(name.clone());
+                collect_all_ids_stmts(body, out);
+            }
+            Stmt::DecoratedFn(decs, _, _, _, body) => {
+                for d in decs {
+                    collect_all_ids_expr(d, out);
+                }
+                collect_all_ids_stmts(body, out);
+            }
+            Stmt::Class(_, bases, metaclass, decs, body) => {
+                for b in bases {
+                    collect_all_ids_expr(b, out);
+                }
+                if let Some(m) = metaclass {
+                    collect_all_ids_expr(m, out);
+                }
+                for d in decs {
+                    collect_all_ids_expr(d, out);
+                }
                 collect_all_ids_stmts(body, out);
             }
             Stmt::SetMember(a, _, b) => {
@@ -252,14 +277,30 @@ fn collect_unslotted_in_expr(e: &Expr, out: &mut HashSet<String>) {
 fn collect_unslotted_in_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         match s {
-            Stmt::Fn(_, _, _, body) | Stmt::AsyncFn(_, _, _, body) => {
-                collect_all_ids_stmts(body, out);
-            }
-            Stmt::DecoratedFn(_, name, _, _, body) => {
+            Stmt::Fn(name, _, _, body) | Stmt::AsyncFn(name, _, _, body) => {
                 out.insert(name.clone());
                 collect_all_ids_stmts(body, out);
             }
-            Stmt::Class(_, _, body) => collect_all_ids_stmts(body, out),
+            Stmt::DecoratedFn(decs, name, _, _, body) => {
+                out.insert(name.clone());
+                for d in decs {
+                    collect_all_ids_expr(d, out);
+                }
+                collect_all_ids_stmts(body, out);
+            }
+            Stmt::Class(name, bases, metaclass, decs, body) => {
+                out.insert(name.clone());
+                for b in bases {
+                    collect_all_ids_expr(b, out);
+                }
+                if let Some(m) = metaclass {
+                    collect_all_ids_expr(m, out);
+                }
+                for d in decs {
+                    collect_all_ids_expr(d, out);
+                }
+                collect_all_ids_stmts(body, out);
+            }
             Stmt::Try(body, err_name, handler, finally) => {
                 out.insert(err_name.clone());
                 collect_unslotted_in_stmts(body, out);
@@ -291,9 +332,10 @@ fn collect_unslotted_in_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
             }
             Stmt::Match(e, cases) => {
                 collect_unslotted_in_expr(e, out);
-                for (p, body) in cases {
-                    if let Some(pe) = p {
-                        collect_unslotted_in_expr(pe, out);
+                for (p, g, body) in cases {
+                    collect_unslotted_in_pattern(p, out);
+                    if let Some(ge) = g {
+                        collect_unslotted_in_expr(ge, out);
                     }
                     collect_unslotted_in_stmts(body, out);
                 }
@@ -316,6 +358,89 @@ fn collect_unslotted_in_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
 struct LoopCtx {
     breaks: Vec<usize>,
     continues: Vec<usize>,
+}
+
+fn collect_all_ids_pattern(pat: &Pattern, out: &mut HashSet<String>) {
+    match pat {
+        Pattern::Wildcard => {}
+        Pattern::Capture(name) => {
+            out.insert(name.clone());
+        }
+        Pattern::Literal(e) => collect_all_ids_expr(e, out),
+        Pattern::Or(alts) => {
+            for a in alts {
+                collect_all_ids_pattern(a, out);
+            }
+        }
+        Pattern::As(p, name) => {
+            collect_all_ids_pattern(p, out);
+            out.insert(name.clone());
+        }
+        Pattern::Seq(elems) => {
+            for el in elems {
+                match el {
+                    SeqElem::Pat(p) => collect_all_ids_pattern(p, out),
+                    SeqElem::Star(Some(name)) => {
+                        out.insert(name.clone());
+                    }
+                    SeqElem::Star(None) => {}
+                }
+            }
+        }
+        Pattern::Map { entries, rest } => {
+            for (k, v) in entries {
+                collect_all_ids_expr(k, out);
+                collect_all_ids_pattern(v, out);
+            }
+            if let Some(r) = rest {
+                out.insert(r.clone());
+            }
+        }
+        Pattern::Class { cls, pos, kw } => {
+            collect_all_ids_expr(cls, out);
+            for p in pos {
+                collect_all_ids_pattern(p, out);
+            }
+            for (_, p) in kw {
+                collect_all_ids_pattern(p, out);
+            }
+        }
+    }
+}
+
+fn collect_unslotted_in_pattern(pat: &Pattern, out: &mut HashSet<String>) {
+    match pat {
+        Pattern::Wildcard | Pattern::Capture(_) => {}
+        Pattern::Literal(e) => collect_unslotted_in_expr(e, out),
+        Pattern::Or(alts) => {
+            for a in alts {
+                collect_unslotted_in_pattern(a, out);
+            }
+        }
+        Pattern::As(p, _) => collect_unslotted_in_pattern(p, out),
+        Pattern::Seq(elems) => {
+            for el in elems {
+                if let SeqElem::Pat(p) = el {
+                    collect_unslotted_in_pattern(p, out);
+                }
+            }
+        }
+        Pattern::Map { entries, .. } => {
+            for (k, v) in entries {
+                collect_unslotted_in_expr(k, out);
+                collect_unslotted_in_pattern(v, out);
+            }
+        }
+        Pattern::Class { cls, pos, kw } => {
+            collect_unslotted_in_expr(cls, out);
+            for p in pos {
+                collect_unslotted_in_pattern(p, out);
+            }
+            for (_, p) in kw {
+                collect_unslotted_in_pattern(p, out);
+            }
+        }
+    }
 }
 
 pub(crate) struct Compiler {
@@ -761,6 +886,55 @@ impl Compiler {
         }
         Ok(())
     }
+    fn emit_decorated_fn(
+        &mut self,
+        decorators: &[Expr],
+        name: &str,
+        params: &[(String, Option<String>)],
+        return_type: &Option<String>,
+        body: &[Stmt],
+    ) -> Result<(), String> {
+        let (child_code, child_dbg) = self.compile_child(params, body, self.cur_line)?;
+        let def_ip = self.code.len();
+        self.child_debugs.push((def_ip, 0, child_dbg));
+        let fn_key = unique_closure_key("dec", name);
+        self.code.push(Op::Def(
+            fn_key.clone(),
+            params.to_vec(),
+            return_type.clone(),
+            false,
+            child_code,
+        ));
+        if decorators.is_empty() {
+            self.code.push(Op::FunctionRef(fn_key));
+            self.emit_define(name, false, None);
+        } else if decorators.len() == 1 {
+            self.emit_expr(&decorators[0])?;
+            self.code.push(Op::FunctionRef(fn_key));
+            self.code.push(Op::CallExpr(1));
+            self.emit_define(name, false, None);
+        } else {
+            let mut dec_tmps = Vec::with_capacity(decorators.len());
+            for d in decorators {
+                let t = self.temp("dec");
+                self.emit_expr(d)?;
+                self.emit_define(&t, false, None);
+                dec_tmps.push(t);
+            }
+            let val_tmp = self.temp("dec_val");
+            self.code.push(Op::FunctionRef(fn_key));
+            self.emit_define(&val_tmp, false, None);
+            for d_tmp in dec_tmps.iter().rev() {
+                self.emit_load(d_tmp);
+                self.emit_load(&val_tmp);
+                self.code.push(Op::CallExpr(1));
+                self.emit_store(&val_tmp);
+            }
+            self.emit_load(&val_tmp);
+            self.emit_define(name, false, None);
+        }
+        Ok(())
+    }
     fn emit_stmt(&mut self, s: &Stmt) -> Result<(), String> {
         match s {
             Stmt::Let(n, ty, e, c) => {
@@ -885,28 +1059,42 @@ impl Compiler {
                 self.emit_define(&subject_name, false, None);
                 let mut end_jumps = vec![];
                 let mut wildcard_seen = false;
-                for (pattern, body) in cases {
+                for (pattern, guard, body) in cases {
                     if wildcard_seen {
                         return Err("match cases after wildcard '_' are unreachable".into());
                     }
-                    if let Some(pattern) = pattern {
-                        self.emit_load(&subject_name);
-                        self.emit_expr(pattern)?;
-                        self.code.push(Op::Eq);
-                        let next_case = self.code.len();
-                        self.code.push(Op::JumpIfFalse(0));
-                        self.emit_stmts(body)?;
-                        let end_jump = self.code.len();
-                        self.code.push(Op::Jump(0));
-                        end_jumps.push(end_jump);
-                        let next = self.code.len();
-                        self.code[next_case] = Op::JumpIfFalse(next);
-                    } else {
+                    if guard.is_none() && Self::pattern_is_irrefutable(pattern) {
                         wildcard_seen = true;
-                        self.emit_stmts(body)?;
-                        let end_jump = self.code.len();
-                        self.code.push(Op::Jump(0));
-                        end_jumps.push(end_jump);
+                    }
+                    let mut fail_jumps = Vec::new();
+                    let mut bindings = Vec::new();
+                    self.emit_match_pattern(
+                        &subject_name,
+                        pattern,
+                        &mut fail_jumps,
+                        &mut bindings,
+                    )?;
+                    for (var_name, tmp_name) in bindings {
+                        self.emit_load(&tmp_name);
+                        self.emit_define(&var_name, false, None);
+                    }
+                    if let Some(g) = guard {
+                        self.emit_expr(g)?;
+                        let jf = self.code.len();
+                        self.code.push(Op::JumpIfFalse(0));
+                        fail_jumps.push(jf);
+                    }
+                    self.emit_stmts(body)?;
+                    let end_jump = self.code.len();
+                    self.code.push(Op::Jump(0));
+                    end_jumps.push(end_jump);
+                    let next = self.code.len();
+                    for j in fail_jumps {
+                        match self.code[j] {
+                            Op::JumpIfFalse(_) => self.code[j] = Op::JumpIfFalse(next),
+                            Op::Jump(_) => self.code[j] = Op::Jump(next),
+                            _ => {}
+                        }
                     }
                 }
                 let end = self.code.len();
@@ -996,88 +1184,172 @@ impl Compiler {
                 }
                 _ => return Err("unsupported index assignment target".into()),
             },
-            Stmt::Class(name, parent, body) => {
-                let mut methods = vec![];
-                let mut method_dbgs = vec![];
-                let mut method_line = self.cur_line;
+            Stmt::Class(name, bases, metaclass, decorators, body) => {
+                let mut dec_tmps = Vec::with_capacity(decorators.len());
+                for d in decorators {
+                    let t = self.temp("cls_dec");
+                    self.emit_expr(d)?;
+                    self.emit_define(&t, false, None);
+                    dec_tmps.push(t);
+                }
+                for b in bases {
+                    self.emit_expr(b)?;
+                }
+                if let Some(m) = metaclass {
+                    self.emit_expr(m)?;
+                } else {
+                    self.code.push(Op::Const(Val::Null));
+                }
+                let mut class_c = Compiler::new_at_line(self.cur_line);
+                let mut defined: Vec<String> = Vec::new();
+                let mut push_def = |n: &str| {
+                    if !defined.iter().any(|x| x == n) {
+                        defined.push(n.to_string());
+                    }
+                };
                 for item in body {
                     match item {
                         Stmt::SourceLine(line) => {
-                            method_line = *line;
+                            class_c.cur_line = *line;
+                            class_c.push_line_mark(*line);
                         }
-                        Stmt::Fn(method, params, return_type, statements) => {
+                        Stmt::Let(n, ty, e, is_c) => {
+                            push_def(n);
+                            class_c.emit_expr(e)?;
+                            class_c.emit_define(n, *is_c, ty.clone());
+                        }
+                        Stmt::Assign(n, e) => {
+                            push_def(n);
+                            class_c.emit_expr(e)?;
+                            class_c.emit_define(n, false, None);
+                        }
+                        Stmt::Fn(method, params, ret, mbody)
+                        | Stmt::AsyncFn(method, params, ret, mbody) => {
+                            push_def(method);
+                            let is_async = matches!(item, Stmt::AsyncFn(..));
                             let (child_code, child_dbg) =
-                                self.compile_child(params, statements, method_line)?;
-                            method_dbgs.push((methods.len(), child_dbg));
-                            methods.push((
-                                method.clone(),
+                                class_c.compile_child(params, mbody, class_c.cur_line)?;
+                            let fn_key = unique_closure_key(&format!("cls_{name}"), method);
+                            let def_ip = class_c.code.len();
+                            class_c.child_debugs.push((def_ip, 0, child_dbg));
+                            class_c.code.push(Op::Def(
+                                fn_key.clone(),
                                 params.clone(),
-                                return_type.clone(),
-                                false,
+                                ret.clone(),
+                                is_async,
                                 child_code,
                             ));
+                            class_c.code.push(Op::FunctionRef(fn_key));
+                            class_c.emit_define(method, false, None);
                         }
-                        Stmt::AsyncFn(method, params, return_type, statements) => {
-                            let (child_code, child_dbg) =
-                                self.compile_child(params, statements, method_line)?;
-                            method_dbgs.push((methods.len(), child_dbg));
-                            methods.push((
-                                method.clone(),
-                                params.clone(),
-                                return_type.clone(),
-                                true,
-                                child_code,
-                            ));
+                        Stmt::DecoratedFn(decs, method, params, ret, mbody) => {
+                            push_def(method);
+                            class_c.emit_decorated_fn(decs, method, params, ret, mbody)?;
                         }
-                        _ => return Err("class bodies currently contain methods only".into()),
+                        Stmt::Class(nested_cls, ..) => {
+                            push_def(nested_cls);
+                            class_c.emit_stmt(item)?;
+                        }
+                        _ => {
+                            class_c.emit_stmt(item)?;
+                        }
                     }
                 }
-                let class_ip = self.code.len();
-                for (sub_idx, dbg) in method_dbgs {
-                    self.child_debugs.push((class_ip, sub_idx, dbg));
+                for n in &defined {
+                    class_c.code.push(Op::Const(Val::Str(n.clone())));
+                    class_c.emit_load(n);
                 }
+                class_c
+                    .code
+                    .push(Op::Call("__map".into(), defined.len() * 2));
+                class_c.code.push(Op::Return);
+                let class_ip = self.code.len();
+                self.child_debugs.push((
+                    class_ip,
+                    0,
+                    CompiledDebug {
+                        lines: class_c.line_marks,
+                        children: class_c.child_debugs,
+                        local_names: class_c.slot_names,
+                    },
+                ));
                 self.code
-                    .push(Op::DefClass(name.clone(), parent.clone(), methods));
+                    .push(Op::BuildClass(name.clone(), bases.len(), class_c.code));
+                if dec_tmps.is_empty() {
+                    self.emit_define(name, false, None);
+                } else {
+                    let val_tmp = self.temp("cls_val");
+                    self.emit_define(&val_tmp, false, None);
+                    for d_tmp in dec_tmps.iter().rev() {
+                        self.emit_load(d_tmp);
+                        self.emit_load(&val_tmp);
+                        self.code.push(Op::CallExpr(1));
+                        self.emit_store(&val_tmp);
+                    }
+                    self.emit_load(&val_tmp);
+                    self.emit_define(name, false, None);
+                }
             }
             Stmt::Fn(name, params, return_type, body) => {
                 let (child_code, child_dbg) = self.compile_child(params, body, self.cur_line)?;
-                let def_ip = self.code.len();
-                self.child_debugs.push((def_ip, 0, child_dbg));
-                self.code.push(Op::Def(
-                    name.clone(),
-                    params.clone(),
-                    return_type.clone(),
-                    false,
-                    child_code,
-                ));
+                if self.local_mode {
+                    self.code.push(Op::Const(Val::Null));
+                    self.emit_define(name, false, None);
+                    let fn_key = unique_closure_key("closure", name);
+                    let def_ip = self.code.len();
+                    self.child_debugs.push((def_ip, 0, child_dbg));
+                    self.code.push(Op::Def(
+                        fn_key.clone(),
+                        params.clone(),
+                        return_type.clone(),
+                        false,
+                        child_code,
+                    ));
+                    self.code.push(Op::FunctionRef(fn_key));
+                    self.emit_define(name, false, None);
+                } else {
+                    let def_ip = self.code.len();
+                    self.child_debugs.push((def_ip, 0, child_dbg));
+                    self.code.push(Op::Def(
+                        name.clone(),
+                        params.clone(),
+                        return_type.clone(),
+                        false,
+                        child_code,
+                    ));
+                }
             }
-            Stmt::DecoratedFn(decorator, name, params, return_type, body) => {
-                let (child_code, child_dbg) = self.compile_child(params, body, self.cur_line)?;
-                let def_ip = self.code.len();
-                self.child_debugs.push((def_ip, 0, child_dbg));
-                self.code.push(Op::Def(
-                    name.clone(),
-                    params.clone(),
-                    return_type.clone(),
-                    false,
-                    child_code,
-                ));
-                self.code.push(Op::FunctionRef(name.clone()));
-                self.code.push(Op::Call(decorator.clone(), 1));
-                self.code
-                    .push(Op::Define(name.clone(), false, Some("Function".into())));
+            Stmt::DecoratedFn(decorators, name, params, return_type, body) => {
+                self.emit_decorated_fn(decorators, name, params, return_type, body)?;
             }
             Stmt::AsyncFn(name, params, return_type, body) => {
                 let (child_code, child_dbg) = self.compile_child(params, body, self.cur_line)?;
-                let def_ip = self.code.len();
-                self.child_debugs.push((def_ip, 0, child_dbg));
-                self.code.push(Op::Def(
-                    name.clone(),
-                    params.clone(),
-                    return_type.clone(),
-                    true,
-                    child_code,
-                ));
+                if self.local_mode {
+                    self.code.push(Op::Const(Val::Null));
+                    self.emit_define(name, false, None);
+                    let fn_key = unique_closure_key("aclosure", name);
+                    let def_ip = self.code.len();
+                    self.child_debugs.push((def_ip, 0, child_dbg));
+                    self.code.push(Op::Def(
+                        fn_key.clone(),
+                        params.clone(),
+                        return_type.clone(),
+                        true,
+                        child_code,
+                    ));
+                    self.code.push(Op::FunctionRef(fn_key));
+                    self.emit_define(name, false, None);
+                } else {
+                    let def_ip = self.code.len();
+                    self.child_debugs.push((def_ip, 0, child_dbg));
+                    self.code.push(Op::Def(
+                        name.clone(),
+                        params.clone(),
+                        return_type.clone(),
+                        true,
+                        child_code,
+                    ));
+                }
             }
             Stmt::SourceLine(line) => {
                 self.cur_line = *line;
@@ -1109,6 +1381,280 @@ impl Compiler {
                     .last_mut()
                     .ok_or("'continue' used outside loop")?;
                 ctx.continues.push(p);
+            }
+        }
+        Ok(())
+    }
+
+    fn pattern_is_irrefutable(pat: &Pattern) -> bool {
+        match pat {
+            Pattern::Wildcard | Pattern::Capture(_) => true,
+            Pattern::As(inner, _) => Self::pattern_is_irrefutable(inner),
+            Pattern::Or(alts) => alts.iter().any(Self::pattern_is_irrefutable),
+            _ => false,
+        }
+    }
+
+    fn collect_pattern_vars(pat: &Pattern, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+        match pat {
+            Pattern::Wildcard | Pattern::Literal(_) => {}
+            Pattern::Capture(name) => {
+                if seen.insert(name.clone()) {
+                    out.push(name.clone());
+                }
+            }
+            Pattern::Or(alts) => {
+                if let Some(first) = alts.first() {
+                    Self::collect_pattern_vars(first, out, seen);
+                }
+            }
+            Pattern::As(inner, name) => {
+                Self::collect_pattern_vars(inner, out, seen);
+                if seen.insert(name.clone()) {
+                    out.push(name.clone());
+                }
+            }
+            Pattern::Seq(elems) => {
+                for el in elems {
+                    match el {
+                        SeqElem::Pat(p) => Self::collect_pattern_vars(p, out, seen),
+                        SeqElem::Star(Some(name)) => {
+                            if seen.insert(name.clone()) {
+                                out.push(name.clone());
+                            }
+                        }
+                        SeqElem::Star(None) => {}
+                    }
+                }
+            }
+            Pattern::Map { entries, rest } => {
+                for (_, p) in entries {
+                    Self::collect_pattern_vars(p, out, seen);
+                }
+                if let Some(r) = rest {
+                    if seen.insert(r.clone()) {
+                        out.push(r.clone());
+                    }
+                }
+            }
+            Pattern::Class { pos, kw, .. } => {
+                for p in pos {
+                    Self::collect_pattern_vars(p, out, seen);
+                }
+                for (_, p) in kw {
+                    Self::collect_pattern_vars(p, out, seen);
+                }
+            }
+        }
+    }
+
+    fn emit_match_pattern(
+        &mut self,
+        subject_var: &str,
+        pat: &Pattern,
+        fail_jumps: &mut Vec<usize>,
+        bindings: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
+        match pat {
+            Pattern::Wildcard => {}
+            Pattern::Capture(name) => {
+                let tmp = self.temp("pat_cap");
+                self.emit_load(subject_var);
+                self.emit_define(&tmp, false, None);
+                bindings.push((name.clone(), tmp));
+            }
+            Pattern::As(inner, name) => {
+                self.emit_match_pattern(subject_var, inner, fail_jumps, bindings)?;
+                let tmp = self.temp("pat_as");
+                self.emit_load(subject_var);
+                self.emit_define(&tmp, false, None);
+                bindings.push((name.clone(), tmp));
+            }
+            Pattern::Literal(expr) => {
+                self.emit_load(subject_var);
+                self.emit_expr(expr)?;
+                self.code.push(Op::Eq);
+                let jf = self.code.len();
+                self.code.push(Op::JumpIfFalse(0));
+                fail_jumps.push(jf);
+            }
+            Pattern::Or(alts) => {
+                let mut bound_names = Vec::new();
+                let mut seen = HashSet::new();
+                Self::collect_pattern_vars(pat, &mut bound_names, &mut seen);
+                let mut shared_map: HashMap<String, String> = HashMap::new();
+                for name in bound_names {
+                    let shared_tmp = self.temp("pat_or");
+                    self.code.push(Op::Const(Val::Null));
+                    self.emit_define(&shared_tmp, false, None);
+                    shared_map.insert(name.clone(), shared_tmp.clone());
+                    bindings.push((name, shared_tmp));
+                }
+                let mut ok_jumps = Vec::new();
+                for alt in alts {
+                    let mut alt_fails = Vec::new();
+                    let mut alt_binds = Vec::new();
+                    self.emit_match_pattern(subject_var, alt, &mut alt_fails, &mut alt_binds)?;
+                    for (bname, btmp) in alt_binds {
+                        if let Some(shared) = shared_map.get(&bname) {
+                            self.emit_load(&btmp);
+                            self.emit_store(shared);
+                        }
+                    }
+                    let j_ok = self.code.len();
+                    self.code.push(Op::Jump(0));
+                    ok_jumps.push(j_ok);
+                    let next_alt = self.code.len();
+                    for j in alt_fails {
+                        match self.code[j] {
+                            Op::JumpIfFalse(_) => self.code[j] = Op::JumpIfFalse(next_alt),
+                            Op::Jump(_) => self.code[j] = Op::Jump(next_alt),
+                            _ => {}
+                        }
+                    }
+                }
+                let all_failed = self.code.len();
+                self.code.push(Op::Jump(0));
+                fail_jumps.push(all_failed);
+                let ok_end = self.code.len();
+                for j in ok_jumps {
+                    self.code[j] = Op::Jump(ok_end);
+                }
+            }
+            Pattern::Seq(elems) => {
+                let star_pos = elems.iter().position(|e| matches!(e, SeqElem::Star(_)));
+                let has_star = star_pos.is_some();
+                let (before, after) = match star_pos {
+                    Some(pos) => (pos, elems.len() - pos - 1),
+                    None => (elems.len(), 0),
+                };
+                let parts_tmp = self.temp("pat_seq");
+                self.emit_load(subject_var);
+                self.code.push(Op::Const(Val::Num(before as f64)));
+                self.code.push(Op::Const(Val::Bool(has_star)));
+                self.code.push(Op::Const(Val::Num(after as f64)));
+                self.code.push(Op::Call("__pat_seq_split".into(), 4));
+                self.emit_define(&parts_tmp, false, None);
+                self.emit_load(&parts_tmp);
+                self.code.push(Op::Const(Val::Null));
+                self.code.push(Op::Ne);
+                let jf = self.code.len();
+                self.code.push(Op::JumpIfFalse(0));
+                fail_jumps.push(jf);
+                for (idx, elem) in elems.iter().enumerate() {
+                    match elem {
+                        SeqElem::Star(None) => {}
+                        SeqElem::Star(Some(name)) => {
+                            let el_tmp = self.temp("pat_star");
+                            self.emit_load(&parts_tmp);
+                            self.code.push(Op::Const(Val::Num(idx as f64)));
+                            self.code.push(Op::Index);
+                            self.emit_define(&el_tmp, false, None);
+                            bindings.push((name.clone(), el_tmp));
+                        }
+                        SeqElem::Pat(sub_pat) => {
+                            if !matches!(sub_pat, Pattern::Wildcard) {
+                                let el_tmp = self.temp("pat_el");
+                                self.emit_load(&parts_tmp);
+                                self.code.push(Op::Const(Val::Num(idx as f64)));
+                                self.code.push(Op::Index);
+                                self.emit_define(&el_tmp, false, None);
+                                self.emit_match_pattern(&el_tmp, sub_pat, fail_jumps, bindings)?;
+                            }
+                        }
+                    }
+                }
+            }
+            Pattern::Map { entries, rest } => {
+                self.emit_load(subject_var);
+                self.code.push(Op::Call("__pat_is_map".into(), 1));
+                let jf = self.code.len();
+                self.code.push(Op::JumpIfFalse(0));
+                fail_jumps.push(jf);
+                let mut excl_temps = Vec::new();
+                for (kexpr, vpat) in entries {
+                    let k_tmp = self.temp("pat_mk");
+                    self.emit_expr(kexpr)?;
+                    self.emit_define(&k_tmp, false, None);
+                    if rest.is_some() {
+                        excl_temps.push(k_tmp.clone());
+                    }
+                    let box_tmp = self.temp("pat_mb");
+                    self.emit_load(subject_var);
+                    self.emit_load(&k_tmp);
+                    self.code.push(Op::Call("__pat_map_get".into(), 2));
+                    self.emit_define(&box_tmp, false, None);
+                    self.emit_load(&box_tmp);
+                    self.code.push(Op::Const(Val::Null));
+                    self.code.push(Op::Ne);
+                    let jf = self.code.len();
+                    self.code.push(Op::JumpIfFalse(0));
+                    fail_jumps.push(jf);
+                    if !matches!(vpat, Pattern::Wildcard) {
+                        let v_tmp = self.temp("pat_mv");
+                        self.emit_load(&box_tmp);
+                        self.code.push(Op::Const(Val::Num(0.0)));
+                        self.code.push(Op::Index);
+                        self.emit_define(&v_tmp, false, None);
+                        self.emit_match_pattern(&v_tmp, vpat, fail_jumps, bindings)?;
+                    }
+                }
+                if let Some(rname) = rest {
+                    let r_tmp = self.temp("pat_mr");
+                    self.emit_load(subject_var);
+                    for kt in &excl_temps {
+                        self.emit_load(kt);
+                    }
+                    self.code.push(Op::Call("__list".into(), excl_temps.len()));
+                    self.code.push(Op::Call("__pat_map_rest".into(), 2));
+                    self.emit_define(&r_tmp, false, None);
+                    bindings.push((rname.clone(), r_tmp));
+                }
+            }
+            Pattern::Class { cls, pos, kw } => {
+                let pos_tmp = self.temp("pat_cpos");
+                self.emit_load(subject_var);
+                self.emit_expr(cls)?;
+                self.code.push(Op::Const(Val::Num(pos.len() as f64)));
+                self.code.push(Op::Call("__pat_class_pos".into(), 3));
+                self.emit_define(&pos_tmp, false, None);
+                self.emit_load(&pos_tmp);
+                self.code.push(Op::Const(Val::Null));
+                self.code.push(Op::Ne);
+                let jf = self.code.len();
+                self.code.push(Op::JumpIfFalse(0));
+                fail_jumps.push(jf);
+                for (idx, sub_pat) in pos.iter().enumerate() {
+                    if !matches!(sub_pat, Pattern::Wildcard) {
+                        let p_tmp = self.temp("pat_cp");
+                        self.emit_load(&pos_tmp);
+                        self.code.push(Op::Const(Val::Num(idx as f64)));
+                        self.code.push(Op::Index);
+                        self.emit_define(&p_tmp, false, None);
+                        self.emit_match_pattern(&p_tmp, sub_pat, fail_jumps, bindings)?;
+                    }
+                }
+                for (kname, sub_pat) in kw {
+                    let kbox_tmp = self.temp("pat_ckb");
+                    self.emit_load(subject_var);
+                    self.code.push(Op::Const(Val::Str(kname.clone())));
+                    self.code.push(Op::Call("__pat_class_kw".into(), 2));
+                    self.emit_define(&kbox_tmp, false, None);
+                    self.emit_load(&kbox_tmp);
+                    self.code.push(Op::Const(Val::Null));
+                    self.code.push(Op::Ne);
+                    let jf = self.code.len();
+                    self.code.push(Op::JumpIfFalse(0));
+                    fail_jumps.push(jf);
+                    if !matches!(sub_pat, Pattern::Wildcard) {
+                        let kv_tmp = self.temp("pat_ckv");
+                        self.emit_load(&kbox_tmp);
+                        self.code.push(Op::Const(Val::Num(0.0)));
+                        self.code.push(Op::Index);
+                        self.emit_define(&kv_tmp, false, None);
+                        self.emit_match_pattern(&kv_tmp, sub_pat, fail_jumps, bindings)?;
+                    }
+                }
             }
         }
         Ok(())

@@ -17,38 +17,228 @@ use crate::VERSION;
 use crate::project::{copy_dir_all, project_root, veyra_home};
 use crate::value::{constant_time_strings_equal, hmac_sha256_hex};
 
-pub(crate) fn pkg_index() -> Result<(PathBuf, JsonValue), String> {
-    if let Ok(url) = env::var("VEYRA_REGISTRY_URL") {
-        #[cfg(feature = "native-services")]
-        {
-            let target_url = if url.ends_with(".json") {
-                url.clone()
-            } else {
-                format!("{}/index.json", url.trim_end_matches('/'))
-            };
-            let response = reqwest::blocking::get(&target_url).map_err(|e| e.to_string())?;
-            if !response.status().is_success() {
-                return Err(format!(
-                    "remote registry returned HTTP {}",
-                    response.status()
-                ));
-            }
-            let text = response.text().map_err(|e| e.to_string())?;
-            let json = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-            return Ok((PathBuf::from(target_url), json));
-        }
-        #[cfg(not(feature = "native-services"))]
-        {
-            return Err(format!(
-                "remote registry '{url}' requires the native-services feature"
-            ));
+fn cache_key(input: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(input.as_bytes());
+    let full = format!("{:x}", h.finalize());
+    full[..24].to_string()
+}
+
+fn registry_cache_dir() -> PathBuf {
+    veyra_home().join("cache").join("registries")
+}
+
+fn artifact_cache_dir() -> PathBuf {
+    veyra_home().join("cache").join("artifacts")
+}
+
+fn offline_mode() -> bool {
+    env::var("VEYRA_OFFLINE")
+        .ok()
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "native-services")]
+fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let response = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "HTTP request to {url} returned status {}",
+            response.status()
+        ));
+    }
+    response
+        .bytes()
+        .map(|b| b.to_vec())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "native-services"))]
+fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    Err(format!(
+        "remote URL '{url}' requires the native-services feature"
+    ))
+}
+
+fn http_get_text(url: &str) -> Result<String, String> {
+    let bytes = http_get_bytes(url)?;
+    String::from_utf8(bytes).map_err(|e| format!("invalid UTF-8 from {url}: {e}"))
+}
+
+/// Ordered registry URLs or local paths from `VEYRA_REGISTRY_URLS`,
+/// `VEYRA_REGISTRY_URL`, or the default local `$VEYRA_HOME/registry/index.json`.
+pub(crate) fn registry_sources() -> Vec<String> {
+    if let Ok(urls) = env::var("VEYRA_REGISTRY_URLS") {
+        let list: Vec<String> = urls
+            .split([',', ';'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !list.is_empty() {
+            return list;
         }
     }
-    let path = veyra_home().join("registry").join("index.json");
+    if let Ok(url) = env::var("VEYRA_REGISTRY_URL") {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return vec![trimmed.to_string()];
+        }
+    }
+    vec![
+        veyra_home()
+            .join("registry")
+            .join("index.json")
+            .to_string_lossy()
+            .into_owned(),
+    ]
+}
+
+fn file_url_to_path(url: &str) -> PathBuf {
+    let raw = if let Some(rest) = url.strip_prefix("file:///") {
+        #[cfg(windows)]
+        {
+            rest.replace('/', "\\")
+        }
+        #[cfg(not(windows))]
+        {
+            format!("/{rest}")
+        }
+    } else if let Some(rest) = url.strip_prefix("file://") {
+        rest.to_string()
+    } else {
+        url.to_string()
+    };
+    PathBuf::from(raw)
+}
+
+fn load_single_registry(source: &str) -> Result<(PathBuf, String, JsonValue), String> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let target_url = if source.ends_with(".json") {
+            source.to_string()
+        } else {
+            format!("{}/index.json", source.trim_end_matches('/'))
+        };
+        let base_url = if let Some(stripped) = target_url.strip_suffix("/index.json") {
+            stripped.to_string()
+        } else if let Some((parent, _)) = target_url.rsplit_once('/') {
+            parent.to_string()
+        } else {
+            target_url.clone()
+        };
+        let cache_path = registry_cache_dir().join(format!("{}.json", cache_key(&target_url)));
+        let text = if offline_mode() {
+            fs::read_to_string(&cache_path)
+                .map_err(|e| format!("offline cache miss for {target_url}: {e}"))?
+        } else {
+            match http_get_text(&target_url) {
+                Ok(t) => {
+                    if let Some(parent) = cache_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(&cache_path, &t);
+                    t
+                }
+                Err(err) => {
+                    if cache_path.is_file() {
+                        fs::read_to_string(&cache_path).map_err(|_| err)?
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        };
+        let json: JsonValue = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        return Ok((PathBuf::from(target_url), base_url, json));
+    }
+    let mut path = file_url_to_path(source);
+    if path.is_dir() {
+        path = path.join("index.json");
+    }
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("registry unavailable at {}: {e}", path.display()))?;
-    let json = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    Ok((path, json))
+    let json: JsonValue = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let base_dir = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_string_lossy()
+        .into_owned();
+    Ok((path, base_dir, json))
+}
+
+fn resolve_pkg_ref(base: &str, rel_or_url: &str) -> String {
+    if rel_or_url.starts_with("http://")
+        || rel_or_url.starts_with("https://")
+        || rel_or_url.starts_with("file://")
+    {
+        return rel_or_url.to_string();
+    }
+    if base.starts_with("http://") || base.starts_with("https://") {
+        return format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            rel_or_url.trim_start_matches('/')
+        );
+    }
+    if let Ok(rel_path) = safe_package_relative_path(rel_or_url) {
+        return Path::new(base)
+            .join(rel_path)
+            .to_string_lossy()
+            .into_owned();
+    }
+    Path::new(base)
+        .join(rel_or_url)
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub(crate) fn pkg_index() -> Result<(PathBuf, JsonValue), String> {
+    let sources = registry_sources();
+    let mut merged = serde_json::Map::new();
+    let mut first_path: Option<PathBuf> = None;
+    let mut registry_version = 1u64;
+    let mut errors = Vec::new();
+    for src in &sources {
+        match load_single_registry(src) {
+            Ok((idx_path, base, json)) => {
+                if first_path.is_none() {
+                    first_path = Some(idx_path.clone());
+                    if let Some(rv) = json.get("registry_version").and_then(JsonValue::as_u64) {
+                        registry_version = rv;
+                    }
+                }
+                if let Some(pkgs) = json.get("packages").and_then(JsonValue::as_object) {
+                    for (name, meta) in pkgs {
+                        if merged.contains_key(name) {
+                            continue;
+                        }
+                        let mut annotated = meta.clone();
+                        if let Some(obj) = annotated.as_object_mut() {
+                            obj.insert("_registry_base".into(), JsonValue::String(base.clone()));
+                            obj.insert(
+                                "_registry_index".into(),
+                                JsonValue::String(idx_path.to_string_lossy().into_owned()),
+                            );
+                        }
+                        merged.insert(name.clone(), annotated);
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("{src}: {e}")),
+        }
+    }
+    if let Some(path) = first_path {
+        Ok((
+            path,
+            serde_json::json!({
+                "registry_version": registry_version,
+                "packages": JsonValue::Object(merged),
+            }),
+        ))
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub(crate) fn safe_package_relative_path(value: &str) -> Result<PathBuf, String> {
@@ -63,19 +253,31 @@ pub(crate) fn safe_package_relative_path(value: &str) -> Result<PathBuf, String>
     Ok(path.to_path_buf())
 }
 
-#[cfg(feature = "native-services")]
 pub(crate) fn fetch_package_file(url: &str) -> Result<Vec<u8>, String> {
-    let response = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "package download returned HTTP {}",
-            response.status()
-        ));
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let cache_path = artifact_cache_dir().join(format!("{}.bin", cache_key(url)));
+        if offline_mode() {
+            return fs::read(&cache_path).map_err(|e| format!("offline cache miss for {url}: {e}"));
+        }
+        return match http_get_bytes(url) {
+            Ok(bytes) => {
+                if let Some(parent) = cache_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&cache_path, &bytes);
+                Ok(bytes)
+            }
+            Err(err) => {
+                if cache_path.is_file() {
+                    fs::read(&cache_path).map_err(|_| err)
+                } else {
+                    Err(err)
+                }
+            }
+        };
     }
-    response
-        .bytes()
-        .map(|b| b.to_vec())
-        .map_err(|e| e.to_string())
+    let path = file_url_to_path(url);
+    fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))
 }
 
 pub(crate) fn hash_directory(dir: &Path) -> Result<String, String> {
@@ -191,12 +393,269 @@ pub(crate) fn semver_matches(version: &str, constraint: &str) -> bool {
     true
 }
 
+/// Validate an unscoped (`foo`) or scoped (`@org/pkg`) Veyra package name.
+pub(crate) fn validate_package_name(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains('\\') {
+        return Err(format!("unsafe package name '{name}'"));
+    }
+    if let Some(rest) = trimmed.strip_prefix('@') {
+        let mut parts = rest.split('/');
+        let scope = parts.next().unwrap_or("");
+        let pkg = parts.next().unwrap_or("");
+        if parts.next().is_some()
+            || scope.is_empty()
+            || pkg.is_empty()
+            || scope == "."
+            || scope == ".."
+            || pkg == "."
+            || pkg == ".."
+            || scope.starts_with('.')
+            || pkg.starts_with('.')
+        {
+            return Err(format!("invalid scoped package name '{name}'"));
+        }
+        return Ok(());
+    }
+    if trimmed.contains('/') || trimmed == "." || trimmed == ".." || trimmed.starts_with('.') {
+        return Err(format!("invalid package name '{name}'"));
+    }
+    Ok(())
+}
+
+/// Split `name[@constraint]`, supporting scoped names like `@org/pkg@^1.2.0`.
+pub(crate) fn parse_pkg_spec(spec: &str) -> Result<(&str, Option<&str>), String> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return Err("package name cannot be empty".into());
+    }
+    if let Some(rest) = s.strip_prefix('@') {
+        if let Some(slash) = rest.find('/') {
+            let after_slash = &rest[slash + 1..];
+            if after_slash.is_empty() {
+                return Err(format!("invalid scoped package spec '{s}'"));
+            }
+            if let Some(at_rel) = after_slash.find('@') {
+                let split_idx = 1 + slash + 1 + at_rel;
+                let (name, ver) = s.split_at(split_idx);
+                let constraint = ver.trim_start_matches('@').trim();
+                return Ok((
+                    name,
+                    if constraint.is_empty() {
+                        None
+                    } else {
+                        Some(constraint)
+                    },
+                ));
+            }
+            return Ok((s, None));
+        }
+        return Err(format!("scoped package must be '@scope/name', got '{s}'"));
+    }
+    Ok(match s.split_once('@') {
+        Some((n, c)) => {
+            let c = c.trim();
+            (n.trim(), if c.is_empty() { None } else { Some(c) })
+        }
+        None => (s, None),
+    })
+}
+
+/// Resolve `vendor/<name>` safely, mapping `@org/pkg` to `vendor/@org/pkg`.
+pub(crate) fn vendor_pkg_dir(root: &Path, name: &str) -> PathBuf {
+    let mut dir = root.join("vendor");
+    for seg in name.split('/').filter(|s| !s.is_empty()) {
+        dir = dir.join(seg);
+    }
+    dir
+}
+
+/// Current host OS + architecture key used for platform-specific native plugins.
+pub(crate) fn current_platform_key() -> String {
+    format!("{}-{}", env::consts::OS, env::consts::ARCH)
+}
+
+/// Select a single native plugin descriptor for the current platform from `veyra.json` / index metadata.
+///
+/// Accepts either legacy flat objects (`{"library": "...", "source": "..."}`)
+/// or per-platform tables (`{"windows-x86_64": {...}, "linux-x86_64": {...}}`).
+pub(crate) fn select_native_spec(native_val: &JsonValue) -> Option<JsonValue> {
+    let obj = native_val.as_object()?;
+    if obj.contains_key("library")
+        || obj.contains_key("source")
+        || obj.contains_key("url")
+        || obj.contains_key("artifact")
+        || obj.contains_key("crate_type")
+    {
+        return Some(native_val.clone());
+    }
+    let table = obj
+        .get("targets")
+        .and_then(JsonValue::as_object)
+        .unwrap_or(obj);
+    let full = current_platform_key();
+    table
+        .get(&full)
+        .or_else(|| table.get(env::consts::OS))
+        .or_else(|| table.get("default"))
+        .filter(|v| v.is_object())
+        .cloned()
+}
+
+/// Find the nearest ancestor `veyra.json` directory that declares a `"workspaces"` array.
+pub(crate) fn workspace_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+    loop {
+        let manifest_path = cur.join("veyra.json");
+        if manifest_path.is_file() {
+            if let Ok(txt) = fs::read_to_string(&manifest_path) {
+                if let Ok(json) = serde_json::from_str::<JsonValue>(&txt) {
+                    if json
+                        .get("workspaces")
+                        .and_then(JsonValue::as_array)
+                        .is_some()
+                    {
+                        return Some(cur);
+                    }
+                }
+            }
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// Expand workspace globs (`packages/*` or explicit directories) under `root`.
+pub(crate) fn resolve_workspace_members(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(txt) = fs::read_to_string(root.join("veyra.json")) else {
+        return out;
+    };
+    let Ok(manifest) = serde_json::from_str::<JsonValue>(&txt) else {
+        return out;
+    };
+    let Some(patterns) = manifest.get("workspaces").and_then(JsonValue::as_array) else {
+        return out;
+    };
+    let mut seen = HashSet::new();
+    for pat in patterns {
+        let Some(raw) = pat.as_str() else {
+            continue;
+        };
+        let norm = raw.trim().replace('\\', "/");
+        if let Some(prefix) = norm.strip_suffix("/*") {
+            let Ok(parent_rel) = safe_package_relative_path(prefix) else {
+                continue;
+            };
+            let parent = root.join(parent_rel);
+            if let Ok(entries) = fs::read_dir(parent) {
+                for ent in entries.flatten() {
+                    let p = ent.path();
+                    if p.is_dir() && p.join("veyra.json").is_file() && seen.insert(p.clone()) {
+                        out.push(p);
+                    } else if p.is_dir()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.starts_with('@'))
+                            .unwrap_or(false)
+                    {
+                        if let Ok(scoped) = fs::read_dir(&p) {
+                            for sub in scoped.flatten() {
+                                let sp = sub.path();
+                                if sp.is_dir()
+                                    && sp.join("veyra.json").is_file()
+                                    && seen.insert(sp.clone())
+                                {
+                                    out.push(sp);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Ok(rel) = safe_package_relative_path(&norm) {
+            let dir = root.join(rel);
+            if dir.is_dir() && dir.join("veyra.json").is_file() && seen.insert(dir.clone()) {
+                out.push(dir);
+            }
+        }
+    }
+    out
+}
+
+/// Locate a workspace member whose `veyra.json` `"name"` matches `name`.
+pub(crate) fn find_workspace_package(
+    project_or_file: &Path,
+    name: &str,
+) -> Option<(PathBuf, JsonValue)> {
+    let mut roots = Vec::new();
+    roots.push(project_or_file.to_path_buf());
+    if let Some(ws_root) = workspace_root(project_or_file) {
+        if ws_root != project_or_file {
+            roots.push(ws_root);
+        }
+    }
+    for ws in roots {
+        for member_dir in resolve_workspace_members(&ws) {
+            if let Ok(txt) = fs::read_to_string(member_dir.join("veyra.json")) {
+                if let Ok(m) = serde_json::from_str::<JsonValue>(&txt) {
+                    if m.get("name").and_then(JsonValue::as_str) == Some(name) {
+                        return Some((member_dir, m));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn copy_package_tree(src: &Path, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(
+            name_str.as_ref(),
+            "vendor" | "target" | ".git" | "veyra.lock"
+        ) {
+            continue;
+        }
+        let from = entry.path();
+        let to = dest.join(name);
+        if from.is_dir() {
+            copy_package_tree(&from, &to)?;
+        } else {
+            fs::copy(&from, &to).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn write_package_lock(root: &Path, manifest: &JsonValue) -> Result<(), String> {
     let mut locked = serde_json::Map::new();
     if let Some(packages) = manifest.get("packages").and_then(JsonValue::as_object) {
         for (name, meta) in packages {
-            let mut entry = meta.clone();
-            let pkg_dir = root.join("vendor").join(name);
+            let mut entry = if meta.is_object() {
+                meta.clone()
+            } else {
+                serde_json::json!({ "version": meta.as_str().unwrap_or("0.0.0") })
+            };
+            let vdir = vendor_pkg_dir(root, name);
+            let pkg_dir = if vdir.exists() {
+                vdir
+            } else if let Some((ws_dir, _)) = find_workspace_package(root, name) {
+                entry["workspace"] = JsonValue::Bool(true);
+                ws_dir
+            } else {
+                vdir
+            };
             let hash = hash_directory(&pkg_dir)?;
             entry["sha256"] = JsonValue::String(hash);
             if pkg_dir.join("veyra.sig.json").is_file() {
@@ -227,52 +686,181 @@ pub(crate) fn write_package_lock(root: &Path, manifest: &JsonValue) -> Result<()
     .map_err(|e| e.to_string())
 }
 
-pub(crate) fn pkg_add_inner(spec: &str, seen: &mut HashSet<String>) -> Result<(), String> {
-    let (name, constraint) = match spec.split_once('@') {
-        Some((n, c)) => (n.trim(), Some(c.trim())),
-        None => (spec.trim(), None),
-    };
-    if !seen.insert(name.to_string()) {
+fn install_platform_native_artifact(
+    pkg: &JsonValue,
+    pkg_base: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    let Some(native_val) = pkg.get("native") else {
         return Ok(());
-    }
-    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
-    let (index_path, index) = pkg_index()?;
-    let pkg = index
-        .get("packages")
-        .and_then(|x| x.get(name))
-        .ok_or(format!("package '{name}' not found in Veyra registry"))?;
-    let version = pkg
-        .get("version")
+    };
+    let Some(nat) = select_native_spec(native_val) else {
+        return Ok(());
+    };
+    let Some(raw_url) = nat
+        .get("url")
+        .or_else(|| nat.get("artifact"))
         .and_then(JsonValue::as_str)
-        .unwrap_or("0.0.0");
-    if let Some(req) = constraint {
-        if !semver_matches(version, req) {
+    else {
+        return Ok(());
+    };
+    let raw_lib = nat
+        .get("library")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("plugin");
+    let mut lib_rel = safe_package_relative_path(raw_lib)?;
+    if lib_rel.extension().is_none() {
+        lib_rel.set_extension(crate::plugin::platform_shared_ext());
+    }
+    let target = dest.join(&lib_rel);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let resolved = resolve_pkg_ref(pkg_base, raw_url);
+    let bytes = fetch_package_file(&resolved)?;
+    if let Some(expected_sha) = nat.get("sha256").and_then(JsonValue::as_str) {
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let actual = format!("{:x}", h.finalize());
+        if actual != expected_sha {
             return Err(format!(
-                "package '{name}' version {version} does not match requested constraint '{req}'"
+                "native artifact sha256 mismatch for '{}': expected {expected_sha}, got {actual}",
+                target.display()
             ));
         }
     }
-    let entry = pkg
-        .get("entry")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("main.vy");
-    if let Some(dependencies) = pkg.get("dependencies").and_then(JsonValue::as_array) {
-        for dependency in dependencies {
-            let dependency = dependency
-                .as_str()
-                .ok_or("package dependency names must be Strings")?;
-            pkg_add_inner(dependency, seen)?;
-        }
+    fs::write(&target, bytes).map_err(|e| e.to_string())?;
+    let pkg_manifest_path = dest.join("veyra.json");
+    if !pkg_manifest_path.is_file() {
+        let synth = serde_json::json!({
+            "name": pkg.get("name").and_then(JsonValue::as_str).unwrap_or("native"),
+            "version": pkg.get("version").and_then(JsonValue::as_str).unwrap_or("0.1.0"),
+            "entry": pkg.get("entry").and_then(JsonValue::as_str).unwrap_or("main.vy"),
+            "native": native_val
+        });
+        fs::write(
+            &pkg_manifest_path,
+            serde_json::to_string_pretty(&synth).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
     }
-    let dest = root.join("vendor").join(name);
-    if dest.exists() {
-        fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
-    }
+    Ok(())
+}
 
-    if let Some(files) = pkg.get("files").and_then(JsonValue::as_object) {
-        fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-        #[cfg(feature = "native-services")]
+pub(crate) fn pkg_add_inner_at(
+    root: &Path,
+    spec: &str,
+    seen: &mut HashSet<String>,
+) -> Result<(), String> {
+    let (name, constraint) = parse_pkg_spec(spec)?;
+    validate_package_name(name)?;
+    if !seen.insert(name.to_string()) {
+        return Ok(());
+    }
+    let dest = vendor_pkg_dir(root, name);
+
+    let (version, entry, from_workspace) = if let Some((ws_dir, ws_manifest)) =
+        find_workspace_package(root, name)
+    {
+        let version = ws_manifest
+            .get("version")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("0.1.0")
+            .to_string();
+        if let Some(req) = constraint {
+            if !semver_matches(&version, req) {
+                return Err(format!(
+                    "workspace package '{name}' version {version} does not match constraint '{req}'"
+                ));
+            }
+        }
+        let entry = ws_manifest
+            .get("entry")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("src/main.vy")
+            .to_string();
+        if let Some(deps) = ws_manifest
+            .get("dependencies")
+            .and_then(JsonValue::as_array)
         {
+            for dep in deps {
+                let dep_spec = dep
+                    .as_str()
+                    .ok_or("package dependency names must be Strings")?;
+                pkg_add_inner_at(root, dep_spec, seen)?;
+            }
+        }
+        if let Some(pkgs) = ws_manifest.get("packages").and_then(JsonValue::as_object) {
+            for (dep_name, dep_meta) in pkgs {
+                let spec_str = match dep_meta.get("version").and_then(JsonValue::as_str) {
+                    Some(v) => format!("{dep_name}@{v}"),
+                    None => match dep_meta.as_str() {
+                        Some(v) => format!("{dep_name}@{v}"),
+                        None => dep_name.clone(),
+                    },
+                };
+                pkg_add_inner_at(root, &spec_str, seen)?;
+            }
+        }
+        if dest.exists() {
+            fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+        }
+        copy_package_tree(&ws_dir, &dest)?;
+        (version, entry, true)
+    } else {
+        let (index_path, index) = pkg_index()?;
+        let pkg = index
+            .get("packages")
+            .and_then(|x| x.get(name))
+            .ok_or(format!("package '{name}' not found in Veyra registry"))?;
+        let version = pkg
+            .get("version")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("0.0.0")
+            .to_string();
+        if let Some(req) = constraint {
+            if !semver_matches(&version, req) {
+                return Err(format!(
+                    "package '{name}' version {version} does not match requested constraint '{req}'"
+                ));
+            }
+        }
+        let entry = pkg
+            .get("entry")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("main.vy")
+            .to_string();
+        if let Some(dependencies) = pkg.get("dependencies").and_then(JsonValue::as_array) {
+            for dependency in dependencies {
+                let dependency = dependency
+                    .as_str()
+                    .ok_or("package dependency names must be Strings")?;
+                pkg_add_inner_at(root, dependency, seen)?;
+            }
+        }
+        let pkg_base = pkg
+            .get("_registry_base")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                index_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .to_string_lossy()
+                    .into_owned()
+            });
+        let pkg_index_parent = pkg
+            .get("_registry_index")
+            .and_then(JsonValue::as_str)
+            .and_then(|p| Path::new(p).parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| index_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+
+        if dest.exists() {
+            fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+        }
+
+        if let Some(files) = pkg.get("files").and_then(JsonValue::as_object) {
+            fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
             for (relative, url) in files {
                 let relative = safe_package_relative_path(relative)?;
                 let url = url
@@ -282,75 +870,48 @@ pub(crate) fn pkg_add_inner(spec: &str, seen: &mut HashSet<String>) -> Result<()
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                fs::write(&target, fetch_package_file(url)?).map_err(|e| e.to_string())?;
+                let resolved = resolve_pkg_ref(&pkg_base, url);
+                fs::write(&target, fetch_package_file(&resolved)?).map_err(|e| e.to_string())?;
             }
-        }
-        #[cfg(not(feature = "native-services"))]
-        {
-            let _ = files;
-            return Err("remote package files require the native-services feature".into());
-        }
-    } else if let Some(bundle_rel) = pkg.get("bundle_path").and_then(JsonValue::as_str) {
-        #[cfg(feature = "native-services")]
-        {
-            let bundle_url =
-                if bundle_rel.starts_with("http://") || bundle_rel.starts_with("https://") {
-                    bundle_rel.to_string()
-                } else {
-                    let base = env::var("VEYRA_REGISTRY_URL")
-                        .map_err(|_| "bundle_path requires VEYRA_REGISTRY_URL".to_string())?;
-                    format!(
-                        "{}/{}",
-                        base.trim_end_matches('/'),
-                        bundle_rel.trim_start_matches('/')
-                    )
-                };
+        } else if let Some(bundle_rel) = pkg.get("bundle_path").and_then(JsonValue::as_str) {
+            let bundle_url = resolve_pkg_ref(&pkg_base, bundle_rel);
             let bytes = fetch_package_file(&bundle_url)?;
             let bundle: JsonValue = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
             unpack_bundle_to_dir(&bundle, &dest)?;
+        } else if let Some(url) = pkg.get("url").and_then(JsonValue::as_str) {
+            fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+            let relative = safe_package_relative_path(&entry)?;
+            let target = dest.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let resolved = resolve_pkg_ref(&pkg_base, url);
+            fs::write(&target, fetch_package_file(&resolved)?).map_err(|e| e.to_string())?;
+        } else {
+            let source = pkg
+                .get("source")
+                .and_then(JsonValue::as_str)
+                .ok_or("registry package requires source, url, or files")?;
+            let source_path = pkg_index_parent.join(source);
+            copy_dir_all(&source_path, &dest)?;
         }
-        #[cfg(not(feature = "native-services"))]
-        {
-            let _ = bundle_rel;
-            return Err("remote bundle download requires the native-services feature".into());
+
+        if let Some(expected_sha) = pkg.get("sha256").and_then(JsonValue::as_str) {
+            let content_sha = hash_directory_excluding_sig(&dest)?;
+            let full_sha = hash_directory(&dest)?;
+            if content_sha != expected_sha && full_sha != expected_sha {
+                let _ = fs::remove_dir_all(&dest);
+                return Err(format!(
+                    "package '{name}' failed registry sha256 verification (expected {expected_sha}, got {content_sha})"
+                ));
+            }
         }
-    } else if let Some(url) = pkg.get("url").and_then(JsonValue::as_str) {
-        fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-        let relative = safe_package_relative_path(entry)?;
-        let target = dest.join(relative);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        install_platform_native_artifact(pkg, &pkg_base, &dest)?;
+        if dest.join("veyra.sig.json").is_file() {
+            let _ = verify_package_dir_sig(&dest)?;
         }
-        #[cfg(feature = "native-services")]
-        {
-            fs::write(&target, fetch_package_file(url)?).map_err(|e| e.to_string())?;
-        }
-        #[cfg(not(feature = "native-services"))]
-        {
-            let _ = url;
-            return Err("remote package download requires the native-services feature".into());
-        }
-    } else {
-        let source = pkg
-            .get("source")
-            .and_then(JsonValue::as_str)
-            .ok_or("registry package requires source, url, or files")?;
-        let source_path = index_path.parent().unwrap_or(Path::new(".")).join(source);
-        copy_dir_all(&source_path, &dest)?;
-    }
-    if let Some(expected_sha) = pkg.get("sha256").and_then(JsonValue::as_str) {
-        let content_sha = hash_directory_excluding_sig(&dest)?;
-        let full_sha = hash_directory(&dest)?;
-        if content_sha != expected_sha && full_sha != expected_sha {
-            let _ = fs::remove_dir_all(&dest);
-            return Err(format!(
-                "package '{name}' failed registry sha256 verification (expected {expected_sha}, got {content_sha})"
-            ));
-        }
-    }
-    if dest.join("veyra.sig.json").is_file() {
-        let _ = verify_package_dir_sig(&dest)?;
-    }
+        (version, entry, false)
+    };
 
     let manifest_path = root.join("veyra.json");
     let mut manifest: JsonValue =
@@ -363,15 +924,24 @@ pub(crate) fn pkg_add_inner(spec: &str, seen: &mut HashSet<String>) -> Result<()
     {
         manifest["packages"] = JsonValue::Object(serde_json::Map::new());
     }
-    manifest["packages"][name] = serde_json::json!({"version":version,"entry":entry});
+    let mut pkg_meta = serde_json::json!({"version": version, "entry": entry});
+    if from_workspace {
+        pkg_meta["workspace"] = JsonValue::Bool(true);
+    }
+    manifest["packages"][name] = pkg_meta;
     fs::write(
         &manifest_path,
         serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    write_package_lock(&root, &manifest)?;
+    write_package_lock(root, &manifest)?;
     println!("Added {name} {version} -> vendor/{name}/{entry}");
     Ok(())
+}
+
+pub(crate) fn pkg_add_inner(spec: &str, seen: &mut HashSet<String>) -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    pkg_add_inner_at(&root, spec, seen)
 }
 
 pub(crate) fn pkg_add(name: &str) -> Result<(), String> {
@@ -379,10 +949,21 @@ pub(crate) fn pkg_add(name: &str) -> Result<(), String> {
 }
 
 pub(crate) fn pkg_remove(name: &str) -> Result<(), String> {
+    validate_package_name(name)?;
     let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
-    let dest = root.join("vendor").join(name);
+    let dest = vendor_pkg_dir(&root, name);
     if dest.exists() {
         fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+        if name.starts_with('@') {
+            if let Some(scope_dir) = dest.parent() {
+                if fs::read_dir(scope_dir)
+                    .map(|mut it| it.next().is_none())
+                    .unwrap_or(false)
+                {
+                    let _ = fs::remove_dir(scope_dir);
+                }
+            }
+        }
     }
     let manifest_path = root.join("veyra.json");
     let mut manifest: JsonValue =
@@ -419,19 +1000,32 @@ pub(crate) fn pkg_list() -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn pkg_install() -> Result<(), String> {
-    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+fn install_project_packages(project_dir: &Path) -> Result<(), String> {
     let manifest: JsonValue = serde_json::from_str(
-        &fs::read_to_string(root.join("veyra.json")).map_err(|e| e.to_string())?,
+        &fs::read_to_string(project_dir.join("veyra.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let names: Vec<String> = manifest
-        .get("packages")
-        .and_then(JsonValue::as_object)
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
-    for name in names {
-        pkg_add(&name)?;
+    let mut seen = HashSet::new();
+    if let Some(pkgs) = manifest.get("packages").and_then(JsonValue::as_object) {
+        let specs: Vec<String> = pkgs
+            .iter()
+            .map(|(name, meta)| match meta.as_str() {
+                Some(ver) => format!("{name}@{ver}"),
+                None => name.clone(),
+            })
+            .collect();
+        for spec in specs {
+            pkg_add_inner_at(project_dir, &spec, &mut seen)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn pkg_install() -> Result<(), String> {
+    let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
+    install_project_packages(&root)?;
+    for member_dir in resolve_workspace_members(&root) {
+        install_project_packages(&member_dir)?;
     }
     println!("Veyra packages restored");
     Ok(())
@@ -587,7 +1181,7 @@ pub(crate) fn pkg_audit() -> Result<(), String> {
             .get("sha256")
             .and_then(JsonValue::as_str)
             .ok_or(format!("package {name} has no sha256"))?;
-        let pkg_dir = root.join("vendor").join(name);
+        let pkg_dir = vendor_pkg_dir(&root, name);
         let actual = hash_directory(&pkg_dir)?;
         if actual != expected {
             return Err(format!("package integrity mismatch: {name}"));
@@ -860,8 +1454,9 @@ pub(crate) fn pkg_verify(target: Option<&str>) -> Result<(), String> {
             println!("Verified package directory {}", p.display());
             return Ok(());
         }
+        validate_package_name(t)?;
         let root = project_root(&env::current_dir().map_err(|e| e.to_string())?)?;
-        let pkg_dir = root.join("vendor").join(t);
+        let pkg_dir = vendor_pkg_dir(&root, t);
         if !pkg_dir.is_dir() {
             return Err(format!("installed package or path '{t}' not found"));
         }
@@ -949,7 +1544,7 @@ pub(crate) fn pkg_tree() -> Result<(), String> {
         seen: &mut HashSet<String>,
     ) {
         let branch = if last { "`-- " } else { "|-- " };
-        let pkg_dir = root.join("vendor").join(name);
+        let pkg_dir = vendor_pkg_dir(root, name);
         let ver = index
             .get("packages")
             .and_then(|p| p.get(name))
@@ -1206,9 +1801,15 @@ pub(crate) fn pkg_build_plugin(dir: Option<&Path>) -> Result<(), String> {
         &fs::read_to_string(target.join("veyra.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let native = manifest
+    let native_root = manifest
         .get("native")
         .ok_or("veyra.json has no 'native' plugin configuration")?;
+    let native = select_native_spec(native_root).ok_or_else(|| {
+        format!(
+            "no 'native' plugin config for platform '{}'",
+            current_platform_key()
+        )
+    })?;
     let src_rel = native
         .get("source")
         .and_then(JsonValue::as_str)
@@ -1217,12 +1818,168 @@ pub(crate) fn pkg_build_plugin(dir: Option<&Path>) -> Result<(), String> {
         .get("library")
         .and_then(JsonValue::as_str)
         .unwrap_or("plugin");
-    let mut out_path = target.join(raw_lib);
+    let mut out_path = target.join(safe_package_relative_path(raw_lib)?);
     if out_path.extension().is_none() {
         out_path.set_extension(crate::plugin::platform_shared_ext());
     }
-    let src_path = target.join(src_rel);
+    let src_path = target.join(safe_package_relative_path(src_rel)?);
     let built = crate::plugin::build_rust_plugin(&src_path, &out_path)?;
     println!("Built Veyra native plugin: {}", built.display());
+    Ok(())
+}
+
+/// Generate a sovereign Veyra bridge package wrapping a Python/PyPI module via CPython C-API.
+pub(crate) fn pkg_py_bridge(
+    pypi_name: &str,
+    out_dir: Option<&Path>,
+    pip_install: bool,
+) -> Result<(), String> {
+    let mod_name = pypi_name.trim();
+    if mod_name.is_empty()
+        || mod_name.starts_with('.')
+        || !mod_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(format!("invalid Python/PyPI package name '{pypi_name}'"));
+    }
+    if pip_install {
+        let mut installed = false;
+        let mut last_err = String::new();
+        for py in ["python", "python3", "py"] {
+            match std::process::Command::new(py)
+                .args(["-m", "pip", "install", mod_name])
+                .status()
+            {
+                Ok(st) if st.success() => {
+                    installed = true;
+                    break;
+                }
+                Ok(st) => last_err = format!("{py} -m pip install exited with {st}"),
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        if !installed {
+            return Err(format!("failed to pip install '{mod_name}': {last_err}"));
+        }
+    }
+
+    let import_name = mod_name.replace('-', "_");
+    let sanitized: String = mod_name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let vy_name = format!("py_{sanitized}");
+    let entry_file = format!("{vy_name}.vy");
+
+    let cwd = env::current_dir().map_err(|e| e.to_string())?;
+    let active_project = project_root(&cwd).ok();
+    let (dest, register_root) = match out_dir {
+        Some(dir) => (dir.to_path_buf(), None),
+        None => match active_project {
+            Some(ref root) => (vendor_pkg_dir(root, &vy_name), Some(root.clone())),
+            None => (cwd.join(&vy_name), None),
+        },
+    };
+    fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+
+    let manifest = serde_json::json!({
+        "name": vy_name,
+        "version": "0.1.0",
+        "entry": entry_file,
+        "description": format!("Veyra CPython C-API bridge wrapper for Python module '{mod_name}'"),
+        "python_package": mod_name,
+        "python_module": import_name,
+        "packages": {}
+    });
+    fs::write(
+        dest.join("veyra.json"),
+        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let vy_source = format!(
+        r#"// Auto-generated by `veyra pkg py-bridge {mod_name}`
+
+fn available() -> Bool {{
+    return py_available();
+}}
+
+fn module() -> Any {{
+    return py_import("{import_name}");
+}}
+
+fn get_attr(attr: String) -> Any {{
+    return py_get(py_import("{import_name}"), attr);
+}}
+
+fn set_attr(attr: String, value: Any) -> Any {{
+    return py_set(py_import("{import_name}"), attr, value);
+}}
+
+fn call(func_name: String, args: List) -> Any {{
+    let m = py_import("{import_name}");
+    let target = py_get(m, func_name);
+    return py_call(target, args);
+}}
+
+fn call_kw(func_name: String, args: List, kwargs: Map) -> Any {{
+    let m = py_import("{import_name}");
+    let target = py_get(m, func_name);
+    return py_call(target, args, kwargs);
+}}
+
+fn to_tensor(handle: Any) -> Any {{
+    return py_to_tensor(handle);
+}}
+
+fn exports() -> List {{
+    return py_dir(py_import("{import_name}"));
+}}
+
+fn info() -> Map {{
+    return {{
+        "bridge": "cpython-c-api",
+        "python_package": "{mod_name}",
+        "python_module": "{import_name}",
+        "available": py_available(),
+        "runtime": py_info()
+    }};
+}}
+"#
+    );
+    fs::write(dest.join(&entry_file), vy_source).map_err(|e| e.to_string())?;
+
+    if let Some(root) = register_root {
+        let proj_manifest_path = root.join("veyra.json");
+        let mut proj_manifest: JsonValue = serde_json::from_str(
+            &fs::read_to_string(&proj_manifest_path).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if !proj_manifest
+            .get("packages")
+            .map(JsonValue::is_object)
+            .unwrap_or(false)
+        {
+            proj_manifest["packages"] = JsonValue::Object(serde_json::Map::new());
+        }
+        proj_manifest["packages"][&vy_name] = serde_json::json!({
+            "version": "0.1.0",
+            "entry": entry_file,
+            "python_package": mod_name
+        });
+        fs::write(
+            &proj_manifest_path,
+            serde_json::to_string_pretty(&proj_manifest).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        write_package_lock(&root, &proj_manifest)?;
+    }
+
+    println!(
+        "Generated Python C-API bridge '{vy_name}' for '{mod_name}' -> {}",
+        dest.display()
+    );
     Ok(())
 }

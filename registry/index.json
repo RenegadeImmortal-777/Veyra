@@ -338,8 +338,38 @@
                      "vydecimal":  {
                                        "source":  "../packages/vydecimal",
                                        "entry":  "vydecimal.vy",
+                                       "version":  "0.2.0"
+                                   },
+                     "vycomplex":  {
+                                       "source":  "../packages/vycomplex",
+                                       "entry":  "vycomplex.vy",
                                        "version":  "0.1.0"
-                                   }
+                                   },
+                     "vyitertools":  {
+                                         "source":  "../packages/vyitertools",
+                                         "entry":  "vyitertools.vy",
+                                         "version":  "0.1.0"
+                                     },
+                     "vyfunctools":  {
+                                         "source":  "../packages/vyfunctools",
+                                         "entry":  "vyfunctools.vy",
+                                         "version":  "0.1.0"
+                                     },
+                     "vytyping":  {
+                                      "source":  "../packages/vytyping",
+                                      "entry":  "vytyping.vy",
+                                      "version":  "0.1.0"
+                                  },
+                     "vygraph":  {
+                                     "source":  "../packages/vygraph",
+                                     "entry":  "vygraph.vy",
+                                     "version":  "0.1.0"
+                                 },
+                     "vysemver":  {
+                                      "source":  "../packages/vysemver",
+                                      "entry":  "vysemver.vy",
+                                      "version":  "0.1.0"
+                                  }
                  },
     "registry_version":  1
 }

@@ -52,6 +52,9 @@ pub(crate) fn namespace_module_ops(code: &mut [Op], local_names: &HashSet<String
                     namespace_module_ops(nested, local_names, prefix);
                 }
             }
+            Op::BuildClass(_, _, body) => {
+                namespace_module_ops(body, local_names, prefix);
+            }
             _ => {}
         }
     }

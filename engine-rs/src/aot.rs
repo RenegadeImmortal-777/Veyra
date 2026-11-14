@@ -10,7 +10,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::ast::{CallArg, Expr, Stmt};
+use crate::ast::{CallArg, Expr, Pattern, SeqElem, Stmt};
 use crate::lexer::lex_with_lines;
 use crate::parser::Parser;
 use crate::pipeline::{load_source, semantic_check_ast};
@@ -101,7 +101,7 @@ fn stmts_have_yield(stmts: &[Stmt]) -> bool {
                 }
             }
             Stmt::Match(_, arms) => {
-                for (_, b) in arms {
+                for (_, _, b) in arms {
                     if stmts_have_yield(b) {
                         return true;
                     }
@@ -117,6 +117,173 @@ fn validate_call_arg(arg: &CallArg) -> Result<(), String> {
     match arg {
         CallArg::Pos(e) | CallArg::Star(e) | CallArg::Kw(_, e) | CallArg::KwStar(e) => {
             validate_aot_expr(e)
+        }
+    }
+}
+
+fn validate_aot_pattern(pat: &Pattern) -> Result<(), String> {
+    match pat {
+        Pattern::Wildcard | Pattern::Capture(_) => Ok(()),
+        Pattern::Literal(e) => validate_aot_expr(e),
+        Pattern::Or(alts) => {
+            for a in alts {
+                validate_aot_pattern(a)?;
+            }
+            Ok(())
+        }
+        Pattern::As(inner, _) => validate_aot_pattern(inner),
+        Pattern::Seq(elems) => {
+            for el in elems {
+                if let SeqElem::Pat(p) = el {
+                    validate_aot_pattern(p)?;
+                }
+            }
+            Ok(())
+        }
+        Pattern::Map { entries, .. } => {
+            for (k, v) in entries {
+                validate_aot_expr(k)?;
+                validate_aot_pattern(v)?;
+            }
+            Ok(())
+        }
+        Pattern::Class { cls, pos, kw } => {
+            validate_aot_expr(cls)?;
+            for p in pos {
+                validate_aot_pattern(p)?;
+            }
+            for (_, p) in kw {
+                validate_aot_pattern(p)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn collect_pattern_bound_names(pat: &Pattern, out: &mut BTreeSet<String>) {
+    match pat {
+        Pattern::Wildcard | Pattern::Literal(_) => {}
+        Pattern::Capture(name) => {
+            out.insert(name.clone());
+        }
+        Pattern::Or(alts) => {
+            for a in alts {
+                collect_pattern_bound_names(a, out);
+            }
+        }
+        Pattern::As(inner, name) => {
+            collect_pattern_bound_names(inner, out);
+            out.insert(name.clone());
+        }
+        Pattern::Seq(elems) => {
+            for el in elems {
+                match el {
+                    SeqElem::Pat(p) => collect_pattern_bound_names(p, out),
+                    SeqElem::Star(Some(name)) => {
+                        out.insert(name.clone());
+                    }
+                    SeqElem::Star(None) => {}
+                }
+            }
+        }
+        Pattern::Map { entries, rest } => {
+            for (_, p) in entries {
+                collect_pattern_bound_names(p, out);
+            }
+            if let Some(r) = rest {
+                out.insert(r.clone());
+            }
+        }
+        Pattern::Class { pos, kw, .. } => {
+            for p in pos {
+                collect_pattern_bound_names(p, out);
+            }
+            for (_, p) in kw {
+                collect_pattern_bound_names(p, out);
+            }
+        }
+    }
+}
+
+fn collect_all_ids_pattern(pat: &Pattern, out: &mut BTreeSet<String>) {
+    match pat {
+        Pattern::Wildcard => {}
+        Pattern::Capture(name) => {
+            out.insert(name.clone());
+        }
+        Pattern::Literal(e) => collect_all_ids_expr(e, out),
+        Pattern::Or(alts) => {
+            for a in alts {
+                collect_all_ids_pattern(a, out);
+            }
+        }
+        Pattern::As(inner, name) => {
+            collect_all_ids_pattern(inner, out);
+            out.insert(name.clone());
+        }
+        Pattern::Seq(elems) => {
+            for el in elems {
+                match el {
+                    SeqElem::Pat(p) => collect_all_ids_pattern(p, out),
+                    SeqElem::Star(Some(name)) => {
+                        out.insert(name.clone());
+                    }
+                    SeqElem::Star(None) => {}
+                }
+            }
+        }
+        Pattern::Map { entries, rest } => {
+            for (k, v) in entries {
+                collect_all_ids_expr(k, out);
+                collect_all_ids_pattern(v, out);
+            }
+            if let Some(r) = rest {
+                out.insert(r.clone());
+            }
+        }
+        Pattern::Class { cls, pos, kw } => {
+            collect_all_ids_expr(cls, out);
+            for p in pos {
+                collect_all_ids_pattern(p, out);
+            }
+            for (_, p) in kw {
+                collect_all_ids_pattern(p, out);
+            }
+        }
+    }
+}
+
+fn collect_nested_refs_pattern(pat: &Pattern, out: &mut BTreeSet<String>) {
+    match pat {
+        Pattern::Wildcard | Pattern::Capture(_) => {}
+        Pattern::Literal(e) => collect_nested_refs_expr(e, out),
+        Pattern::Or(alts) => {
+            for a in alts {
+                collect_nested_refs_pattern(a, out);
+            }
+        }
+        Pattern::As(inner, _) => collect_nested_refs_pattern(inner, out),
+        Pattern::Seq(elems) => {
+            for el in elems {
+                if let SeqElem::Pat(p) = el {
+                    collect_nested_refs_pattern(p, out);
+                }
+            }
+        }
+        Pattern::Map { entries, .. } => {
+            for (k, v) in entries {
+                collect_nested_refs_expr(k, out);
+                collect_nested_refs_pattern(v, out);
+            }
+        }
+        Pattern::Class { cls, pos, kw } => {
+            collect_nested_refs_expr(cls, out);
+            for p in pos {
+                collect_nested_refs_pattern(p, out);
+            }
+            for (_, p) in kw {
+                collect_nested_refs_pattern(p, out);
+            }
         }
     }
 }
@@ -149,19 +316,35 @@ fn validate_aot_support(stmts: &[Stmt]) -> Result<(), String> {
             }
             Stmt::Match(subj, arms) => {
                 validate_aot_expr(subj)?;
-                for (p, b) in arms {
-                    if let Some(pe) = p {
-                        validate_aot_expr(pe)?;
+                for (p, g, b) in arms {
+                    validate_aot_pattern(p)?;
+                    if let Some(ge) = g {
+                        validate_aot_expr(ge)?;
                     }
                     validate_aot_support(b)?;
                 }
             }
-            Stmt::Fn(_, _, _, body)
-            | Stmt::AsyncFn(_, _, _, body)
-            | Stmt::DecoratedFn(_, _, _, _, body) => {
+            Stmt::Fn(_, _, _, body) | Stmt::AsyncFn(_, _, _, body) => {
                 validate_aot_support(body)?;
             }
-            Stmt::Class(_, _, methods) => validate_aot_support(methods)?,
+            Stmt::DecoratedFn(decs, _, _, _, body) => {
+                for d in decs {
+                    validate_aot_expr(d)?;
+                }
+                validate_aot_support(body)?;
+            }
+            Stmt::Class(_, bases, meta, decs, body) => {
+                for b in bases {
+                    validate_aot_expr(b)?;
+                }
+                if let Some(m) = meta {
+                    validate_aot_expr(m)?;
+                }
+                for d in decs {
+                    validate_aot_expr(d)?;
+                }
+                validate_aot_support(body)?;
+            }
             Stmt::Let(_, _, e, _) | Stmt::Assign(_, e) | Stmt::Expr(e) | Stmt::Throw(e) => {
                 validate_aot_expr(e)?;
             }
@@ -298,13 +481,17 @@ fn collect_scope_decls(
                 collect_scope_decls(b, is_top, decls, explicit_decls, strict, enclosing)
             }
             Stmt::Match(_, arms) => {
-                for (_, b) in arms {
+                for (p, _, b) in arms {
+                    if !is_top {
+                        collect_pattern_bound_names(p, decls);
+                    }
                     collect_scope_decls(b, is_top, decls, explicit_decls, strict, enclosing);
                 }
             }
             Stmt::Fn(name, _, _, _)
             | Stmt::AsyncFn(name, _, _, _)
-            | Stmt::DecoratedFn(_, name, _, _, _) => {
+            | Stmt::DecoratedFn(_, name, _, _, _)
+            | Stmt::Class(name, _, _, _, _) => {
                 if !is_top {
                     decls.insert(name.clone());
                     explicit_decls.insert(name.clone());
@@ -434,13 +621,30 @@ fn collect_all_ids_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
                 collect_all_ids_stmts(c, out);
                 collect_all_ids_stmts(f, out);
             }
-            Stmt::Fn(n, _, _, body)
-            | Stmt::AsyncFn(n, _, _, body)
-            | Stmt::DecoratedFn(_, n, _, _, body) => {
+            Stmt::Fn(n, _, _, body) | Stmt::AsyncFn(n, _, _, body) => {
                 out.insert(n.clone());
                 collect_all_ids_stmts(body, out);
             }
-            Stmt::Class(_, _, methods) => collect_all_ids_stmts(methods, out),
+            Stmt::DecoratedFn(decs, n, _, _, body) => {
+                out.insert(n.clone());
+                for d in decs {
+                    collect_all_ids_expr(d, out);
+                }
+                collect_all_ids_stmts(body, out);
+            }
+            Stmt::Class(n, bases, meta, decs, body) => {
+                out.insert(n.clone());
+                for b in bases {
+                    collect_all_ids_expr(b, out);
+                }
+                if let Some(m) = meta {
+                    collect_all_ids_expr(m, out);
+                }
+                for d in decs {
+                    collect_all_ids_expr(d, out);
+                }
+                collect_all_ids_stmts(body, out);
+            }
             Stmt::SetMember(a, _, b) => {
                 collect_all_ids_expr(a, out);
                 collect_all_ids_expr(b, out);
@@ -452,9 +656,10 @@ fn collect_all_ids_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             }
             Stmt::Match(e, arms) => {
                 collect_all_ids_expr(e, out);
-                for (p, b) in arms {
-                    if let Some(pe) = p {
-                        collect_all_ids_expr(pe, out);
+                for (p, g, b) in arms {
+                    collect_all_ids_pattern(p, out);
+                    if let Some(ge) = g {
+                        collect_all_ids_expr(ge, out);
                     }
                     collect_all_ids_stmts(b, out);
                 }
@@ -531,15 +736,30 @@ fn collect_nested_refs_expr(expr: &Expr, out: &mut BTreeSet<String>) {
 fn collect_nested_refs_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            Stmt::Fn(name, _, _, body) => {
+            Stmt::Fn(name, _, _, body) | Stmt::AsyncFn(name, _, _, body) => {
                 out.insert(name.clone());
                 collect_all_ids_stmts(body, out);
             }
-            Stmt::AsyncFn(name, _, _, body) | Stmt::DecoratedFn(_, name, _, _, body) => {
+            Stmt::DecoratedFn(decs, name, _, _, body) => {
                 out.insert(name.clone());
+                for d in decs {
+                    collect_all_ids_expr(d, out);
+                }
                 collect_all_ids_stmts(body, out);
             }
-            Stmt::Class(_, _, methods) => collect_all_ids_stmts(methods, out),
+            Stmt::Class(name, bases, meta, decs, body) => {
+                out.insert(name.clone());
+                for b in bases {
+                    collect_all_ids_expr(b, out);
+                }
+                if let Some(m) = meta {
+                    collect_all_ids_expr(m, out);
+                }
+                for d in decs {
+                    collect_all_ids_expr(d, out);
+                }
+                collect_all_ids_stmts(body, out);
+            }
             Stmt::Let(_, _, e, _) | Stmt::Assign(_, e) | Stmt::Expr(e) | Stmt::Throw(e) => {
                 collect_nested_refs_expr(e, out);
             }
@@ -578,9 +798,10 @@ fn collect_nested_refs_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             }
             Stmt::Match(e, arms) => {
                 collect_nested_refs_expr(e, out);
-                for (p, b) in arms {
-                    if let Some(pe) = p {
-                        collect_nested_refs_expr(pe, out);
+                for (p, g, b) in arms {
+                    collect_nested_refs_pattern(p, out);
+                    if let Some(ge) = g {
+                        collect_nested_refs_expr(ge, out);
                     }
                     collect_nested_refs_stmts(b, out);
                 }
@@ -977,6 +1198,15 @@ impl AotEmitter {
         }
         self.indent -= 1;
         self.line("}));");
+        let p_strs: Vec<String> = params
+            .iter()
+            .take_while(|(_, ty)| !matches!(ty.as_deref(), Some("*") | Some("**")))
+            .map(|(p, _)| escape_rust_str(p))
+            .collect();
+        self.line(&format!(
+            "rt.reg_fn_params(&{fn_var}, &[{}]);",
+            p_strs.join(", ")
+        ));
         Ok(fn_var)
     }
 
@@ -1516,64 +1746,92 @@ impl AotEmitter {
                     self.emit_write_var(scope, name, &fn_v, true);
                 }
             }
-            Stmt::DecoratedFn(dec, name, params, ret_ty, body) => {
-                let fn_v = self.emit_fn_body_value(params, ret_ty, body, scope, false)?;
-                let local_opt = match scope.resolve(dec) {
-                    VarKind::Plain | VarKind::Cell | VarKind::Captured => {
-                        format!("Some({})", self.emit_read_var(scope, dec))
-                    }
-                    VarKind::Global => "None".to_string(),
-                };
-                let wrapped = self.fresh_tmp("dec");
-                self.line(&format!(
-                    "let {wrapped} = rt.call_target({}, {local_opt}, vec![{fn_v}])?;",
-                    escape_rust_str(dec)
-                ));
+            Stmt::DecoratedFn(decs, name, params, ret_ty, body) => {
+                let mut dec_tmps = Vec::with_capacity(decs.len());
+                for d in decs {
+                    dec_tmps.push(self.emit_expr(d, scope)?);
+                }
+                let mut wrapped = self.emit_fn_body_value(params, ret_ty, body, scope, false)?;
+                for d_tmp in dec_tmps.iter().rev() {
+                    let nxt = self.fresh_tmp("dec");
+                    self.line(&format!(
+                        "let {nxt} = rt.call_val(&{d_tmp}, vec![{wrapped}])?;"
+                    ));
+                    wrapped = nxt;
+                }
                 if scope.is_top {
                     self.line(&format!(
-                        "if let Val::Fn(vy_fid) = {wrapped} {{ rt.named_fns.insert(String::from({}), vy_fid); }} else {{ rt.set_global({}, {wrapped}); }}",
-                        escape_rust_str(name),
+                        "rt.set_global({}, {wrapped});",
                         escape_rust_str(name)
                     ));
                 } else {
                     self.emit_write_var(scope, name, &wrapped, true);
                 }
             }
-            Stmt::Class(name, parent, methods) => {
-                let p_expr = match parent {
-                    Some(p) => format!("Some(String::from({}))", escape_rust_str(p)),
-                    None => "None".to_string(),
+            Stmt::Class(name, bases, metaclass, decorators, body) => {
+                let mut dec_tmps = Vec::with_capacity(decorators.len());
+                for d in decorators {
+                    dec_tmps.push(self.emit_expr(d, scope)?);
+                }
+                let mut base_vars = Vec::with_capacity(bases.len());
+                for b in bases {
+                    base_vars.push(self.emit_expr(b, scope)?);
+                }
+                let meta_v = match metaclass {
+                    Some(m) => self.emit_expr(m, scope)?,
+                    None => "Val::Null".to_string(),
                 };
-                let cls_tmp = self.fresh_tmp("cls_methods");
-                self.line(&format!(
-                    "let mut {cls_tmp}: HashMap<String, usize> = HashMap::new();"
-                ));
-                for item in methods {
+                let mut defined: Vec<String> = Vec::new();
+                let mut push_def = |n: &str| {
+                    if !defined.iter().any(|x| x == n) {
+                        defined.push(n.to_string());
+                    }
+                };
+                let mut ns_stmts = Vec::with_capacity(body.len() + 1);
+                for item in body {
                     match item {
-                        Stmt::SourceLine(_) => {}
-                        Stmt::Fn(method_name, params, ret_ty, body) => {
-                            let fn_v =
-                                self.emit_fn_body_value(params, ret_ty, body, scope, false)?;
-                            self.line(&format!(
-                                "if let Val::Fn(vy_mid) = {fn_v} {{ {cls_tmp}.insert(String::from({}), vy_mid); }}",
-                                escape_rust_str(method_name)
-                            ));
+                        Stmt::Let(n, ..)
+                        | Stmt::Fn(n, ..)
+                        | Stmt::AsyncFn(n, ..)
+                        | Stmt::DecoratedFn(_, n, ..)
+                        | Stmt::Class(n, ..) => {
+                            push_def(n);
+                            ns_stmts.push(item.clone());
                         }
-                        Stmt::AsyncFn(method_name, params, ret_ty, body) => {
-                            let fn_v =
-                                self.emit_fn_body_value(params, ret_ty, body, scope, true)?;
-                            self.line(&format!(
-                                "if let Val::Fn(vy_mid) = {fn_v} {{ {cls_tmp}.insert(String::from({}), vy_mid); }}",
-                                escape_rust_str(method_name)
-                            ));
+                        Stmt::Assign(n, e) => {
+                            push_def(n);
+                            ns_stmts.push(Stmt::Let(n.clone(), None, e.clone(), false));
                         }
-                        _ => {}
+                        _ => ns_stmts.push(item.clone()),
                     }
                 }
+                let map_pairs: Vec<(Expr, Expr)> = defined
+                    .iter()
+                    .map(|n| (Expr::Str(n.clone()), Expr::Var(n.clone())))
+                    .collect();
+                ns_stmts.push(Stmt::Return(Some(Expr::Map(map_pairs))));
+                let body_fn = self.emit_fn_body_value(&[], &None, &ns_stmts, scope, false)?;
+                let mut cls_val = self.fresh_tmp("cls_val");
                 self.line(&format!(
-                    "rt.define_class(String::from({}), {p_expr}, {cls_tmp})?;",
-                    escape_rust_str(name)
+                    "let {cls_val} = rt.build_class(String::from({}), vec![{}], {meta_v}, {body_fn})?;",
+                    escape_rust_str(name),
+                    base_vars.join(", ")
                 ));
+                for d_tmp in dec_tmps.iter().rev() {
+                    let nxt = self.fresh_tmp("cls_dec");
+                    self.line(&format!(
+                        "let {nxt} = rt.call_val(&{d_tmp}, vec![{cls_val}])?;"
+                    ));
+                    cls_val = nxt;
+                }
+                if scope.is_top {
+                    self.line(&format!(
+                        "rt.set_global({}, {cls_val});",
+                        escape_rust_str(name)
+                    ));
+                } else {
+                    self.emit_write_var(scope, name, &cls_val, true);
+                }
             }
             Stmt::SetMember(obj, field, expr) => {
                 let ov = self.emit_expr(obj, scope)?;
@@ -1642,19 +1900,31 @@ impl AotEmitter {
                 let lbl = self.fresh_tmp("match");
                 self.line(&format!("'{lbl}: {{"));
                 self.indent += 1;
-                for (pat_opt, body) in arms {
-                    if let Some(pat) = pat_opt {
-                        let pv = self.emit_expr(pat, scope)?;
-                        self.line(&format!("if {sv} == {pv} {{"));
-                        self.indent += 1;
-                        self.emit_stmts(body, scope)?;
-                        self.line(&format!("break '{lbl};"));
-                        self.indent -= 1;
-                        self.line("}");
-                    } else {
-                        self.emit_stmts(body, scope)?;
-                        self.line(&format!("break '{lbl};"));
+                let mut wildcard_seen = false;
+                for (pat, guard, body) in arms {
+                    if wildcard_seen {
+                        return Err("match cases after wildcard '_' are unreachable".into());
                     }
+                    if guard.is_none() && Self::pattern_is_irrefutable(pat) {
+                        wildcard_seen = true;
+                    }
+                    let arm_lbl = self.fresh_tmp("pat_arm");
+                    self.line(&format!("'{arm_lbl}: {{"));
+                    self.indent += 1;
+                    let mut bindings = Vec::new();
+                    self.emit_aot_pattern(&sv, pat, scope, &arm_lbl, &mut bindings)?;
+                    for (var_name, tmp_var) in bindings {
+                        let clone_expr = format!("{tmp_var}.clone()");
+                        self.emit_write_var(scope, &var_name, &clone_expr, true);
+                    }
+                    if let Some(g) = guard {
+                        let gv = self.emit_expr(g, scope)?;
+                        self.line(&format!("if !({gv}).truthy() {{ break '{arm_lbl}; }}"));
+                    }
+                    self.emit_stmts(body, scope)?;
+                    self.line(&format!("break '{lbl};"));
+                    self.indent -= 1;
+                    self.line("}");
                 }
                 self.indent -= 1;
                 self.line("}");
@@ -1695,6 +1965,223 @@ impl AotEmitter {
         }
         Ok(())
     }
+
+    fn pattern_is_irrefutable(pat: &Pattern) -> bool {
+        match pat {
+            Pattern::Wildcard | Pattern::Capture(_) => true,
+            Pattern::As(inner, _) => Self::pattern_is_irrefutable(inner),
+            Pattern::Or(alts) => alts.iter().any(Self::pattern_is_irrefutable),
+            _ => false,
+        }
+    }
+
+    fn collect_pattern_bound_vars_ordered(
+        pat: &Pattern,
+        out: &mut Vec<String>,
+        seen: &mut BTreeSet<String>,
+    ) {
+        match pat {
+            Pattern::Wildcard | Pattern::Literal(_) => {}
+            Pattern::Capture(name) => {
+                if seen.insert(name.clone()) {
+                    out.push(name.clone());
+                }
+            }
+            Pattern::Or(alts) => {
+                if let Some(first) = alts.first() {
+                    Self::collect_pattern_bound_vars_ordered(first, out, seen);
+                }
+            }
+            Pattern::As(inner, name) => {
+                Self::collect_pattern_bound_vars_ordered(inner, out, seen);
+                if seen.insert(name.clone()) {
+                    out.push(name.clone());
+                }
+            }
+            Pattern::Seq(elems) => {
+                for el in elems {
+                    match el {
+                        SeqElem::Pat(p) => Self::collect_pattern_bound_vars_ordered(p, out, seen),
+                        SeqElem::Star(Some(name)) => {
+                            if seen.insert(name.clone()) {
+                                out.push(name.clone());
+                            }
+                        }
+                        SeqElem::Star(None) => {}
+                    }
+                }
+            }
+            Pattern::Map { entries, rest } => {
+                for (_, p) in entries {
+                    Self::collect_pattern_bound_vars_ordered(p, out, seen);
+                }
+                if let Some(r) = rest {
+                    if seen.insert(r.clone()) {
+                        out.push(r.clone());
+                    }
+                }
+            }
+            Pattern::Class { pos, kw, .. } => {
+                for p in pos {
+                    Self::collect_pattern_bound_vars_ordered(p, out, seen);
+                }
+                for (_, p) in kw {
+                    Self::collect_pattern_bound_vars_ordered(p, out, seen);
+                }
+            }
+        }
+    }
+
+    fn emit_aot_pattern(
+        &mut self,
+        subj_var: &str,
+        pat: &Pattern,
+        scope: &ScopeInfo,
+        fail_lbl: &str,
+        bindings: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
+        match pat {
+            Pattern::Wildcard => {}
+            Pattern::Capture(name) => {
+                let tmp = self.fresh_tmp("pat_cap");
+                self.line(&format!("let {tmp} = {subj_var}.clone();"));
+                bindings.push((name.clone(), tmp));
+            }
+            Pattern::As(inner, name) => {
+                self.emit_aot_pattern(subj_var, inner, scope, fail_lbl, bindings)?;
+                let tmp = self.fresh_tmp("pat_as");
+                self.line(&format!("let {tmp} = {subj_var}.clone();"));
+                bindings.push((name.clone(), tmp));
+            }
+            Pattern::Literal(expr) => {
+                let pv = self.emit_expr(expr, scope)?;
+                self.line(&format!("if {subj_var} != {pv} {{ break '{fail_lbl}; }}"));
+            }
+            Pattern::Or(alts) => {
+                let mut bound_names = Vec::new();
+                let mut seen = BTreeSet::new();
+                Self::collect_pattern_bound_vars_ordered(pat, &mut bound_names, &mut seen);
+                let mut shared_map: HashMap<String, String> = HashMap::new();
+                for name in bound_names {
+                    let st = self.fresh_tmp("pat_or");
+                    self.line(&format!("let mut {st}: Val = Val::Null;"));
+                    shared_map.insert(name.clone(), st.clone());
+                    bindings.push((name, st));
+                }
+                let or_ok = self.fresh_tmp("pat_or_ok");
+                self.line(&format!("'{or_ok}: {{"));
+                self.indent += 1;
+                for alt in alts {
+                    let alt_lbl = self.fresh_tmp("pat_alt");
+                    self.line(&format!("'{alt_lbl}: {{"));
+                    self.indent += 1;
+                    let mut alt_binds = Vec::new();
+                    self.emit_aot_pattern(subj_var, alt, scope, &alt_lbl, &mut alt_binds)?;
+                    for (bname, btmp) in &alt_binds {
+                        if let Some(shared) = shared_map.get(bname) {
+                            self.line(&format!("{shared} = {btmp}.clone();"));
+                        }
+                    }
+                    self.line(&format!("break '{or_ok};"));
+                    self.indent -= 1;
+                    self.line("}");
+                }
+                self.line(&format!("break '{fail_lbl};"));
+                self.indent -= 1;
+                self.line("}");
+            }
+            Pattern::Seq(elems) => {
+                let star_pos = elems.iter().position(|e| matches!(e, SeqElem::Star(_)));
+                let has_star = star_pos.is_some();
+                let (before, after) = match star_pos {
+                    Some(pos) => (pos, elems.len() - pos - 1),
+                    None => (elems.len(), 0),
+                };
+                let parts_v = self.fresh_tmp("pat_seq");
+                self.line(&format!(
+                    "let Some({parts_v}) = rt.pat_seq_split(&{subj_var}, {before}, {has_star}, {after}) else {{ break '{fail_lbl}; }};"
+                ));
+                for (idx, elem) in elems.iter().enumerate() {
+                    match elem {
+                        SeqElem::Star(None) => {}
+                        SeqElem::Star(Some(name)) => {
+                            let el_v = self.fresh_tmp("pat_star");
+                            self.line(&format!("let {el_v} = {parts_v}[{idx}].clone();"));
+                            bindings.push((name.clone(), el_v));
+                        }
+                        SeqElem::Pat(sub_pat) => {
+                            if !matches!(sub_pat, Pattern::Wildcard) {
+                                let el_v = self.fresh_tmp("pat_el");
+                                self.line(&format!("let {el_v} = {parts_v}[{idx}].clone();"));
+                                self.emit_aot_pattern(&el_v, sub_pat, scope, fail_lbl, bindings)?;
+                            }
+                        }
+                    }
+                }
+            }
+            Pattern::Map { entries, rest } => {
+                self.line(&format!(
+                    "if !matches!(&{subj_var}, Val::Map(_)) {{ break '{fail_lbl}; }}"
+                ));
+                let mut excl_vars = Vec::new();
+                for (kexpr, vpat) in entries {
+                    let kv = self.emit_expr(kexpr, scope)?;
+                    let mv = self.fresh_tmp("pat_mv");
+                    if rest.is_some() {
+                        let kt = self.fresh_tmp("pat_mk");
+                        self.line(&format!("let {kt} = {kv}.clone();"));
+                        self.line(&format!(
+                            "let Some({mv}) = rt.pat_map_get(&{subj_var}, &{kt}) else {{ break '{fail_lbl}; }};"
+                        ));
+                        excl_vars.push(kt);
+                    } else {
+                        self.line(&format!(
+                            "let Some({mv}) = rt.pat_map_get(&{subj_var}, &{kv}) else {{ break '{fail_lbl}; }};"
+                        ));
+                    }
+                    if !matches!(vpat, Pattern::Wildcard) {
+                        self.emit_aot_pattern(&mv, vpat, scope, fail_lbl, bindings)?;
+                    }
+                }
+                if let Some(rname) = rest {
+                    let excl_items: Vec<String> =
+                        excl_vars.iter().map(|v| format!("{v}.clone()")).collect();
+                    let rv = self.fresh_tmp("pat_mr");
+                    self.line(&format!(
+                        "let {rv} = rt.pat_map_rest(&{subj_var}, &[{}])?;",
+                        excl_items.join(", ")
+                    ));
+                    bindings.push((rname.clone(), rv));
+                }
+            }
+            Pattern::Class { cls, pos, kw } => {
+                let cv = self.emit_expr(cls, scope)?;
+                let pv_list = self.fresh_tmp("pat_cpos");
+                self.line(&format!(
+                    "let Some({pv_list}) = rt.pat_class_pos(&{subj_var}, &{cv}, {})? else {{ break '{fail_lbl}; }};",
+                    pos.len()
+                ));
+                for (idx, sub_pat) in pos.iter().enumerate() {
+                    if !matches!(sub_pat, Pattern::Wildcard) {
+                        let pv = self.fresh_tmp("pat_cp");
+                        self.line(&format!("let {pv} = {pv_list}[{idx}].clone();"));
+                        self.emit_aot_pattern(&pv, sub_pat, scope, fail_lbl, bindings)?;
+                    }
+                }
+                for (kname, sub_pat) in kw {
+                    let kv = self.fresh_tmp("pat_ckv");
+                    self.line(&format!(
+                        "let Some({kv}) = rt.pat_class_kw(&{subj_var}, {}) else {{ break '{fail_lbl}; }};",
+                        escape_rust_str(kname)
+                    ));
+                    if !matches!(sub_pat, Pattern::Wildcard) {
+                        self.emit_aot_pattern(&kv, sub_pat, scope, fail_lbl, bindings)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn compile_source_to_rust(src: &str) -> Result<String, String> {
@@ -1705,6 +2192,9 @@ pub(crate) fn compile_source_to_rust(src: &str) -> Result<String, String> {
 
     let mut emitter = AotEmitter::new();
     emitter.out.push_str(AOT_PREAMBLE);
+    emitter.out.push_str("\nmod bigint {\n");
+    emitter.out.push_str(include_str!("bigint.rs"));
+    emitter.out.push_str("\n}\n");
     emitter.line("fn vy_main(rt: &mut Rt) -> Result<(), Flow> {");
     emitter.indent = 1;
     let empty_parent = BTreeSet::new();
@@ -1797,6 +2287,7 @@ const AOT_PREAMBLE: &str = r####"#![allow(
     unused_mut,
     unreachable_code,
     unused_imports,
+    unused_labels,
     clippy::all
 )]
 
@@ -1876,7 +2367,10 @@ struct ObjData {
 }
 
 struct ClassInfo {
-    parent: Option<String>,
+    bases: Vec<String>,
+    metaclass: Option<String>,
+    mro: Vec<String>,
+    attrs: HashMap<String, Val>,
     methods: HashMap<String, usize>,
 }
 
@@ -2143,6 +2637,46 @@ impl VyJson {
     }
 }
 
+fn aot_val_to_big_arg(v: &Val) -> bigint::BigArg {
+    match v {
+        Val::Str(s) => bigint::BigArg::Str(s.clone()),
+        Val::Num(n) => bigint::BigArg::Num(*n),
+        Val::List(xs) => bigint::BigArg::List(xs.iter().map(aot_val_to_big_arg).collect()),
+        Val::Map(pairs) => {
+            let mut re = None;
+            let mut im = 0.0;
+            for (k, val) in pairs {
+                if let (Val::Str(ks), Val::Num(x)) = (k, val) {
+                    if ks == "re" {
+                        re = Some(*x);
+                    } else if ks == "im" {
+                        im = *x;
+                    }
+                }
+            }
+            match re {
+                Some(r) => bigint::BigArg::Complex(r, im),
+                None => bigint::BigArg::Other,
+            }
+        }
+        _ => bigint::BigArg::Other,
+    }
+}
+
+fn aot_big_out_to_val(out: bigint::BigOut) -> Val {
+    match out {
+        bigint::BigOut::Str(s) => Val::Str(s),
+        bigint::BigOut::Num(n) => Val::Num(n),
+        bigint::BigOut::StrPair(q, r) => Val::List(vec![Val::Str(q), Val::Str(r)]),
+        bigint::BigOut::Complex(r, i) => Val::List(vec![Val::Num(r), Val::Num(i)]),
+        bigint::BigOut::ComplexList(zs) => Val::List(
+            zs.into_iter()
+                .map(|(r, i)| Val::List(vec![Val::Num(r), Val::Num(i)]))
+                .collect(),
+        ),
+    }
+}
+
 fn is_py_handle_id(val: &Val) -> Option<u64> {
     let Val::Map(pairs) = val else {
         return None;
@@ -2291,6 +2825,10 @@ def _dispatch(req):
     if op == "exec":
         exec(req["code"], _ENV)
         return None
+    if op == "free":
+        obj = req.get("obj") or {}
+        oid = int(obj["__py_ref__"]) if isinstance(obj, dict) and "__py_ref__" in obj else None
+        return _OBJS.pop(oid, None) is not None if oid is not None else False
     raise ValueError(f"unknown op: {op}")
 
 for raw in sys.stdin:
@@ -2382,6 +2920,10 @@ struct Rt {
     fns: Vec<NativeFn>,
     named_fns: HashMap<String, usize>,
     classes: HashMap<String, ClassInfo>,
+    class_objects: HashMap<String, usize>,
+    builtin_fn_ids: HashMap<String, usize>,
+    fn_params: HashMap<usize, Vec<String>>,
+    call_ctx_stack: Vec<(Option<String>, Option<Val>)>,
     objects: Vec<ObjData>,
     generators: Vec<(Vec<Val>, usize)>,
     tasks: HashMap<u64, Option<Result<Val, String>>>,
@@ -2403,11 +2945,36 @@ impl Drop for Rt {
 }
 
 impl Rt {
+    fn builtin_classes_map() -> HashMap<String, ClassInfo> {
+        let mut classes = HashMap::new();
+        let make = |bases: Vec<String>, mro: Vec<String>| ClassInfo {
+            bases,
+            metaclass: None,
+            mro,
+            attrs: HashMap::new(),
+            methods: HashMap::new(),
+        };
+        classes.insert("object".into(), make(vec![], vec!["object".into()]));
+        for name in [
+            "type", "int", "float", "str", "bool", "list", "dict", "function", "null",
+        ] {
+            classes.insert(
+                name.into(),
+                make(vec!["object".into()], vec![name.into(), "object".into()]),
+            );
+        }
+        classes
+    }
+
     fn new() -> Self {
         Self {
             fns: Vec::new(),
             named_fns: HashMap::new(),
-            classes: HashMap::new(),
+            classes: Self::builtin_classes_map(),
+            class_objects: HashMap::new(),
+            builtin_fn_ids: HashMap::new(),
+            fn_params: HashMap::new(),
+            call_ctx_stack: Vec::new(),
             objects: Vec::new(),
             generators: Vec::new(),
             tasks: HashMap::new(),
@@ -2581,10 +3148,163 @@ impl Rt {
         Ok(())
     }
 
+    fn py_free(&mut self, obj: &Val) -> Result<bool, Flow> {
+        if is_py_handle_id(obj).is_none() {
+            return Ok(false);
+        }
+        let v = self.py_req(VyJson::Obj(vec![
+            ("op".into(), VyJson::Str("free".into())),
+            ("obj".into(), val_to_wire(obj)),
+        ]))?;
+        Ok(v.as_bool().unwrap_or(false))
+    }
+
     fn reg_fn(&mut self, f: NativeFn) -> Val {
         let id = self.fns.len();
         self.fns.push(f);
         Val::Fn(id)
+    }
+
+    fn reg_fn_params(&mut self, val: &Val, params: &[&str]) {
+        if let Val::Fn(id) = *val {
+            self.fn_params
+                .insert(id, params.iter().map(|s| s.to_string()).collect());
+        }
+    }
+
+    fn pat_seq_split(
+        &self,
+        val: &Val,
+        before: usize,
+        has_star: bool,
+        after: usize,
+    ) -> Option<Vec<Val>> {
+        let Val::List(items) = val else {
+            return None;
+        };
+        let len = items.len();
+        if has_star {
+            if len < before + after {
+                return None;
+            }
+            let mut out = Vec::with_capacity(before + 1 + after);
+            out.extend_from_slice(&items[..before]);
+            out.push(Val::List(items[before..(len - after)].to_vec()));
+            out.extend_from_slice(&items[(len - after)..]);
+            Some(out)
+        } else {
+            if len != before {
+                return None;
+            }
+            Some(items.clone())
+        }
+    }
+
+    fn pat_map_get(&self, val: &Val, key: &Val) -> Option<Val> {
+        let Val::Map(pairs) = val else {
+            return None;
+        };
+        pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    fn pat_map_rest(&self, val: &Val, excluded: &[Val]) -> Result<Val, Flow> {
+        let Val::Map(pairs) = val else {
+            return Err(Flow::Err("mapping rest pattern requires Map".into()));
+        };
+        Ok(Val::Map(
+            pairs
+                .iter()
+                .filter(|(k, _)| !excluded.iter().any(|ek| ek == k))
+                .cloned()
+                .collect(),
+        ))
+    }
+
+    fn pat_class_pos(
+        &mut self,
+        val: &Val,
+        cls: &Val,
+        pos_len: usize,
+    ) -> Result<Option<Vec<Val>>, Flow> {
+        let target = self.resolve_class_name_arg(cls)?;
+        if !self.value_matches_rt(val, &target) {
+            return Ok(None);
+        }
+        if pos_len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if matches!(
+            target.as_str(),
+            "int" | "float" | "str" | "bool" | "list" | "dict" | "function" | "object"
+        ) {
+            if pos_len == 1 {
+                return Ok(Some(vec![val.clone()]));
+            }
+            return Err(Flow::Err(format!(
+                "{target}() accepts at most 1 positional sub-pattern ({pos_len} given)"
+            )));
+        }
+        let mro = self.class_mro_slice(&target);
+        let mut attr_names: Option<Vec<String>> = None;
+        for cname in &mro {
+            if let Some(cinfo) = self.classes.get(cname) {
+                if let Some(Val::List(items)) = cinfo.attrs.get("__match_args__") {
+                    let mut names = Vec::with_capacity(items.len());
+                    for item in items {
+                        let Val::Str(s) = item else {
+                            return Err(Flow::Err(format!(
+                                "{target}.__match_args__ must contain strings"
+                            )));
+                        };
+                        names.push(s.clone());
+                    }
+                    attr_names = Some(names);
+                    break;
+                }
+            }
+        }
+        let attr_names = if let Some(names) = attr_names {
+            names
+        } else {
+            let mut found = Vec::new();
+            for cname in &mro {
+                if let Some(cinfo) = self.classes.get(cname) {
+                    if let Some(&fid) = cinfo
+                        .methods
+                        .get("init")
+                        .or_else(|| cinfo.methods.get("__init__"))
+                    {
+                        if let Some(pnames) = self.fn_params.get(&fid) {
+                            for p in pnames {
+                                if p != "self" {
+                                    found.push(p.clone());
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        if pos_len > attr_names.len() {
+            return Err(Flow::Err(format!(
+                "{target}() accepts {} positional sub-patterns ({pos_len} given)",
+                attr_names.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(pos_len);
+        for name in &attr_names[..pos_len] {
+            match self.get_member(val.clone(), name) {
+                Ok(v) => out.push(v),
+                Err(_) => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+
+    fn pat_class_kw(&mut self, val: &Val, attr: &str) -> Option<Val> {
+        self.get_member(val.clone(), attr).ok()
     }
 
     fn new_generator(&mut self, items: Vec<Val>) -> Val {
@@ -2616,14 +3336,220 @@ impl Rt {
         self.globals.insert(name.to_string(), v);
     }
 
-    fn resolve_ident(&self, name: &str) -> Result<Val, Flow> {
+    fn resolve_ident(&mut self, name: &str) -> Result<Val, Flow> {
         if let Some(v) = self.globals.get(name) {
             return Ok(v.clone());
         }
         if let Some(&id) = self.named_fns.get(name) {
             return Ok(Val::Fn(id));
         }
+        if self.classes.contains_key(name) {
+            return self.class_object_val(name);
+        }
+        if matches!(
+            name,
+            "property"
+                | "staticmethod"
+                | "classmethod"
+                | "super"
+                | "isinstance"
+                | "is_instance"
+                | "issubclass"
+                | "mro"
+                | "getattr"
+                | "hasattr"
+                | "setattr"
+                | "delattr"
+                | "type_of"
+                | "callable"
+        ) {
+            return Ok(self.builtin_fn_val(name));
+        }
         Err(Flow::Err(format!("undefined name '{name}'")))
+    }
+
+    fn builtin_fn_val(&mut self, name: &str) -> Val {
+        if let Some(&id) = self.builtin_fn_ids.get(name) {
+            return Val::Fn(id);
+        }
+        let bname = name.to_string();
+        let val = self.reg_fn(Rc::new(
+            move |rt: &mut Rt, args: Vec<Val>, kwargs: Vec<(String, Val)>| {
+                rt.call_builtin_wrapper(&bname, args, kwargs)
+            },
+        ));
+        if let Val::Fn(id) = val {
+            self.builtin_fn_ids.insert(name.to_string(), id);
+        }
+        val
+    }
+
+    fn pop_kw(kw: &mut Vec<(String, Val)>, key: &str) -> Option<Val> {
+        kw.iter()
+            .position(|(k, _)| k == key)
+            .map(|idx| kw.remove(idx).1)
+    }
+
+    fn compute_c3_mro(
+        &self,
+        cls_name: &str,
+        bases: &[String],
+    ) -> Result<Vec<String>, Flow> {
+        if bases.is_empty() {
+            return Ok(vec![cls_name.to_string()]);
+        }
+        let mut seqs: Vec<Vec<String>> = Vec::with_capacity(bases.len() + 1);
+        for b in bases {
+            let cls = self
+                .classes
+                .get(b)
+                .ok_or_else(|| Flow::Err(format!("unknown base class '{b}'")))?;
+            let m = if cls.mro.is_empty() {
+                vec![b.clone(), "object".to_string()]
+            } else {
+                cls.mro.clone()
+            };
+            seqs.push(m);
+        }
+        seqs.push(bases.to_vec());
+        let mut out = vec![cls_name.to_string()];
+        loop {
+            seqs.retain(|s| !s.is_empty());
+            if seqs.is_empty() {
+                break;
+            }
+            let mut chosen: Option<String> = None;
+            for seq in &seqs {
+                let cand = &seq[0];
+                let in_tail = seqs.iter().any(|other| other[1..].iter().any(|x| x == cand));
+                if !in_tail {
+                    chosen = Some(cand.clone());
+                    break;
+                }
+            }
+            let Some(head) = chosen else {
+                return Err(Flow::Err(format!(
+                    "Cannot create a consistent method resolution order (MRO) for bases of {cls_name}"
+                )));
+            };
+            if !out.contains(&head) {
+                out.push(head.clone());
+            }
+            for seq in &mut seqs {
+                if seq.first().is_some_and(|x| x == &head) {
+                    seq.remove(0);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn class_mro_slice(&self, class_name: &str) -> Vec<String> {
+        if let Some(cls) = self.classes.get(class_name) {
+            if !cls.mro.is_empty() {
+                return cls.mro.clone();
+            }
+        }
+        vec![class_name.to_string(), "object".to_string()]
+    }
+
+    fn alloc_object(&mut self, class_name: &str, fields: HashMap<String, Val>) -> Val {
+        let id = self.objects.len();
+        self.objects.push(ObjData {
+            class_name: class_name.to_string(),
+            fields,
+        });
+        Val::Object(id)
+    }
+
+    fn class_object_tag(&self, val: &Val) -> Option<String> {
+        let Val::Object(id) = val else {
+            return None;
+        };
+        self.objects.get(*id).and_then(|o| match o.fields.get("__veyra_class__") {
+            Some(Val::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    fn resolve_class_name_arg(&self, val: &Val) -> Result<String, Flow> {
+        if let Some(cls) = self.class_object_tag(val) {
+            return Ok(cls);
+        }
+        if let Val::Str(name) = val {
+            if self.classes.contains_key(name) {
+                return Ok(name.clone());
+            }
+        }
+        Err(Flow::Err(format!("expected class/type, got {}", val.show())))
+    }
+
+    fn class_object_val(&mut self, cls_name: &str) -> Result<Val, Flow> {
+        if !self.classes.contains_key(cls_name) {
+            return Err(Flow::Err(format!("unknown class '{cls_name}'")));
+        }
+        if let Some(&id) = self.class_objects.get(cls_name) {
+            if id < self.objects.len() {
+                return Ok(Val::Object(id));
+            }
+        }
+        let meta_name = self
+            .classes
+            .get(cls_name)
+            .and_then(|c| c.metaclass.clone())
+            .unwrap_or_else(|| "type".to_string());
+        let mut fields = HashMap::new();
+        fields.insert("__veyra_class__".to_string(), Val::Str(cls_name.to_string()));
+        fields.insert("__name__".to_string(), Val::Str(cls_name.to_string()));
+        let obj = self.alloc_object(&meta_name, fields);
+        if let Val::Object(id) = obj {
+            self.class_objects.insert(cls_name.to_string(), id);
+        }
+        Ok(obj)
+    }
+
+    fn make_bound_method(&mut self, func: Val, self_val: Val, owner: Option<&str>) -> Val {
+        let mut fields = HashMap::new();
+        fields.insert("__func__".to_string(), func);
+        fields.insert("__self__".to_string(), self_val);
+        if let Some(o) = owner {
+            fields.insert("__owner__".to_string(), Val::Str(o.to_string()));
+        }
+        self.alloc_object("__bound_method__", fields)
+    }
+
+    fn make_property_obj(&mut self, fget: Val, fset: Val, fdel: Val) -> Val {
+        let mut fields = HashMap::new();
+        fields.insert("fget".to_string(), fget);
+        fields.insert("fset".to_string(), fset);
+        fields.insert("fdel".to_string(), fdel);
+        self.alloc_object("__property__", fields)
+    }
+
+    fn make_descriptor_wrapper(&mut self, tag: &str, func: Val) -> Val {
+        let mut fields = HashMap::new();
+        fields.insert("__func__".to_string(), func);
+        self.alloc_object(tag, fields)
+    }
+
+    fn make_super_obj(&mut self, args: &[Val]) -> Result<Val, Flow> {
+        let (thisclass, self_val) = if args.is_empty() {
+            let Some((cls_opt, self_opt)) = self.call_ctx_stack.last().cloned() else {
+                return Err(Flow::Err("super(): no active class context".into()));
+            };
+            let cls = cls_opt.ok_or_else(|| Flow::Err("super(): no active class context".into()))?;
+            let sv = self_opt.ok_or_else(|| Flow::Err("super(): no active self/cls context".into()))?;
+            (cls, sv)
+        } else if args.len() == 2 {
+            let cls = self.resolve_class_name_arg(&args[0])?;
+            (cls, args[1].clone())
+        } else {
+            return Err(Flow::Err("super() expects 0 or 2 arguments".into()));
+        };
+        let mut fields = HashMap::new();
+        fields.insert("__thisclass__".to_string(), Val::Str(thisclass));
+        fields.insert("__self__".to_string(), self_val);
+        Ok(self.alloc_object("__super__", fields))
     }
 
     fn define_class(
@@ -2637,45 +3563,235 @@ impl Rt {
                 return Err(Flow::Err(format!("unknown parent class '{p}'")));
             }
         }
-        self.classes.insert(name, ClassInfo { parent, methods });
+        let bases = match parent {
+            Some(p) => vec![p],
+            None => vec!["object".to_string()],
+        };
+        let mro = self.compute_c3_mro(&name, &bases)?;
+        self.classes.insert(
+            name.clone(),
+            ClassInfo {
+                bases,
+                metaclass: None,
+                mro,
+                attrs: HashMap::new(),
+                methods,
+            },
+        );
+        self.class_objects.remove(&name);
+        let cls_obj = self.class_object_val(&name)?;
+        self.globals.insert(name, cls_obj);
         Ok(())
     }
 
-    fn class_is_a(&self, class_name: &str, target: &str) -> bool {
-        let mut cur = Some(class_name.to_string());
-        while let Some(name) = cur {
-            if name == target {
-                return true;
+    fn register_class_from_ns(
+        &mut self,
+        meta_name: &str,
+        cls_name: &str,
+        bases_in: &[String],
+        ns_pairs: Vec<(Val, Val)>,
+    ) -> Result<Val, Flow> {
+        let bases = if bases_in.is_empty() && cls_name != "object" {
+            vec!["object".to_string()]
+        } else {
+            bases_in.to_vec()
+        };
+        let mro = self.compute_c3_mro(cls_name, &bases)?;
+        let mut attrs = HashMap::new();
+        let mut methods = HashMap::new();
+        let builtin_ids: std::collections::HashSet<usize> =
+            self.builtin_fn_ids.values().copied().collect();
+        for (k, v) in ns_pairs {
+            let key = k.show();
+            if let Val::Fn(fid) = v {
+                if !builtin_ids.contains(&fid) {
+                    methods.insert(key, fid);
+                    continue;
+                }
             }
-            cur = self.classes.get(&name).and_then(|c| c.parent.clone());
+            attrs.insert(key, v);
+        }
+        self.classes.insert(
+            cls_name.to_string(),
+            ClassInfo {
+                bases,
+                metaclass: if meta_name == "type" {
+                    None
+                } else {
+                    Some(meta_name.to_string())
+                },
+                mro,
+                attrs,
+                methods,
+            },
+        );
+        self.class_objects.remove(cls_name);
+        self.class_object_val(cls_name)
+    }
+
+    fn build_class(
+        &mut self,
+        name: String,
+        raw_bases: Vec<Val>,
+        meta_val: Val,
+        body_fn: Val,
+    ) -> Result<Val, Flow> {
+        let mut bases = Vec::with_capacity(raw_bases.len());
+        for b in &raw_bases {
+            bases.push(self.resolve_class_name_arg(b)?);
+        }
+        if bases.is_empty() && name != "object" {
+            bases.push("object".to_string());
+        }
+        let ns_val = self.call_val(&body_fn, vec![])?;
+        let Val::Map(ns_pairs) = ns_val else {
+            return Err(Flow::Err("internal error: class body did not return namespace map".into()));
+        };
+
+        let meta_name = if !matches!(meta_val, Val::Null) {
+            if let Ok(mname) = self.resolve_class_name_arg(&meta_val) {
+                mname
+            } else {
+                let mut base_objs = Vec::with_capacity(bases.len());
+                for b in &bases {
+                    base_objs.push(self.class_object_val(b)?);
+                }
+                return self.call_val(
+                    &meta_val,
+                    vec![Val::Str(name), Val::List(base_objs), Val::Map(ns_pairs)],
+                );
+            }
+        } else {
+            let mut chosen = "type".to_string();
+            for b in &bases {
+                if let Some(bm) = self.classes.get(b).and_then(|c| c.metaclass.clone()) {
+                    if self.class_is_a(&bm, &chosen) {
+                        chosen = bm;
+                    } else if !self.class_is_a(&chosen, &bm) {
+                        return Err(Flow::Err("metaclass conflict among class bases".into()));
+                    }
+                }
+            }
+            chosen
+        };
+
+        if meta_name == "type" {
+            return self.register_class_from_ns("type", &name, &bases, ns_pairs);
+        }
+
+        let meta_cls_obj = self.class_object_val(&meta_name)?;
+        let mut base_objs = Vec::with_capacity(bases.len());
+        for b in &bases {
+            base_objs.push(self.class_object_val(b)?);
+        }
+        let bases_list = Val::List(base_objs);
+        let ns_map_val = Val::Map(ns_pairs);
+
+        let custom_new = self
+            .find_method_with_owner(&meta_name, "__new__")
+            .filter(|(o, _)| o != "type" && o != "object");
+        let cls_obj = if let Some((new_owner, new_id)) = custom_new {
+            self.call_fn_id_ctx(
+                new_id,
+                vec![
+                    meta_cls_obj.clone(),
+                    Val::Str(name.clone()),
+                    bases_list.clone(),
+                    ns_map_val.clone(),
+                ],
+                Vec::new(),
+                Some(new_owner),
+                Some(meta_cls_obj),
+            )?
+        } else {
+            let Val::Map(owned_ns) = ns_map_val.clone() else {
+                unreachable!();
+            };
+            self.register_class_from_ns(&meta_name, &name, &bases, owned_ns)?
+        };
+
+        if let Some(created_name) = self.class_object_tag(&cls_obj) {
+            let actual_meta = self
+                .classes
+                .get(&created_name)
+                .and_then(|c| c.metaclass.clone())
+                .unwrap_or_else(|| meta_name.clone());
+            if let Some((init_owner, init_id)) = self
+                .find_method_with_owner(&actual_meta, "__init__")
+                .filter(|(o, _)| o != "type" && o != "object")
+            {
+                let _ = self.call_fn_id_ctx(
+                    init_id,
+                    vec![cls_obj.clone(), Val::Str(name), bases_list, ns_map_val],
+                    Vec::new(),
+                    Some(init_owner),
+                    Some(cls_obj.clone()),
+                )?;
+            }
+        }
+        Ok(cls_obj)
+    }
+
+    fn class_is_a(&self, class_name: &str, target: &str) -> bool {
+        if class_name == target || target == "object" {
+            return true;
+        }
+        if let Some(cls) = self.classes.get(class_name) {
+            if !cls.mro.is_empty() {
+                return cls.mro.iter().any(|c| c == target);
+            }
+            return cls.bases.iter().any(|b| self.class_is_a(b, target));
         }
         false
     }
 
-    fn find_method(&self, class_name: &str, method: &str) -> Option<usize> {
-        let mut cur = Some(class_name.to_string());
-        while let Some(name) = cur {
-            let cls = self.classes.get(&name)?;
-            if let Some(&id) = cls.methods.get(method) {
-                return Some(id);
+    fn find_method_with_owner(&self, class_name: &str, method: &str) -> Option<(String, usize)> {
+        let mro = self.class_mro_slice(class_name);
+        for name in mro {
+            if let Some(cls) = self.classes.get(&name) {
+                if let Some(&id) = cls.methods.get(method) {
+                    return Some((name, id));
+                }
             }
-            cur = cls.parent.clone();
         }
         None
     }
 
-    fn check_type(&self, value: &Val, ty: &str, kind: &str, name: &str) -> Result<(), Flow> {
-        let ok = match ty {
-            "Any" => true,
-            "Number" | "Float" => matches!(value, Val::Num(_)),
-            "Int" => matches!(value, Val::Num(n) if n.fract() == 0.0),
-            "String" => matches!(value, Val::Str(_)),
-            "Bool" => matches!(value, Val::Bool(_)),
-            "List" => matches!(value, Val::List(_)),
-            "Map" => matches!(value, Val::Map(_)),
-            "Null" | "Void" => matches!(value, Val::Null),
+    fn find_method(&self, class_name: &str, method: &str) -> Option<usize> {
+        self.find_method_with_owner(class_name, method)
+            .map(|(_, id)| id)
+    }
+
+    fn find_member_in_mro_slice(
+        &self,
+        mro: &[String],
+        member: &str,
+    ) -> Option<(String, bool, Val, Option<usize>)> {
+        for cls_name in mro {
+            if let Some(cls) = self.classes.get(cls_name) {
+                if let Some(v) = cls.attrs.get(member) {
+                    return Some((cls_name.clone(), true, v.clone(), None));
+                }
+                if let Some(&fid) = cls.methods.get(member) {
+                    return Some((cls_name.clone(), false, Val::Null, Some(fid)));
+                }
+            }
+        }
+        None
+    }
+
+    fn value_matches_rt(&self, value: &Val, ty: &str) -> bool {
+        match ty {
+            "Any" | "object" => true,
+            "Number" | "Float" | "float" => matches!(value, Val::Num(_)),
+            "Int" | "int" => matches!(value, Val::Num(n) if n.fract() == 0.0),
+            "String" | "str" => matches!(value, Val::Str(_)),
+            "Bool" | "bool" => matches!(value, Val::Bool(_)),
+            "List" | "list" => matches!(value, Val::List(_)),
+            "Map" | "dict" => matches!(value, Val::Map(_)),
+            "Null" | "Void" | "null" => matches!(value, Val::Null),
             "Object" => matches!(value, Val::Object(_)),
-            "Function" => matches!(value, Val::Fn(_)),
+            "Function" | "function" => matches!(value, Val::Fn(_)),
             "Generator" => matches!(value, Val::Generator(_)),
             custom => match value {
                 Val::Object(id) => self
@@ -2685,7 +3801,11 @@ impl Rt {
                     .unwrap_or(false),
                 _ => false,
             },
-        };
+        }
+    }
+
+    fn check_type(&self, value: &Val, ty: &str, kind: &str, name: &str) -> Result<(), Flow> {
+        let ok = self.value_matches_rt(value, ty);
         if ok {
             Ok(())
         } else if name.is_empty() {
@@ -2811,12 +3931,18 @@ impl Rt {
             .ok_or_else(|| Flow::Err("dangling object".into()))?
             .class_name
             .clone();
-        let Some(mid) = self.find_method(&class_name, dunder) else {
+        let Some((owner, mid)) = self.find_method_with_owner(&class_name, dunder) else {
             return Ok(None);
         };
         let mut args = vec![Val::Object(*id)];
         args.extend(extra);
-        Ok(Some(self.call_fn_id_kw(mid, args, kwargs)?))
+        Ok(Some(self.call_fn_id_ctx(
+            mid,
+            args,
+            kwargs,
+            Some(owner),
+            Some(Val::Object(*id)),
+        )?))
     }
 
     fn show_val_runtime(&mut self, val: &Val) -> Result<String, Flow> {
@@ -2852,12 +3978,26 @@ impl Rt {
         args: Vec<Val>,
         kwargs: Vec<(String, Val)>,
     ) -> Result<Val, Flow> {
+        self.call_fn_id_ctx(id, args, kwargs, None, None)
+    }
+
+    fn call_fn_id_ctx(
+        &mut self,
+        id: usize,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+        active_class: Option<String>,
+        active_self: Option<Val>,
+    ) -> Result<Val, Flow> {
         let f = self
             .fns
             .get(id)
             .cloned()
             .ok_or_else(|| Flow::Err(format!("dangling function id {id}")))?;
-        f(self, args, kwargs)
+        self.call_ctx_stack.push((active_class, active_self));
+        let res = f(self, args, kwargs);
+        self.call_ctx_stack.pop();
+        res
     }
 
     fn call_val(&mut self, val: &Val, args: Vec<Val>) -> Result<Val, Flow> {
@@ -2872,7 +4012,25 @@ impl Rt {
     ) -> Result<Val, Flow> {
         match val {
             Val::Fn(id) => self.call_fn_id_kw(*id, args, kwargs),
-            Val::Object(_) => {
+            Val::Object(id) => {
+                let Some(snap) = self.objects.get(*id).map(|o| (o.class_name.clone(), o.fields.clone())) else {
+                    return Err(Flow::Err("dangling object".into()));
+                };
+                if snap.0 == "__bound_method__" {
+                    let func = snap.1.get("__func__").cloned().ok_or_else(|| Flow::Err("corrupt bound method".into()))?;
+                    let bself = snap.1.get("__self__").cloned().ok_or_else(|| Flow::Err("corrupt bound method".into()))?;
+                    let owner = snap.1.get("__owner__").map(|v| v.show());
+                    let mut full_args = Vec::with_capacity(1 + args.len());
+                    full_args.push(bself.clone());
+                    full_args.extend(args);
+                    return match func {
+                        Val::Fn(fid) => self.call_fn_id_ctx(fid, full_args, kwargs, owner, Some(bself)),
+                        _ => self.call_val_kw(&func, full_args, kwargs),
+                    };
+                }
+                if let Some(Val::Str(ref cls_name)) = snap.1.get("__veyra_class__") {
+                    return self.instantiate_kw(cls_name, args, kwargs);
+                }
                 if let Some(res) = self.try_dunder(val, "__call__", args, kwargs)? {
                     Ok(res)
                 } else {
@@ -2897,19 +4055,122 @@ impl Rt {
         args: Vec<Val>,
         kwargs: Vec<(String, Val)>,
     ) -> Result<Val, Flow> {
-        let id = self.objects.len();
-        self.objects.push(ObjData {
-            class_name: class_name.to_string(),
-            fields: HashMap::new(),
-        });
-        if let Some(init_id) = self.find_method(class_name, "init") {
-            let mut call_args = vec![Val::Object(id)];
+        match class_name {
+            "int" | "float" | "str" | "bool" | "list" | "dict" | "type" => {
+                return self
+                    .call_builtin_kw(class_name, &args, &kwargs)?
+                    .ok_or_else(|| Flow::Err(format!("builtin '{class_name}' returned no value")));
+            }
+            "object" => {
+                if !args.is_empty() || !kwargs.is_empty() {
+                    return Err(Flow::Err("object() takes no arguments".into()));
+                }
+                return Ok(self.alloc_object("object", HashMap::new()));
+            }
+            _ => {}
+        }
+        let meta_name = self
+            .classes
+            .get(class_name)
+            .ok_or_else(|| Flow::Err(format!("unknown class '{class_name}'")))?
+            .metaclass
+            .clone();
+        if let Some(meta) = meta_name {
+            if let Some((owner, call_id)) = self.find_method_with_owner(&meta, "__call__") {
+                if owner != "type" && owner != "object" {
+                    let cls_obj = self.class_object_val(class_name)?;
+                    let mut call_args = Vec::with_capacity(1 + args.len());
+                    call_args.push(cls_obj.clone());
+                    call_args.extend(args);
+                    return self.call_fn_id_ctx(
+                        call_id,
+                        call_args,
+                        kwargs,
+                        Some(owner),
+                        Some(cls_obj),
+                    );
+                }
+            }
+        }
+        self.default_instantiate_kw(class_name, args, kwargs)
+    }
+
+    fn default_instantiate_kw(
+        &mut self,
+        class_name: &str,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+    ) -> Result<Val, Flow> {
+        let mro = self.class_mro_slice(class_name);
+        let mut custom_new: Option<(String, usize)> = None;
+        for c in &mro {
+            if c == "object" || c == "type" {
+                continue;
+            }
+            if let Some(cls) = self.classes.get(c) {
+                if let Some(&fid) = cls.methods.get("__new__") {
+                    custom_new = Some((c.clone(), fid));
+                    break;
+                }
+            }
+        }
+        let mut custom_new_ran = false;
+        let inst = if let Some((new_owner, new_id)) = custom_new {
+            custom_new_ran = true;
+            let cls_obj = self.class_object_val(class_name)?;
+            let mut new_args = Vec::with_capacity(1 + args.len());
+            new_args.push(cls_obj.clone());
+            new_args.extend(args.clone());
+            let created = self.call_fn_id_ctx(
+                new_id,
+                new_args,
+                kwargs.clone(),
+                Some(new_owner),
+                Some(cls_obj),
+            )?;
+            let is_instance = match created {
+                Val::Object(id) => self
+                    .objects
+                    .get(id)
+                    .map(|o| self.class_is_a(&o.class_name, class_name))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !is_instance {
+                return Ok(created);
+            }
+            created
+        } else {
+            self.alloc_object(class_name, HashMap::new())
+        };
+
+        let mut init_found: Option<(String, usize)> = None;
+        for c in &mro {
+            if c == "object" || c == "type" {
+                continue;
+            }
+            if let Some(cls) = self.classes.get(c) {
+                if let Some(&fid) = cls.methods.get("__init__").or_else(|| cls.methods.get("init"))
+                {
+                    init_found = Some((c.clone(), fid));
+                    break;
+                }
+            }
+        }
+        if let Some((init_owner, init_id)) = init_found {
+            let mut call_args = vec![inst.clone()];
             call_args.extend(args);
-            let _ = self.call_fn_id_kw(init_id, call_args, kwargs)?;
-        } else if !args.is_empty() || !kwargs.is_empty() {
+            let _ = self.call_fn_id_ctx(
+                init_id,
+                call_args,
+                kwargs,
+                Some(init_owner),
+                Some(inst.clone()),
+            )?;
+        } else if !custom_new_ran && (!args.is_empty() || !kwargs.is_empty()) {
             return Err(Flow::Err(format!("{class_name} has no init method")));
         }
-        Ok(Val::Object(id))
+        Ok(inst)
     }
 
     #[inline(always)]
@@ -2933,14 +4194,14 @@ impl Rt {
         if let Some(res) = self.call_builtin_kw(name, &args, &kwargs)? {
             return Ok(res);
         }
-        if self.classes.contains_key(name) {
-            return self.instantiate_kw(name, args, kwargs);
-        }
         if let Some(lv) = local_val {
             return self.call_val_kw(&lv, args, kwargs);
         }
         if let Some(gv) = self.globals.get(name).cloned() {
             return self.call_val_kw(&gv, args, kwargs);
+        }
+        if self.classes.contains_key(name) {
+            return self.instantiate_kw(name, args, kwargs);
         }
         if let Some(&id) = self.named_fns.get(name) {
             return self.call_fn_id_kw(id, args, kwargs);
@@ -3151,28 +4412,391 @@ impl Rt {
         }
     }
 
+    fn descriptor_has_method(&self, val: &Val, method: &str) -> bool {
+        let Val::Object(id) = val else {
+            return false;
+        };
+        let Some(cls) = self.objects.get(*id).map(|o| o.class_name.clone()) else {
+            return false;
+        };
+        if cls == "__property__" {
+            return true;
+        }
+        if matches!(
+            cls.as_str(),
+            "__staticmethod__" | "__classmethod__" | "__bound_method__" | "__super__"
+        ) {
+            return false;
+        }
+        self.find_method_with_owner(&cls, method).is_some()
+    }
+
+    fn materialize_member(
+        &mut self,
+        owner: &str,
+        is_attr: bool,
+        attr_val: Val,
+        method_id: Option<usize>,
+        recv_opt: Option<Val>,
+        is_cls_bind: bool,
+    ) -> Result<Val, Flow> {
+        if is_attr {
+            if let Val::Object(did) = attr_val {
+                let dcls = self
+                    .objects
+                    .get(did)
+                    .ok_or_else(|| Flow::Err("dangling object".into()))?
+                    .class_name
+                    .clone();
+                if dcls == "__staticmethod__" {
+                    return self.objects[did]
+                        .fields
+                        .get("__func__")
+                        .cloned()
+                        .ok_or_else(|| Flow::Err("corrupt staticmethod".into()));
+                }
+                if dcls == "__classmethod__" {
+                    let func = self.objects[did]
+                        .fields
+                        .get("__func__")
+                        .cloned()
+                        .ok_or_else(|| Flow::Err("corrupt classmethod".into()))?;
+                    let cls_val = match recv_opt {
+                        Some(ref r) => {
+                            if is_cls_bind {
+                                r.clone()
+                            } else if let Val::Object(oid) = r {
+                                let ocls = self.objects[*oid].class_name.clone();
+                                self.class_object_val(&ocls)?
+                            } else {
+                                self.class_object_val(owner)?
+                            }
+                        }
+                        None => self.class_object_val(owner)?,
+                    };
+                    return Ok(self.make_bound_method(func, cls_val, Some(owner)));
+                }
+                if dcls == "__property__" {
+                    if !is_cls_bind {
+                        if let Some(inst) = recv_opt {
+                            let fget = self.objects[did]
+                                .fields
+                                .get("fget")
+                                .cloned()
+                                .unwrap_or(Val::Null);
+                            if matches!(fget, Val::Null) {
+                                return Err(Flow::Err(
+                                    "unreadable attribute (property has no getter)".into(),
+                                ));
+                            }
+                            return match fget {
+                                Val::Fn(fid) => self.call_fn_id_ctx(
+                                    fid,
+                                    vec![inst.clone()],
+                                    vec![],
+                                    Some(owner.to_string()),
+                                    Some(inst),
+                                ),
+                                _ => self.call_val(&fget, vec![inst]),
+                            };
+                        }
+                    }
+                    return Ok(attr_val);
+                }
+                if let Some((_, get_id)) = self.find_method_with_owner(&dcls, "__get__") {
+                    let owner_cls = match recv_opt {
+                        Some(ref r) if is_cls_bind => r.clone(),
+                        Some(Val::Object(oid)) => {
+                            let ocls = self.objects[oid].class_name.clone();
+                            self.class_object_val(&ocls)?
+                        }
+                        _ => self.class_object_val(owner)?,
+                    };
+                    let inst_arg = if is_cls_bind {
+                        Val::Null
+                    } else {
+                        recv_opt.unwrap_or(Val::Null)
+                    };
+                    return self.call_fn_id_ctx(
+                        get_id,
+                        vec![attr_val, inst_arg, owner_cls],
+                        vec![],
+                        Some(dcls),
+                        Some(Val::Object(did)),
+                    );
+                }
+            }
+            return Ok(attr_val);
+        }
+        let fid = method_id.ok_or_else(|| Flow::Err("missing method id".into()))?;
+        let fn_val = Val::Fn(fid);
+        if is_cls_bind {
+            return Ok(fn_val);
+        }
+        match recv_opt {
+            Some(inst) => Ok(self.make_bound_method(fn_val, inst, Some(owner))),
+            None => Ok(fn_val),
+        }
+    }
+
+    fn super_target_info(&self, super_id: usize) -> Result<(Vec<String>, Val, bool), Flow> {
+        let snap = self
+            .objects
+            .get(super_id)
+            .ok_or_else(|| Flow::Err("dangling super object".into()))?;
+        let Some(Val::Str(thisclass)) = snap.fields.get("__thisclass__").cloned() else {
+            return Err(Flow::Err("corrupt super() object".into()));
+        };
+        let self_val = snap
+            .fields
+            .get("__self__")
+            .cloned()
+            .ok_or_else(|| Flow::Err("corrupt super() object".into()))?;
+        let (target_cls, is_cls_bind) = if let Some(c) = self.class_object_tag(&self_val) {
+            if self.class_is_a(&c, &thisclass) {
+                (c, true)
+            } else if let Val::Object(oid) = self_val {
+                let oc = self
+                    .objects
+                    .get(oid)
+                    .ok_or_else(|| Flow::Err("dangling object".into()))?
+                    .class_name
+                    .clone();
+                (oc, false)
+            } else {
+                (c, true)
+            }
+        } else if let Val::Object(oid) = self_val {
+            let oc = self
+                .objects
+                .get(oid)
+                .ok_or_else(|| Flow::Err("dangling object".into()))?
+                .class_name
+                .clone();
+            (oc, false)
+        } else {
+            return Err(Flow::Err("super() second argument must be object or class".into()));
+        };
+        let mro = self.class_mro_slice(&target_cls);
+        let pos = mro
+            .iter()
+            .position(|c| c == &thisclass)
+            .ok_or_else(|| Flow::Err(format!("'{thisclass}' is not in MRO of '{target_cls}'")))?;
+        Ok((mro[pos + 1..].to_vec(), self_val, is_cls_bind))
+    }
+
+    fn super_get_attr(&mut self, super_id: usize, name: &str) -> Result<Val, Flow> {
+        let (tail_mro, self_val, is_cls_bind) = self.super_target_info(super_id)?;
+        if let Some((owner, is_attr, attr_val, method_id)) =
+            self.find_member_in_mro_slice(&tail_mro, name)
+        {
+            return self.materialize_member(
+                &owner,
+                is_attr,
+                attr_val,
+                method_id,
+                Some(self_val),
+                is_cls_bind,
+            );
+        }
+        let is_class_arg = self.class_object_tag(&self_val).is_some();
+        for c in &tail_mro {
+            if c == "object" {
+                if let Some(b) = match name {
+                    "__new__" => Some("__object_new__"),
+                    "__init__" => Some("__object_init__"),
+                    "__setattr__" => Some("__object_setattr__"),
+                    "__delattr__" => Some("__object_delattr__"),
+                    _ => None,
+                } {
+                    let fnv = self.builtin_fn_val(b);
+                    return Ok(self.make_bound_method(fnv, self_val, Some("object")));
+                }
+            } else if c == "type" && (is_cls_bind || is_class_arg) {
+                if let Some(b) = match name {
+                    "__call__" => Some("__type_call__"),
+                    "__new__" => Some("__type_new__"),
+                    "__init__" => Some("__type_init__"),
+                    _ => None,
+                } {
+                    let fnv = self.builtin_fn_val(b);
+                    if name == "__new__" {
+                        return Ok(fnv);
+                    }
+                    return Ok(self.make_bound_method(fnv, self_val, Some("type")));
+                }
+            }
+        }
+        Err(Flow::Err(format!("'super' object has no attribute '{name}'")))
+    }
+
     fn get_member(&mut self, obj: Val, name: &str) -> Result<Val, Flow> {
         if is_py_handle_id(&obj).is_some() {
             return self.py_get(&obj, name);
         }
-        match obj {
-            Val::Object(id) => {
-                let data = self
-                    .objects
-                    .get(id)
-                    .ok_or_else(|| Flow::Err("dangling object".into()))?;
-                data.fields
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| Flow::Err(format!("undefined field '{name}'")))
+        let Val::Object(id) = obj else {
+            if let Val::Map(pairs) = obj {
+                return pairs
+                    .iter()
+                    .find(|(k, _)| *k == Val::Str(name.to_string()))
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| Flow::Err(format!("undefined member '{name}'")));
             }
-            Val::Map(pairs) => pairs
-                .iter()
-                .find(|(k, _)| *k == Val::Str(name.to_string()))
-                .map(|(_, v)| v.clone())
-                .ok_or_else(|| Flow::Err(format!("undefined member '{name}'"))),
-            _ => Err(Flow::Err("member access requires object or map".into())),
+            return Err(Flow::Err("member access requires object or map".into()));
+        };
+        let (cls_name, fields) = {
+            let data = self
+                .objects
+                .get(id)
+                .ok_or_else(|| Flow::Err("dangling object".into()))?;
+            (data.class_name.clone(), data.fields.clone())
+        };
+        if cls_name == "__super__" {
+            return self.super_get_attr(id, name);
         }
+        if cls_name == "__property__" {
+            if matches!(name, "getter" | "setter" | "deleter") {
+                let bname = match name {
+                    "getter" => "__prop_getter__",
+                    "setter" => "__prop_setter__",
+                    _ => "__prop_deleter__",
+                };
+                let fnv = self.builtin_fn_val(bname);
+                return Ok(self.make_bound_method(fnv, Val::Object(id), None));
+            }
+            if let Some(v) = fields.get(name) {
+                return Ok(v.clone());
+            }
+            return Err(Flow::Err(format!("'property' object has no attribute '{name}'")));
+        }
+        if let Some(Val::Str(ref cname)) = fields.get("__veyra_class__") {
+            match name {
+                "__name__" => return Ok(Val::Str(cname.clone())),
+                "__bases__" => {
+                    let bases = self
+                        .classes
+                        .get(cname)
+                        .map(|c| c.bases.clone())
+                        .unwrap_or_default();
+                    let mut out = Vec::with_capacity(bases.len());
+                    for b in &bases {
+                        out.push(self.class_object_val(b)?);
+                    }
+                    return Ok(Val::List(out));
+                }
+                "__mro__" => {
+                    let mro = self.class_mro_slice(cname);
+                    let mut out = Vec::with_capacity(mro.len());
+                    for c in &mro {
+                        out.push(self.class_object_val(c)?);
+                    }
+                    return Ok(Val::List(out));
+                }
+                "__dict__" => {
+                    let pairs = self
+                        .classes
+                        .get(cname)
+                        .map(|c| {
+                            c.attrs
+                                .iter()
+                                .map(|(k, v)| (Val::Str(k.clone()), v.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    return Ok(Val::Map(pairs));
+                }
+                _ => {}
+            }
+            let mro = self.class_mro_slice(cname);
+            if let Some((owner, is_attr, attr_val, method_id)) =
+                self.find_member_in_mro_slice(&mro, name)
+            {
+                return self.materialize_member(
+                    &owner,
+                    is_attr,
+                    attr_val,
+                    method_id,
+                    Some(Val::Object(id)),
+                    true,
+                );
+            }
+            if cname == "object" {
+                if let Some(b) = match name {
+                    "__new__" => Some("__object_new__"),
+                    "__init__" => Some("__object_init__"),
+                    "__setattr__" => Some("__object_setattr__"),
+                    "__delattr__" => Some("__object_delattr__"),
+                    _ => None,
+                } {
+                    return Ok(self.builtin_fn_val(b));
+                }
+            } else if cname == "type" {
+                if let Some(b) = match name {
+                    "__new__" => Some("__type_new__"),
+                    "__init__" => Some("__type_init__"),
+                    "__call__" => Some("__type_call__"),
+                    _ => None,
+                } {
+                    return Ok(self.builtin_fn_val(b));
+                }
+            }
+            let meta_mro = self.class_mro_slice(&cls_name);
+            if let Some((owner, is_attr, attr_val, method_id)) =
+                self.find_member_in_mro_slice(&meta_mro, name)
+            {
+                return self.materialize_member(
+                    &owner,
+                    is_attr,
+                    attr_val,
+                    method_id,
+                    Some(Val::Object(id)),
+                    false,
+                );
+            }
+            return Err(Flow::Err(format!("type object '{cname}' has no attribute '{name}'")));
+        }
+
+        let mro = self.class_mro_slice(&cls_name);
+        let hit = self.find_member_in_mro_slice(&mro, name);
+        if let Some((ref owner, true, ref attr_val, _)) = hit {
+            if self.descriptor_has_method(attr_val, "__set__")
+                || self.descriptor_has_method(attr_val, "__delete__")
+            {
+                return self.materialize_member(
+                    owner,
+                    true,
+                    attr_val.clone(),
+                    None,
+                    Some(Val::Object(id)),
+                    false,
+                );
+            }
+        }
+        if let Some(v) = fields.get(name) {
+            return Ok(v.clone());
+        }
+        if let Some((owner, is_attr, attr_val, method_id)) = hit {
+            return self.materialize_member(
+                &owner,
+                is_attr,
+                attr_val,
+                method_id,
+                Some(Val::Object(id)),
+                false,
+            );
+        }
+        if name != "__getattr__" {
+            if let Some((owner, ga_id)) = self.find_method_with_owner(&cls_name, "__getattr__") {
+                return self.call_fn_id_ctx(
+                    ga_id,
+                    vec![Val::Object(id), Val::Str(name.to_string())],
+                    vec![],
+                    Some(owner),
+                    Some(Val::Object(id)),
+                );
+            }
+        }
+        Err(Flow::Err(format!("undefined field '{name}'")))
     }
 
     fn set_member(&mut self, obj: Val, name: &str, value: Val) -> Result<(), Flow> {
@@ -3180,16 +4804,279 @@ impl Rt {
             let _ = self.py_set(&obj, name, &value)?;
             return Ok(());
         }
-        match obj {
-            Val::Object(id) => {
-                let data = self
-                    .objects
-                    .get_mut(id)
-                    .ok_or_else(|| Flow::Err("dangling object".into()))?;
-                data.fields.insert(name.to_string(), value);
-                Ok(())
+        let Val::Object(id) = obj else {
+            return Err(Flow::Err("member assignment requires object".into()));
+        };
+        let (cls_name, cls_tag) = {
+            let data = self
+                .objects
+                .get(id)
+                .ok_or_else(|| Flow::Err("dangling object".into()))?;
+            (
+                data.class_name.clone(),
+                match data.fields.get("__veyra_class__") {
+                    Some(Val::Str(s)) => Some(s.clone()),
+                    _ => None,
+                },
+            )
+        };
+        if let Some(cname) = cls_tag {
+            let is_builtin = match value {
+                Val::Fn(fid) => self.builtin_fn_ids.values().any(|&b| b == fid),
+                _ => false,
+            };
+            let cls = self
+                .classes
+                .get_mut(&cname)
+                .ok_or_else(|| Flow::Err(format!("unknown class '{cname}'")))?;
+            cls.attrs.remove(name);
+            cls.methods.remove(name);
+            if let Val::Fn(fid) = value {
+                if !is_builtin {
+                    cls.methods.insert(name.to_string(), fid);
+                    return Ok(());
+                }
             }
-            _ => Err(Flow::Err("member assignment requires object".into())),
+            cls.attrs.insert(name.to_string(), value);
+            return Ok(());
+        }
+        if name != "__setattr__" {
+            if let Some((owner, sa_id)) = self.find_method_with_owner(&cls_name, "__setattr__") {
+                if owner != "object" && owner != "type" {
+                    let _ = self.call_fn_id_ctx(
+                        sa_id,
+                        vec![Val::Object(id), Val::Str(name.to_string()), value],
+                        vec![],
+                        Some(owner),
+                        Some(Val::Object(id)),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        let mro = self.class_mro_slice(&cls_name);
+        if let Some((owner, true, attr_val, _)) = self.find_member_in_mro_slice(&mro, name) {
+            if let Val::Object(did) = attr_val {
+                let dcls = self.objects[did].class_name.clone();
+                if dcls == "__property__" {
+                    let fset = self.objects[did]
+                        .fields
+                        .get("fset")
+                        .cloned()
+                        .unwrap_or(Val::Null);
+                    if matches!(fset, Val::Null) {
+                        return Err(Flow::Err(format!("property '{name}' has no setter")));
+                    }
+                    let _ = match fset {
+                        Val::Fn(fid) => self.call_fn_id_ctx(
+                            fid,
+                            vec![Val::Object(id), value],
+                            vec![],
+                            Some(owner),
+                            Some(Val::Object(id)),
+                        )?,
+                        _ => self.call_val(&fset, vec![Val::Object(id), value])?,
+                    };
+                    return Ok(());
+                }
+                if let Some((_, set_id)) = self.find_method_with_owner(&dcls, "__set__") {
+                    let _ = self.call_fn_id_ctx(
+                        set_id,
+                        vec![attr_val, Val::Object(id), value],
+                        vec![],
+                        Some(dcls),
+                        Some(Val::Object(did)),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        let data = self
+            .objects
+            .get_mut(id)
+            .ok_or_else(|| Flow::Err("dangling object".into()))?;
+        data.fields.insert(name.to_string(), value);
+        Ok(())
+    }
+
+    fn del_member(&mut self, obj: Val, name: &str) -> Result<(), Flow> {
+        let Val::Object(id) = obj else {
+            return Err(Flow::Err("delattr requires Object".into()));
+        };
+        let (cls_name, cls_tag) = {
+            let data = self
+                .objects
+                .get(id)
+                .ok_or_else(|| Flow::Err("dangling object".into()))?;
+            (
+                data.class_name.clone(),
+                match data.fields.get("__veyra_class__") {
+                    Some(Val::Str(s)) => Some(s.clone()),
+                    _ => None,
+                },
+            )
+        };
+        if let Some(cname) = cls_tag {
+            let cls = self
+                .classes
+                .get_mut(&cname)
+                .ok_or_else(|| Flow::Err(format!("unknown class '{cname}'")))?;
+            let removed = cls.attrs.remove(name).is_some() || cls.methods.remove(name).is_some();
+            if removed {
+                return Ok(());
+            }
+            return Err(Flow::Err(format!("type object '{cname}' has no attribute '{name}'")));
+        }
+        let mro = self.class_mro_slice(&cls_name);
+        if let Some((owner, true, attr_val, _)) = self.find_member_in_mro_slice(&mro, name) {
+            if let Val::Object(did) = attr_val {
+                let dcls = self.objects[did].class_name.clone();
+                if dcls == "__property__" {
+                    let fdel = self.objects[did]
+                        .fields
+                        .get("fdel")
+                        .cloned()
+                        .unwrap_or(Val::Null);
+                    if matches!(fdel, Val::Null) {
+                        return Err(Flow::Err(format!("property '{name}' has no deleter")));
+                    }
+                    let _ = match fdel {
+                        Val::Fn(fid) => self.call_fn_id_ctx(
+                            fid,
+                            vec![Val::Object(id)],
+                            vec![],
+                            Some(owner),
+                            Some(Val::Object(id)),
+                        )?,
+                        _ => self.call_val(&fdel, vec![Val::Object(id)])?,
+                    };
+                    return Ok(());
+                }
+                if let Some((_, del_id)) = self.find_method_with_owner(&dcls, "__delete__") {
+                    let _ = self.call_fn_id_ctx(
+                        del_id,
+                        vec![attr_val, Val::Object(id)],
+                        vec![],
+                        Some(dcls),
+                        Some(Val::Object(did)),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        if name != "__delattr__" {
+            if let Some((owner, da_id)) = self.find_method_with_owner(&cls_name, "__delattr__") {
+                if owner != "object" && owner != "type" {
+                    let _ = self.call_fn_id_ctx(
+                        da_id,
+                        vec![Val::Object(id), Val::Str(name.to_string())],
+                        vec![],
+                        Some(owner),
+                        Some(Val::Object(id)),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        let data = self
+            .objects
+            .get_mut(id)
+            .ok_or_else(|| Flow::Err("dangling object".into()))?;
+        data.fields
+            .remove(name)
+            .ok_or_else(|| Flow::Err(format!("undefined field '{name}'")))?;
+        Ok(())
+    }
+
+    fn call_builtin_wrapper(
+        &mut self,
+        bname: &str,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+    ) -> Result<Val, Flow> {
+        match bname {
+            "__prop_getter__" | "__prop_setter__" | "__prop_deleter__" => {
+                if args.len() != 2 {
+                    return Err(Flow::Err(format!("property.{bname} expects 1 callable argument")));
+                }
+                let Val::Object(pid) = args[0] else {
+                    return Err(Flow::Err("property modifier target must be property".into()));
+                };
+                let mut fields = self.objects[pid].fields.clone();
+                let key = match bname {
+                    "__prop_getter__" => "fget",
+                    "__prop_setter__" => "fset",
+                    _ => "fdel",
+                };
+                fields.insert(key.to_string(), args[1].clone());
+                Ok(self.alloc_object("__property__", fields))
+            }
+            "__object_new__" => {
+                let cls_arg = args
+                    .first()
+                    .ok_or_else(|| Flow::Err("object.__new__(cls) requires a class argument".into()))?;
+                let cls_name = self.resolve_class_name_arg(cls_arg)?;
+                Ok(self.alloc_object(&cls_name, HashMap::new()))
+            }
+            "__object_init__" => Ok(Val::Null),
+            "__object_setattr__" => {
+                if args.len() != 3 {
+                    return Err(Flow::Err("object.__setattr__ expects (self, name, value)".into()));
+                }
+                let Val::Object(id) = args[0] else {
+                    return Err(Flow::Err("object.__setattr__ target must be an Object".into()));
+                };
+                let Val::Str(ref attr) = args[1] else {
+                    return Err(Flow::Err("attribute name must be String".into()));
+                };
+                self.objects[id].fields.insert(attr.clone(), args[2].clone());
+                Ok(Val::Null)
+            }
+            "__object_delattr__" => {
+                if args.len() != 2 {
+                    return Err(Flow::Err("object.__delattr__ expects (self, name)".into()));
+                }
+                let Val::Object(id) = args[0] else {
+                    return Err(Flow::Err("object.__delattr__ target must be an Object".into()));
+                };
+                let Val::Str(ref attr) = args[1] else {
+                    return Err(Flow::Err("attribute name must be String".into()));
+                };
+                self.objects[id]
+                    .fields
+                    .remove(attr)
+                    .ok_or_else(|| Flow::Err(format!("undefined field '{attr}'")))?;
+                Ok(Val::Null)
+            }
+            "__type_call__" => {
+                if args.is_empty() {
+                    return Err(Flow::Err("type.__call__ expects (cls, *args)".into()));
+                }
+                let cls_name = self.resolve_class_name_arg(&args[0])?;
+                self.default_instantiate_kw(&cls_name, args[1..].to_vec(), kwargs)
+            }
+            "__type_new__" => {
+                if args.len() != 4 {
+                    return Err(Flow::Err("type.__new__ expects (mcs, name, bases, namespace)".into()));
+                }
+                let meta_name = self.resolve_class_name_arg(&args[0])?;
+                let Val::Str(ref cls_name) = args[1] else {
+                    return Err(Flow::Err("type.__new__ name must be String".into()));
+                };
+                let base_vals = self.to_iter(args[2].clone())?;
+                let mut bases = Vec::with_capacity(base_vals.len());
+                for b in &base_vals {
+                    bases.push(self.resolve_class_name_arg(b)?);
+                }
+                let Val::Map(ref pairs) = args[3] else {
+                    return Err(Flow::Err("type.__new__ namespace must be Map".into()));
+                };
+                self.register_class_from_ns(&meta_name, cls_name, &bases, pairs.clone())
+            }
+            "__type_init__" => Ok(Val::Null),
+            other => self
+                .call_builtin_kw(other, &args, &kwargs)?
+                .ok_or_else(|| Flow::Err(format!("unknown builtin '{other}'"))),
         }
     }
 
@@ -3259,22 +5146,43 @@ impl Rt {
         }
         match recv {
             Val::Object(id) => {
-                let class_name = self
-                    .objects
-                    .get(id)
-                    .ok_or_else(|| Flow::Err("dangling object".into()))?
-                    .class_name
-                    .clone();
-                let method_id = self
-                    .find_method(&class_name, name)
-                    .ok_or_else(|| Flow::Err(format!("undefined method '{name}' on {class_name}")))?;
-                let mut call_args = vec![Val::Object(id)];
-                call_args.extend(args);
-                self.call_fn_id_kw(method_id, call_args, kwargs)
+                let (cls_name, has_cls_tag, has_field, is_special) = {
+                    let obj = self
+                        .objects
+                        .get(id)
+                        .ok_or_else(|| Flow::Err("dangling object".into()))?;
+                    (
+                        obj.class_name.clone(),
+                        obj.fields.contains_key("__veyra_class__"),
+                        obj.fields.contains_key(name),
+                        matches!(
+                            obj.class_name.as_str(),
+                            "__super__" | "__property__" | "__bound_method__"
+                        ),
+                    )
+                };
+                if !has_cls_tag && !is_special && !has_field {
+                    let mro = self.class_mro_slice(&cls_name);
+                    if let Some((owner, false, _, Some(method_id))) =
+                        self.find_member_in_mro_slice(&mro, name)
+                    {
+                        let mut call_args = vec![Val::Object(id)];
+                        call_args.extend(args);
+                        return self.call_fn_id_ctx(
+                            method_id,
+                            call_args,
+                            kwargs,
+                            Some(owner),
+                            Some(Val::Object(id)),
+                        );
+                    }
+                }
+                let member = self.get_member(Val::Object(id), name)?;
+                self.call_val_kw(&member, args, kwargs)
             }
             Val::Map(mut pairs) => {
                 if let Some((_, member)) = pairs.iter().find(|(k, _)| *k == Val::Str(name.into())) {
-                    if matches!(member, Val::Fn(_) | Val::Str(_)) {
+                    if matches!(member, Val::Fn(_) | Val::Str(_) | Val::Object(_)) {
                         let m = member.clone();
                         return self.call_val_kw(&m, args, kwargs);
                     }
@@ -3566,6 +5474,11 @@ impl Rt {
         let kw_find = |key: &str| -> Option<Val> {
             kwargs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone())
         };
+        if bigint::is_bigint_builtin(name) {
+            let bargs: Vec<bigint::BigArg> = args.iter().map(aot_val_to_big_arg).collect();
+            let res = bigint::eval_bigint_builtin(name, &bargs).map_err(Flow::Err)?;
+            return Ok(res.map(aot_big_out_to_val));
+        }
         let out = match name {
             "print" | "println" => {
                 let mut sep = String::from(" ");
@@ -3700,11 +5613,14 @@ impl Rt {
                 }
                 let ok = match &args[0] {
                     Val::Fn(_) => true,
-                    Val::Object(id) => self
-                        .objects
-                        .get(*id)
-                        .and_then(|o| self.find_method(&o.class_name, "__call__"))
-                        .is_some(),
+                    Val::Object(id) => self.objects.get(*id).is_some_and(|o| {
+                        o.fields.contains_key("__veyra_class__")
+                            || o.class_name == "__bound_method__"
+                            || (!matches!(
+                                o.class_name.as_str(),
+                                "__property__" | "__staticmethod__" | "__classmethod__" | "__super__"
+                            ) && self.find_method(&o.class_name, "__call__").is_some())
+                    }),
                     Val::Map(_) if is_py_handle_id(&args[0]).is_some() => {
                         let built = self.py_import("builtins")?;
                         self.py_call_method(&built, "callable", std::slice::from_ref(&args[0]), &[])?
@@ -3751,18 +5667,7 @@ impl Rt {
                 let ok = if is_py_handle_id(&args[0]).is_some() {
                     self.py_hasattr(&args[0], attr)?
                 } else {
-                    match &args[0] {
-                        Val::Object(id) => self
-                            .objects
-                            .get(*id)
-                            .map(|o| {
-                                o.fields.contains_key(attr)
-                                    || self.find_method(&o.class_name, attr).is_some()
-                            })
-                            .unwrap_or(false),
-                        Val::Map(pairs) => pairs.iter().any(|(k, _)| *k == Val::Str(attr.clone())),
-                        _ => false,
-                    }
+                    self.get_member(args[0].clone(), attr).is_ok()
                 };
                 Val::Bool(ok)
             }
@@ -3775,6 +5680,139 @@ impl Rt {
                 };
                 self.set_member(args[0].clone(), attr, args[2].clone())?;
                 Val::Null
+            }
+            "delattr" => {
+                if args.len() != 2 {
+                    return Err(Flow::Err("delattr expects (obj, name)".into()));
+                }
+                let Val::Str(attr) = &args[1] else {
+                    return Err(Flow::Err("delattr attribute name must be String".into()));
+                };
+                self.del_member(args[0].clone(), attr)?;
+                Val::Null
+            }
+            "type" => {
+                if args.len() == 1 {
+                    let cls_name = match &args[0] {
+                        Val::Num(n) => {
+                            if n.fract() == 0.0 {
+                                "int".to_string()
+                            } else {
+                                "float".to_string()
+                            }
+                        }
+                        Val::Str(_) => "str".to_string(),
+                        Val::Bool(_) => "bool".to_string(),
+                        Val::Null => "null".to_string(),
+                        Val::List(_) => "list".to_string(),
+                        Val::Map(_) => "dict".to_string(),
+                        Val::Fn(_) => "function".to_string(),
+                        Val::Generator(_) => "object".to_string(),
+                        Val::Object(id) => self
+                            .objects
+                            .get(*id)
+                            .map(|o| o.class_name.clone())
+                            .unwrap_or_else(|| "object".into()),
+                    };
+                    self.class_object_val(&cls_name)?
+                } else if args.len() == 3 {
+                    let Val::Str(ref cls_name) = args[0] else {
+                        return Err(Flow::Err(
+                            "type(name, bases, namespace) name must be String".into(),
+                        ));
+                    };
+                    let base_items = self.to_iter(args[1].clone())?;
+                    let mut bases = Vec::with_capacity(base_items.len());
+                    for b in &base_items {
+                        bases.push(self.resolve_class_name_arg(b)?);
+                    }
+                    let Val::Map(ref pairs) = args[2] else {
+                        return Err(Flow::Err(
+                            "type(name, bases, namespace) namespace must be a Map".into(),
+                        ));
+                    };
+                    self.register_class_from_ns("type", cls_name, &bases, pairs.clone())?
+                } else {
+                    return Err(Flow::Err(
+                        "type expects 1 argument (obj) or 3 arguments (name, bases, namespace)"
+                            .into(),
+                    ));
+                }
+            }
+            "super" => self.make_super_obj(args)?,
+            "property" => {
+                let mut fget = args.first().cloned().unwrap_or(Val::Null);
+                let mut fset = args.get(1).cloned().unwrap_or(Val::Null);
+                let mut fdel = args.get(2).cloned().unwrap_or(Val::Null);
+                if args.len() > 3 {
+                    return Err(Flow::Err(
+                        "property expects at most 3 positional arguments".into(),
+                    ));
+                }
+                let mut kw = kwargs.to_vec();
+                if let Some(v) = Self::pop_kw(&mut kw, "fget") {
+                    fget = v;
+                }
+                if let Some(v) = Self::pop_kw(&mut kw, "fset") {
+                    fset = v;
+                }
+                if let Some(v) = Self::pop_kw(&mut kw, "fdel") {
+                    fdel = v;
+                }
+                if let Some((bad, _)) = kw.first() {
+                    return Err(Flow::Err(format!(
+                        "property got unexpected keyword argument '{bad}'"
+                    )));
+                }
+                self.make_property_obj(fget, fset, fdel)
+            }
+            "staticmethod" => {
+                if args.len() != 1 {
+                    return Err(Flow::Err("staticmethod expects 1 callable argument".into()));
+                }
+                self.make_descriptor_wrapper("__staticmethod__", args[0].clone())
+            }
+            "classmethod" => {
+                if args.len() != 1 {
+                    return Err(Flow::Err("classmethod expects 1 callable argument".into()));
+                }
+                self.make_descriptor_wrapper("__classmethod__", args[0].clone())
+            }
+            "mro" => {
+                if args.len() != 1 {
+                    return Err(Flow::Err("mro expects 1 class argument".into()));
+                }
+                let cls_name = self.resolve_class_name_arg(&args[0])?;
+                let mro = self.class_mro_slice(&cls_name);
+                let mut out = Vec::with_capacity(mro.len());
+                for c in &mro {
+                    out.push(self.class_object_val(c)?);
+                }
+                Val::List(out)
+            }
+            "issubclass" => {
+                if args.len() != 2 {
+                    return Err(Flow::Err("issubclass expects (cls, class_or_tuple)".into()));
+                }
+                let sub = self.resolve_class_name_arg(&args[0])?;
+                let ok = match &args[1] {
+                    Val::List(items) => {
+                        let mut matched = false;
+                        for item in items {
+                            let sup = self.resolve_class_name_arg(item)?;
+                            if self.class_is_a(&sub, &sup) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        matched
+                    }
+                    other => {
+                        let sup = self.resolve_class_name_arg(other)?;
+                        self.class_is_a(&sub, &sup)
+                    }
+                };
+                Val::Bool(ok)
             }
             "int" => match args.first() {
                 Some(Val::Num(n)) => Val::Num(n.trunc()),
@@ -4120,15 +6158,33 @@ impl Rt {
                 Some(Val::Map(pairs)) => Val::List(pairs.iter().map(|(_, v)| v.clone()).collect()),
                 _ => return Err(Flow::Err("values expects Map".into())),
             },
-            "is_instance" => match args {
-                [Val::Object(id), Val::Str(cls)] => Val::Bool(
-                    self.objects
-                        .get(*id)
-                        .map(|o| self.class_is_a(&o.class_name, cls))
-                        .unwrap_or(false),
-                ),
-                _ => return Err(Flow::Err("is_instance expects (Object, String)".into())),
-            },
+            "is_instance" | "isinstance" => {
+                if args.len() != 2 {
+                    return Err(Flow::Err("isinstance expects (value, class_or_type)".into()));
+                }
+                let matched = match &args[1] {
+                    Val::Str(s) => self.value_matches_rt(&args[0], s),
+                    Val::List(items) => {
+                        let mut ok = false;
+                        for item in items {
+                            let target = match item {
+                                Val::Str(s) => s.clone(),
+                                _ => self.resolve_class_name_arg(item)?,
+                            };
+                            if self.value_matches_rt(&args[0], &target) {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        ok
+                    }
+                    other => {
+                        let target = self.resolve_class_name_arg(other)?;
+                        self.value_matches_rt(&args[0], &target)
+                    }
+                };
+                Val::Bool(matched)
+            }
             "has_field" => match args {
                 [Val::Object(id), Val::Str(f)] => Val::Bool(
                     self.objects
@@ -4343,6 +6399,27 @@ impl Rt {
                 self.py_exec(code)?;
                 Val::Null
             }
+            "py_info" => {
+                if !args.is_empty() {
+                    return Err(Flow::Err("py_info expects no args".into()));
+                }
+                Val::Map(vec![
+                    (Val::Str("available".into()), Val::Bool(PyWorker::detect().is_some())),
+                    (Val::Str("mode".into()), Val::Str("subprocess-jsonrpc".into())),
+                    (Val::Str("zero_copy_buffer".into()), Val::Bool(false)),
+                ])
+            }
+            "py_free" => {
+                if args.len() != 1 {
+                    return Err(Flow::Err("py_free expects Python handle".into()));
+                }
+                Val::Bool(self.py_free(&args[0])?)
+            }
+            "py_to_tensor" | "tensor_to_py" => {
+                return Err(Flow::Err(
+                    "py_to_tensor/tensor_to_py requires VM Tensor runtime".into(),
+                ));
+            }
             "clock" => Val::Num(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -4400,6 +6477,14 @@ impl Rt {
                     Err(_) => Val::Null,
                 },
                 _ => return Err(Flow::Err("env_get expects String key".into())),
+            },
+            "starts_with" | "ends_with" => match args {
+                [Val::Str(text), Val::Str(pat)] => Val::Bool(if name == "starts_with" {
+                    text.starts_with(pat)
+                } else {
+                    text.ends_with(pat)
+                }),
+                _ => return Err(Flow::Err(format!("{name} expects (String, String)"))),
             },
             "jit_available" => Val::Bool(false),
             "jit_set_enabled" => Val::Bool(false),

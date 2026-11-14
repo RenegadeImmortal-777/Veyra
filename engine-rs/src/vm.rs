@@ -12,7 +12,7 @@ use std::{
 
 use crate::bytecode::{
     ClassDef, FunctionDef, ObjectData, Op, code_has_yield, collect_referenced_names,
-    compute_local_count,
+    compute_c3_mro, compute_local_count,
 };
 use crate::dap::{DAP_TERMINATED_ERR, DebugFrameGuard, DebugSession};
 use crate::runtime::{
@@ -36,6 +36,8 @@ pub(crate) struct CallFrame {
     return_type: Option<String>,
     debug_scope: usize,
     dap_pushed: bool,
+    active_class: Option<String>,
+    active_self: Option<Val>,
 }
 
 struct PreparedCall {
@@ -51,6 +53,8 @@ struct PreparedCall {
     is_generator: bool,
     debug_name: String,
     debug_scope: usize,
+    active_class: Option<String>,
+    active_self: Option<Val>,
 }
 
 pub(crate) struct Vm {
@@ -69,8 +73,9 @@ pub(crate) struct Vm {
     pub(crate) frames: Vec<CallFrame>,
     pub(crate) funcs: Arc<HashMap<String, FunctionDef>>,
     pub(crate) classes: Arc<HashMap<String, ClassDef>>,
-    pub(crate) method_cache: HashMap<(String, String), FunctionDef>,
+    pub(crate) method_cache: HashMap<(String, String), (String, FunctionDef)>,
     pub(crate) objects: Arc<Mutex<HashMap<u64, ObjectData>>>,
+    pub(crate) class_objects: Arc<Mutex<HashMap<String, u64>>>,
     pub(crate) handlers: Vec<(usize, String, usize)>,
     pub(crate) breakpoints: HashSet<usize>,
     pub(crate) trace: bool,
@@ -78,6 +83,8 @@ pub(crate) struct Vm {
     pub(crate) debug_scope: usize,
     pub(crate) debugger: Option<Arc<DebugSession>>,
     pub(crate) call_counts: HashMap<usize, u32>,
+    pub(crate) active_class: Option<String>,
+    pub(crate) active_self: Option<Val>,
 }
 
 static GENERATORS: OnceLock<Mutex<HashMap<u64, Vm>>> = OnceLock::new();
@@ -121,6 +128,35 @@ pub(crate) fn collect_generator(id: u64) -> Result<Vec<Val>, String> {
 }
 
 impl Vm {
+    fn builtin_classes_map() -> HashMap<String, ClassDef> {
+        let mut classes = HashMap::new();
+        let make = |bases: Vec<String>, mro: Vec<String>| ClassDef {
+            bases,
+            metaclass: None,
+            mro,
+            attrs: HashMap::new(),
+            methods: HashMap::new(),
+        };
+        classes.insert("object".into(), make(vec![], vec!["object".into()]));
+        for name in [
+            "type", "int", "float", "str", "bool", "list", "dict", "function", "null",
+        ] {
+            classes.insert(
+                name.into(),
+                make(vec!["object".into()], vec![name.into(), "object".into()]),
+            );
+        }
+        classes
+    }
+    pub(crate) fn ensure_builtin_classes(&mut self) {
+        if !self.classes.contains_key("object") || !self.classes.contains_key("type") {
+            let defaults = Self::builtin_classes_map();
+            let map = Arc::make_mut(&mut self.classes);
+            for (k, v) in defaults {
+                map.entry(k).or_insert(v);
+            }
+        }
+    }
     pub(crate) fn new(code: Vec<Op>) -> Self {
         let local_count = compute_local_count(&code, 0);
         Self {
@@ -138,9 +174,10 @@ impl Vm {
             return_type: None,
             frames: Vec::new(),
             funcs: Arc::new(HashMap::new()),
-            classes: Arc::new(HashMap::new()),
+            classes: Arc::new(Self::builtin_classes_map()),
             method_cache: HashMap::new(),
             objects: Arc::new(Mutex::new(HashMap::new())),
+            class_objects: Arc::new(Mutex::new(HashMap::new())),
             handlers: vec![],
             breakpoints: HashSet::new(),
             trace: false,
@@ -148,6 +185,8 @@ impl Vm {
             debug_scope: 0,
             debugger: None,
             call_counts: HashMap::new(),
+            active_class: None,
+            active_self: None,
         }
     }
     fn nested_from_prepared(&self, prepared: PreparedCall) -> Self {
@@ -169,6 +208,7 @@ impl Vm {
             classes: self.classes.clone(),
             method_cache: HashMap::new(),
             objects: self.objects.clone(),
+            class_objects: self.class_objects.clone(),
             handlers: vec![],
             breakpoints: HashSet::new(),
             trace: false,
@@ -176,6 +216,8 @@ impl Vm {
             debug_scope: prepared.debug_scope,
             debugger: None,
             call_counts: HashMap::new(),
+            active_class: prepared.active_class,
+            active_self: prepared.active_self,
         }
     }
     fn child_debug_scope(&self, def_ip: usize, sub_idx: usize) -> usize {
@@ -212,28 +254,30 @@ impl Vm {
             Err("numeric operands required".into())
         }
     }
-    fn class_is_a(&self, class_name: &str, target: &str) -> bool {
-        let mut current = Some(class_name.to_string());
-        while let Some(name) = current {
-            if name == target {
-                return true;
+    pub(crate) fn class_is_a(&self, class_name: &str, target: &str) -> bool {
+        if class_name == target || target == "object" {
+            return true;
+        }
+        if let Some(cls) = self.classes.get(class_name) {
+            if !cls.mro.is_empty() {
+                return cls.mro.iter().any(|c| c == target);
             }
-            current = self.classes.get(&name).and_then(|c| c.parent.clone());
+            return cls.bases.iter().any(|b| self.class_is_a(b, target));
         }
         false
     }
     pub(crate) fn value_matches(&self, value: &Val, ty: &str) -> bool {
         match ty {
-            "Any" => true,
-            "Number" | "Float" => matches!(value, Val::Num(_)),
-            "Int" => matches!(value,Val::Num(n) if n.fract()==0.0),
-            "String" => matches!(value, Val::Str(_)),
-            "Bool" => matches!(value, Val::Bool(_)),
-            "List" => matches!(value, Val::List(_)),
-            "Map" => matches!(value, Val::Map(_)),
-            "Null" | "Void" => matches!(value, Val::Null),
+            "Any" | "object" => true,
+            "Number" | "Float" | "float" => matches!(value, Val::Num(_)),
+            "Int" | "int" => matches!(value, Val::Num(n) if n.fract() == 0.0),
+            "String" | "str" => matches!(value, Val::Str(_)),
+            "Bool" | "bool" => matches!(value, Val::Bool(_)),
+            "List" | "list" => matches!(value, Val::List(_)),
+            "Map" | "dict" => matches!(value, Val::Map(_)),
+            "Null" | "Void" | "null" => matches!(value, Val::Null),
             "Object" => matches!(value, Val::Object(_)),
-            "Function" => matches!(value, Val::Function(_)),
+            "Function" | "function" => matches!(value, Val::Function(_)),
             "Generator" => matches!(value, Val::Generator(_)),
             custom => match value {
                 Val::Object(id) => {
@@ -248,27 +292,39 @@ impl Vm {
             },
         }
     }
-    fn find_method(&self, class_name: &str, method: &str) -> Option<FunctionDef> {
-        let mut current = Some(class_name.to_string());
-        while let Some(name) = current {
-            let class = self.classes.get(&name)?;
-            if let Some(def) = class.methods.get(method) {
-                return Some(def.clone());
+    fn class_mro_slice(&self, class_name: &str) -> Vec<String> {
+        if let Some(cls) = self.classes.get(class_name) {
+            if !cls.mro.is_empty() {
+                return cls.mro.clone();
             }
-            current = class.parent.clone();
+        }
+        vec![class_name.to_string(), "object".to_string()]
+    }
+    fn find_method_with_owner(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<(String, FunctionDef)> {
+        let mro = self.class_mro_slice(class_name);
+        for name in mro {
+            if let Some(class) = self.classes.get(&name) {
+                if let Some(def) = class.methods.get(method) {
+                    return Some((name, def.clone()));
+                }
+            }
         }
         None
     }
-    pub(crate) fn find_method_cached(
+    pub(crate) fn find_method_with_owner_cached(
         &mut self,
         class_name: &str,
         method: &str,
-    ) -> Option<FunctionDef> {
+    ) -> Option<(String, FunctionDef)> {
         let key = (class_name.to_string(), method.to_string());
         if let Some(cached) = self.method_cache.get(&key) {
             return Some(cached.clone());
         }
-        let found = self.find_method(class_name, method)?;
+        let found = self.find_method_with_owner(class_name, method)?;
         self.method_cache.insert(key, found.clone());
         Some(found)
     }
@@ -425,6 +481,8 @@ impl Vm {
             is_generator: def.is_generator,
             debug_name: def.debug_name,
             debug_scope: def.debug_scope,
+            active_class: None,
+            active_self: None,
         })
     }
     fn push_prepared_frame(&mut self, prepared: PreparedCall) {
@@ -462,6 +520,8 @@ impl Vm {
             return_type: std::mem::replace(&mut self.return_type, prepared.return_type),
             debug_scope: std::mem::replace(&mut self.debug_scope, prepared.debug_scope),
             dap_pushed,
+            active_class: std::mem::replace(&mut self.active_class, prepared.active_class),
+            active_self: std::mem::replace(&mut self.active_self, prepared.active_self),
         };
         self.frames.push(frame);
     }
@@ -484,9 +544,21 @@ impl Vm {
         self.handlers = caller.handlers;
         self.return_type = caller.return_type;
         self.debug_scope = caller.debug_scope;
+        self.active_class = caller.active_class;
+        self.active_self = caller.active_self;
+    }
+    pub(crate) fn resolve_jit_callee(&self, fname: &str) -> Option<FunctionDef> {
+        match self.get_var(fname) {
+            Some(Val::Function(target)) => self
+                .funcs
+                .get(&target)
+                .cloned()
+                .or_else(|| resolve_function_object(&target).ok().flatten()),
+            _ => self.funcs.get(fname).cloned(),
+        }
     }
     fn invoke_in_execute(&mut self, def: FunctionDef, args: Vec<Val>) -> Result<(), String> {
-        self.invoke_in_execute_kw(def, args, Vec::new())
+        self.invoke_in_execute_kw_ctx(def, args, Vec::new(), None, None)
     }
     fn invoke_in_execute_kw(
         &mut self,
@@ -494,8 +566,18 @@ impl Vm {
         args: Vec<Val>,
         kwargs: Vec<(String, Val)>,
     ) -> Result<(), String> {
+        self.invoke_in_execute_kw_ctx(def, args, kwargs, None, None)
+    }
+    fn invoke_in_execute_kw_ctx(
+        &mut self,
+        def: FunctionDef,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+        active_class: Option<String>,
+        active_self: Option<Val>,
+    ) -> Result<(), String> {
         if def.is_async || def.is_generator {
-            let v = self.call_def_kw(def, args, kwargs)?;
+            let v = self.call_def_kw_ctx(def, args, kwargs, active_class, active_self)?;
             self.stack.push(v);
             return Ok(());
         }
@@ -510,30 +592,42 @@ impl Vm {
                 *entry = entry.saturating_add(1);
                 *entry
             };
-            if let Some(res) = crate::jit::jit_try_run(&def.debug_name, &def, &args, count) {
+            if let Some(res) =
+                crate::jit::jit_try_run(&def.debug_name, &def, &args, count, &|fname| {
+                    self.resolve_jit_callee(fname)
+                })
+            {
                 self.stack.push(res);
                 return Ok(());
             }
         }
-        let prepared = self.prepare_call_kw(def, args, kwargs)?;
+        let mut prepared = self.prepare_call_kw(def, args, kwargs)?;
+        prepared.active_class = active_class;
+        prepared.active_self = active_self;
         self.push_prepared_frame(prepared);
         Ok(())
     }
-    fn call_def_kw(
-        &self,
+    fn call_def_kw_ctx(
+        &mut self,
         def: FunctionDef,
         args: Vec<Val>,
         kwargs: Vec<(String, Val)>,
+        active_class: Option<String>,
+        active_self: Option<Val>,
     ) -> Result<Val, String> {
         if def.is_async {
             if def.is_generator {
                 return Err("async generator functions are not yet supported".into());
             }
-            let prepared = self.prepare_call_kw(def, args, kwargs)?;
+            let mut prepared = self.prepare_call_kw(def, args, kwargs)?;
+            prepared.active_class = active_class;
+            prepared.active_self = active_self;
             return self.spawn_prepared_task(prepared, "async");
         }
-        let prepared = self.prepare_call_kw(def, args, kwargs)?;
-        self.run_prepared_call(prepared)
+        let mut prepared = self.prepare_call_kw(def, args, kwargs)?;
+        prepared.active_class = active_class;
+        prepared.active_self = active_self;
+        self.run_prepared_call_mut(prepared)
     }
     fn spawn_prepared_task(&self, prepared: PreparedCall, kind: &str) -> Result<Val, String> {
         let expected_return = prepared.return_type.clone();
@@ -577,12 +671,14 @@ impl Vm {
         let prepared = self.prepare_call(def, args)?;
         self.run_prepared_call(prepared)
     }
-    fn run_prepared_call(&self, prepared: PreparedCall) -> Result<Val, String> {
-        let is_generator = prepared.is_generator;
-        let return_type = prepared.return_type.clone();
-        let debug_name = prepared.debug_name.clone();
-        let debug_scope = prepared.debug_scope;
-        let mut nested = self.nested_from_prepared(prepared);
+    fn exec_prepared_nested(
+        caller: &Vm,
+        nested: &mut Vm,
+        is_generator: bool,
+        return_type: Option<String>,
+        debug_name: String,
+        debug_scope: usize,
+    ) -> Result<Val, String> {
         if is_generator {
             if let Some(expected) = return_type {
                 if expected != "Generator" && expected != "Any" {
@@ -591,22 +687,22 @@ impl Vm {
                     ));
                 }
             }
-            nested.debugger = self.debugger.clone();
+            nested.debugger = caller.debugger.clone();
             let id = GENERATOR_IDS.fetch_add(1, Ordering::Relaxed);
             generators()
                 .lock()
                 .map_err(|_| "generator registry poisoned")?
-                .insert(id, nested);
+                .insert(id, nested.clone_generator_state());
             return Ok(Val::Generator(id));
         }
-        let _frame_guard = if let Some(ref dbg) = self.debugger {
+        let _frame_guard = if let Some(dbg) = &caller.debugger {
             dbg.update_caller_frame(
-                self.debug_scope,
-                self.ip.saturating_sub(1),
-                &self.vars,
-                &self.cells,
-                &self.locals,
-                &self.local_defined,
+                caller.debug_scope,
+                caller.ip.saturating_sub(1),
+                &caller.vars,
+                &caller.cells,
+                &caller.locals,
+                &caller.local_defined,
             );
             nested.debugger = Some(dbg.clone());
             Some(DebugFrameGuard::push(
@@ -623,7 +719,7 @@ impl Vm {
         };
         let result = nested.execute()?;
         if let Some(expected) = return_type {
-            if !self.value_matches(&result, &expected) {
+            if !nested.value_matches(&result, &expected) {
                 return Err(format!(
                     "return value expected {expected}, got {}",
                     result.show()
@@ -632,11 +728,125 @@ impl Vm {
         }
         Ok(result)
     }
-    pub(crate) fn instantiate(&self, class_name: &str, args: Vec<Val>) -> Result<Val, String> {
+    fn clone_generator_state(&self) -> Vm {
+        Self {
+            code: self.code.clone(),
+            ip: self.ip,
+            stack: self.stack.clone(),
+            vars: self.vars.clone(),
+            cells: self.cells.clone(),
+            var_types: self.var_types.clone(),
+            consts: self.consts.clone(),
+            locals: self.locals.clone(),
+            local_defined: self.local_defined.clone(),
+            local_consts: self.local_consts.clone(),
+            local_types: self.local_types.clone(),
+            return_type: self.return_type.clone(),
+            frames: Vec::new(),
+            funcs: self.funcs.clone(),
+            classes: self.classes.clone(),
+            method_cache: HashMap::new(),
+            objects: self.objects.clone(),
+            class_objects: self.class_objects.clone(),
+            handlers: self.handlers.clone(),
+            breakpoints: self.breakpoints.clone(),
+            trace: self.trace,
+            finished: self.finished,
+            debug_scope: self.debug_scope,
+            debugger: self.debugger.clone(),
+            call_counts: HashMap::new(),
+            active_class: self.active_class.clone(),
+            active_self: self.active_self.clone(),
+        }
+    }
+    fn run_prepared_call(&self, prepared: PreparedCall) -> Result<Val, String> {
+        let is_generator = prepared.is_generator;
+        let return_type = prepared.return_type.clone();
+        let debug_name = prepared.debug_name.clone();
+        let debug_scope = prepared.debug_scope;
+        let mut nested = self.nested_from_prepared(prepared);
+        Self::exec_prepared_nested(
+            self,
+            &mut nested,
+            is_generator,
+            return_type,
+            debug_name,
+            debug_scope,
+        )
+    }
+    fn run_prepared_call_mut(&mut self, prepared: PreparedCall) -> Result<Val, String> {
+        let is_generator = prepared.is_generator;
+        let return_type = prepared.return_type.clone();
+        let debug_name = prepared.debug_name.clone();
+        let debug_scope = prepared.debug_scope;
+        let mut nested = self.nested_from_prepared(prepared);
+        let res = Self::exec_prepared_nested(
+            self,
+            &mut nested,
+            is_generator,
+            return_type,
+            debug_name,
+            debug_scope,
+        )?;
+        if !Arc::ptr_eq(&self.funcs, &nested.funcs) {
+            self.funcs = nested.funcs;
+        }
+        if !Arc::ptr_eq(&self.classes, &nested.classes) {
+            self.classes = nested.classes;
+            self.method_cache.clear();
+        }
+        Ok(res)
+    }
+    pub(crate) fn instantiate(&mut self, class_name: &str, args: Vec<Val>) -> Result<Val, String> {
         self.instantiate_kw(class_name, args, Vec::new())
     }
     pub(crate) fn instantiate_kw(
-        &self,
+        &mut self,
+        class_name: &str,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+    ) -> Result<Val, String> {
+        match class_name {
+            "int" | "float" | "str" | "bool" | "list" | "dict" | "type" => {
+                return self
+                    .call_builtin_kw(class_name, args, kwargs)?
+                    .ok_or_else(|| format!("builtin '{class_name}' did not produce a value"));
+            }
+            "object" => {
+                if !args.is_empty() || !kwargs.is_empty() {
+                    return Err("object() takes no arguments".into());
+                }
+                return self.alloc_object("object", HashMap::new());
+            }
+            _ => {}
+        }
+        let meta_name = self
+            .classes
+            .get(class_name)
+            .ok_or_else(|| format!("unknown class '{class_name}'"))?
+            .metaclass
+            .clone();
+        if let Some(meta) = meta_name {
+            if let Some((owner, def)) = self.find_method_with_owner_cached(&meta, "__call__") {
+                if owner != "type" && owner != "object" {
+                    let cls_obj = self.class_object_val(class_name)?;
+                    let mut call_args = Vec::with_capacity(1 + args.len());
+                    call_args.push(cls_obj.clone());
+                    call_args.extend(args);
+                    return self.call_def_kw_ctx(
+                        def,
+                        call_args,
+                        kwargs,
+                        Some(owner),
+                        Some(cls_obj),
+                    );
+                }
+            }
+        }
+        self.default_instantiate_kw(class_name, args, kwargs)
+    }
+    fn default_instantiate_kw(
+        &mut self,
         class_name: &str,
         args: Vec<Val>,
         kwargs: Vec<(String, Val)>,
@@ -644,25 +854,78 @@ impl Vm {
         if !self.classes.contains_key(class_name) {
             return Err(format!("unknown class '{class_name}'"));
         }
-        let id = OBJECT_IDS.fetch_add(1, Ordering::Relaxed);
-        self.objects
-            .lock()
-            .map_err(|_| "object heap poisoned")?
-            .insert(
-                id,
-                ObjectData {
-                    class_name: class_name.to_string(),
-                    fields: HashMap::new(),
-                },
-            );
-        if let Some(init) = self.find_method(class_name, "init") {
-            let mut call_args = vec![Val::Object(id)];
+        let mro = self.class_mro_slice(class_name);
+        let mut custom_new: Option<(String, FunctionDef)> = None;
+        for c in &mro {
+            if c == "object" || c == "type" {
+                continue;
+            }
+            if let Some(cls) = self.classes.get(c) {
+                if let Some(def) = cls.methods.get("__new__") {
+                    custom_new = Some((c.clone(), def.clone()));
+                    break;
+                }
+            }
+        }
+        let mut custom_new_ran = false;
+        let inst = if let Some((new_owner, new_def)) = custom_new {
+            custom_new_ran = true;
+            let cls_obj = self.class_object_val(class_name)?;
+            let mut new_args = Vec::with_capacity(1 + args.len());
+            new_args.push(cls_obj.clone());
+            new_args.extend(args.clone());
+            let created = self.call_def_kw_ctx(
+                new_def,
+                new_args,
+                kwargs.clone(),
+                Some(new_owner),
+                Some(cls_obj),
+            )?;
+            let is_instance = match created {
+                Val::Object(id) => self
+                    .object_class_name(id)
+                    .map(|c| self.class_is_a(&c, class_name))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !is_instance {
+                return Ok(created);
+            }
+            created
+        } else {
+            self.alloc_object(class_name, HashMap::new())?
+        };
+
+        let mut init_found: Option<(String, FunctionDef)> = None;
+        for c in &mro {
+            if c == "object" || c == "type" {
+                continue;
+            }
+            if let Some(cls) = self.classes.get(c) {
+                if let Some(def) = cls
+                    .methods
+                    .get("__init__")
+                    .or_else(|| cls.methods.get("init"))
+                {
+                    init_found = Some((c.clone(), def.clone()));
+                    break;
+                }
+            }
+        }
+        if let Some((init_owner, init_def)) = init_found {
+            let mut call_args = vec![inst.clone()];
             call_args.extend(args);
-            let _ = self.call_def_kw(init, call_args, kwargs)?;
-        } else if !args.is_empty() || !kwargs.is_empty() {
+            let _ = self.call_def_kw_ctx(
+                init_def,
+                call_args,
+                kwargs,
+                Some(init_owner),
+                Some(inst.clone()),
+            )?;
+        } else if !custom_new_ran && (!args.is_empty() || !kwargs.is_empty()) {
             return Err(format!("{class_name} has no init method"));
         }
-        Ok(Val::Object(id))
+        Ok(inst)
     }
     pub(crate) fn try_dunder(
         &mut self,
@@ -670,16 +933,20 @@ impl Vm {
         method: &str,
         args: Vec<Val>,
     ) -> Result<Option<Val>, String> {
-        let class_name = {
-            let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-            heap.get(&id).ok_or("dangling object")?.class_name.clone()
-        };
-        let Some(def) = self.find_method_cached(&class_name, method) else {
+        let class_name = self.object_class_name(id)?;
+        let Some((owner, def)) = self.find_method_with_owner_cached(&class_name, method) else {
             return Ok(None);
         };
-        let mut call_args = vec![Val::Object(id)];
+        let self_val = Val::Object(id);
+        let mut call_args = vec![self_val.clone()];
         call_args.extend(args);
-        Ok(Some(self.call_def(def, call_args)?))
+        Ok(Some(self.call_def_kw_ctx(
+            def,
+            call_args,
+            Vec::new(),
+            Some(owner),
+            Some(self_val),
+        )?))
     }
     pub(crate) fn callable_def(&self, value: &Val) -> Result<(String, FunctionDef), String> {
         let name = match value {
@@ -784,17 +1051,1277 @@ impl Vm {
         callee: &Val,
         args: Vec<Val>,
     ) -> Result<Val, String> {
-        if crate::py_bridge::is_py_handle(callee) {
-            return crate::py_bridge::py_call(callee, &args, None);
+        self.call_val_kw_sync(callee, args, Vec::new())
+    }
+    pub(crate) fn is_callable_val(&mut self, val: &Val) -> bool {
+        if crate::py_bridge::is_py_handle(val) {
+            return false;
+        }
+        match val {
+            Val::Function(_) => true,
+            Val::Object(id) => {
+                let Ok((cls, is_class_obj, is_bound)) =
+                    (|| -> Result<(String, bool, bool), String> {
+                        let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                        let o = heap.get(id).ok_or("dangling object")?;
+                        Ok((
+                            o.class_name.clone(),
+                            o.fields.contains_key("__veyra_class__"),
+                            o.class_name == "__bound_method__",
+                        ))
+                    })()
+                else {
+                    return false;
+                };
+                if is_class_obj || is_bound {
+                    return true;
+                }
+                if cls == "__property__"
+                    || cls == "__staticmethod__"
+                    || cls == "__classmethod__"
+                    || cls == "__super__"
+                {
+                    return false;
+                }
+                self.find_method_with_owner_cached(&cls, "__call__")
+                    .is_some()
+            }
+            _ => false,
+        }
+    }
+    fn object_class_name(&self, id: u64) -> Result<String, String> {
+        let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+        Ok(heap.get(&id).ok_or("dangling object")?.class_name.clone())
+    }
+    fn object_data_snapshot(&self, id: u64) -> Result<ObjectData, String> {
+        let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+        heap.get(&id)
+            .cloned()
+            .ok_or_else(|| "dangling object".into())
+    }
+    fn alloc_object(&self, class_name: &str, fields: HashMap<String, Val>) -> Result<Val, String> {
+        let id = OBJECT_IDS.fetch_add(1, Ordering::Relaxed);
+        self.objects
+            .lock()
+            .map_err(|_| "object heap poisoned")?
+            .insert(
+                id,
+                ObjectData {
+                    class_name: class_name.to_string(),
+                    fields,
+                },
+            );
+        Ok(Val::Object(id))
+    }
+    pub(crate) fn class_object_tag(&self, val: &Val) -> Result<Option<String>, String> {
+        let Val::Object(id) = val else {
+            return Ok(None);
+        };
+        let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+        Ok(heap
+            .get(id)
+            .and_then(|o| match o.fields.get("__veyra_class__") {
+                Some(Val::Str(name)) => Some(name.clone()),
+                _ => None,
+            }))
+    }
+    pub(crate) fn resolve_class_name_arg(&self, val: &Val) -> Result<String, String> {
+        if let Some(cls) = self.class_object_tag(val)? {
+            return Ok(cls);
+        }
+        if let Val::Str(name) = val {
+            if self.classes.contains_key(name) {
+                return Ok(name.clone());
+            }
+        }
+        Err(format!("expected class/type, got {}", val.show()))
+    }
+    pub(crate) fn class_object_val(&mut self, cls_name: &str) -> Result<Val, String> {
+        self.ensure_builtin_classes();
+        if !self.classes.contains_key(cls_name) {
+            return Err(format!("unknown class '{cls_name}'"));
+        }
+        {
+            let cache = self
+                .class_objects
+                .lock()
+                .map_err(|_| "class object table poisoned")?;
+            if let Some(&id) = cache.get(cls_name) {
+                let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                if heap.contains_key(&id) {
+                    return Ok(Val::Object(id));
+                }
+            }
+        }
+        let meta_name = self
+            .classes
+            .get(cls_name)
+            .and_then(|c| c.metaclass.clone())
+            .unwrap_or_else(|| "type".to_string());
+        let mut fields = HashMap::new();
+        fields.insert(
+            "__veyra_class__".to_string(),
+            Val::Str(cls_name.to_string()),
+        );
+        fields.insert("__name__".to_string(), Val::Str(cls_name.to_string()));
+        let obj = self.alloc_object(&meta_name, fields)?;
+        if let Val::Object(id) = obj {
+            self.class_objects
+                .lock()
+                .map_err(|_| "class object table poisoned")?
+                .insert(cls_name.to_string(), id);
+        }
+        Ok(obj)
+    }
+    fn make_bound_method(
+        &self,
+        func: Val,
+        self_val: Val,
+        owner: Option<&str>,
+    ) -> Result<Val, String> {
+        let mut fields = HashMap::new();
+        fields.insert("__func__".to_string(), func);
+        fields.insert("__self__".to_string(), self_val);
+        if let Some(o) = owner {
+            fields.insert("__owner__".to_string(), Val::Str(o.to_string()));
+        }
+        self.alloc_object("__bound_method__", fields)
+    }
+    pub(crate) fn make_property_obj(&self, fget: Val, fset: Val, fdel: Val) -> Result<Val, String> {
+        let mut fields = HashMap::new();
+        fields.insert("fget".to_string(), fget);
+        fields.insert("fset".to_string(), fset);
+        fields.insert("fdel".to_string(), fdel);
+        self.alloc_object("__property__", fields)
+    }
+    pub(crate) fn make_descriptor_wrapper(&self, tag: &str, func: Val) -> Result<Val, String> {
+        let mut fields = HashMap::new();
+        fields.insert("__func__".to_string(), func);
+        self.alloc_object(tag, fields)
+    }
+    pub(crate) fn make_super_obj(&mut self, args: &[Val]) -> Result<Val, String> {
+        let (thisclass, self_val) = if args.is_empty() {
+            let cls = self
+                .active_class
+                .clone()
+                .ok_or_else(|| "super(): no active class context".to_string())?;
+            let sv = self
+                .active_self
+                .clone()
+                .ok_or_else(|| "super(): no active self/cls context".to_string())?;
+            (cls, sv)
+        } else if args.len() == 2 {
+            let cls = self.resolve_class_name_arg(&args[0])?;
+            (cls, args[1].clone())
+        } else {
+            return Err("super() expects 0 or 2 arguments (cls, self_or_cls)".into());
+        };
+        let mut fields = HashMap::new();
+        fields.insert("__thisclass__".to_string(), Val::Str(thisclass));
+        fields.insert("__self__".to_string(), self_val);
+        self.alloc_object("__super__", fields)
+    }
+    fn find_member_in_mro_slice(
+        &self,
+        mro: &[String],
+        member: &str,
+    ) -> Option<(String, bool, Val, Option<FunctionDef>)> {
+        for cls_name in mro {
+            if let Some(cls) = self.classes.get(cls_name) {
+                if let Some(v) = cls.attrs.get(member) {
+                    return Some((cls_name.clone(), true, v.clone(), None));
+                }
+                if let Some(def) = cls.methods.get(member) {
+                    return Some((cls_name.clone(), false, Val::Null, Some(def.clone())));
+                }
+            }
+        }
+        None
+    }
+    fn descriptor_has_method(&mut self, val: &Val, method: &str) -> Result<Option<String>, String> {
+        let Val::Object(id) = val else {
+            return Ok(None);
+        };
+        let cls = self.object_class_name(*id)?;
+        if cls == "__property__" {
+            return Ok(Some(cls));
+        }
+        if matches!(
+            cls.as_str(),
+            "__staticmethod__" | "__classmethod__" | "__bound_method__" | "__super__"
+        ) {
+            return Ok(None);
+        }
+        if self.find_method_with_owner_cached(&cls, method).is_some() {
+            Ok(Some(cls))
+        } else {
+            Ok(None)
+        }
+    }
+    fn register_class_from_ns(
+        &mut self,
+        meta_name: &str,
+        cls_name: &str,
+        bases_in: &[String],
+        ns_pairs: Vec<(Val, Val)>,
+    ) -> Result<Val, String> {
+        self.ensure_builtin_classes();
+        let bases = if bases_in.is_empty() && cls_name != "object" {
+            vec!["object".to_string()]
+        } else {
+            bases_in.to_vec()
+        };
+        let mro = compute_c3_mro(cls_name, &bases, |b| {
+            self.classes
+                .get(b)
+                .map(|c| {
+                    if c.mro.is_empty() {
+                        vec![b.to_string(), "object".to_string()]
+                    } else {
+                        c.mro.clone()
+                    }
+                })
+                .ok_or_else(|| format!("unknown base class '{b}'"))
+        })?;
+        let mut attrs = HashMap::new();
+        let mut methods = HashMap::new();
+        for (k, v) in ns_pairs {
+            let key = k.show();
+            if let Val::Function(ref fk) = v {
+                if !fk.starts_with("__builtin__:") {
+                    if let Ok((_, def)) = self.callable_def(&v) {
+                        methods.insert(key, def);
+                        continue;
+                    }
+                }
+            }
+            attrs.insert(key, v);
+        }
+        Arc::make_mut(&mut self.classes).insert(
+            cls_name.to_string(),
+            ClassDef {
+                bases,
+                metaclass: if meta_name == "type" {
+                    None
+                } else {
+                    Some(meta_name.to_string())
+                },
+                mro,
+                attrs,
+                methods,
+            },
+        );
+        self.method_cache.clear();
+        if let Ok(mut cache) = self.class_objects.lock() {
+            cache.remove(cls_name);
+        }
+        self.class_object_val(cls_name)
+    }
+    pub(crate) fn dynamic_type_create(
+        &mut self,
+        name: &str,
+        bases_val: &Val,
+        ns_val: &Val,
+    ) -> Result<Val, String> {
+        let base_items = self.iterable_values(bases_val)?;
+        let mut bases = Vec::with_capacity(base_items.len());
+        for b in &base_items {
+            bases.push(self.resolve_class_name_arg(b)?);
+        }
+        let Val::Map(pairs) = ns_val else {
+            return Err("type(name, bases, namespace) namespace must be a Map".into());
+        };
+        self.register_class_from_ns("type", name, &bases, pairs.clone())
+    }
+    fn invoke_ctx_sync(
+        &mut self,
+        callable: &Val,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+        active_class: Option<String>,
+        active_self: Option<Val>,
+    ) -> Result<Val, String> {
+        if crate::py_bridge::is_py_handle(callable) {
+            if kwargs.is_empty() {
+                return crate::py_bridge::py_call(callable, &args, None);
+            }
+            let kw_map = Val::Map(kwargs.into_iter().map(|(k, v)| (Val::Str(k), v)).collect());
+            return crate::py_bridge::py_call(callable, &args, Some(&kw_map));
+        }
+        if let Val::Function(s) = callable {
+            if let Some(bname) = s.strip_prefix("__builtin__:") {
+                return self.call_builtin_wrapper_sync(bname, args, kwargs);
+            }
+        }
+        if let Val::Object(id) = callable {
+            let snap = self.object_data_snapshot(*id)?;
+            if snap.class_name == "__bound_method__" {
+                let func = snap
+                    .fields
+                    .get("__func__")
+                    .cloned()
+                    .ok_or("corrupt bound method")?;
+                let bound_self = snap
+                    .fields
+                    .get("__self__")
+                    .cloned()
+                    .ok_or("corrupt bound method")?;
+                let owner = snap.fields.get("__owner__").map(|v| v.show());
+                let mut full_args = Vec::with_capacity(1 + args.len());
+                full_args.push(bound_self.clone());
+                full_args.extend(args);
+                return self.invoke_ctx_sync(&func, full_args, kwargs, owner, Some(bound_self));
+            }
+            if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+                return self.instantiate_kw(cls_name, args, kwargs);
+            }
+            let (owner, def) = self
+                .find_method_with_owner_cached(&snap.class_name, "__call__")
+                .ok_or_else(|| format!("'{}' object is not callable", snap.class_name))?;
+            let mut full_args = Vec::with_capacity(1 + args.len());
+            full_args.push(Val::Object(*id));
+            full_args.extend(args);
+            return self.call_def_kw_ctx(
+                def,
+                full_args,
+                kwargs,
+                Some(owner),
+                Some(Val::Object(*id)),
+            );
+        }
+        let (_, def) = self.callable_def(callable)?;
+        self.call_def_kw_ctx(def, args, kwargs, active_class, active_self)
+    }
+    pub(crate) fn call_val_kw_sync(
+        &mut self,
+        callee: &Val,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+    ) -> Result<Val, String> {
+        self.invoke_ctx_sync(callee, args, kwargs, None, None)
+    }
+    fn call_builtin_wrapper_sync(
+        &mut self,
+        bname: &str,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+    ) -> Result<Val, String> {
+        match bname {
+            "__prop_getter__" | "__prop_setter__" | "__prop_deleter__" => {
+                if args.len() != 2 {
+                    return Err(format!("property.{bname} expects 1 callable argument"));
+                }
+                let Val::Object(pid) = args[0] else {
+                    return Err("property modifier target must be property".into());
+                };
+                let mut fields = self.object_data_snapshot(pid)?.fields;
+                let key = match bname {
+                    "__prop_getter__" => "fget",
+                    "__prop_setter__" => "fset",
+                    _ => "fdel",
+                };
+                fields.insert(key.to_string(), args[1].clone());
+                self.alloc_object("__property__", fields)
+            }
+            "__object_new__" => {
+                let cls_arg = args
+                    .first()
+                    .ok_or("object.__new__(cls) requires a class argument")?;
+                let cls_name = self.resolve_class_name_arg(cls_arg)?;
+                self.alloc_object(&cls_name, HashMap::new())
+            }
+            "__object_init__" => Ok(Val::Null),
+            "__object_setattr__" => {
+                if args.len() != 3 {
+                    return Err("object.__setattr__ expects (self, name, value)".into());
+                }
+                let Val::Object(id) = args[0] else {
+                    return Err("object.__setattr__ target must be an Object".into());
+                };
+                let attr = match &args[1] {
+                    Val::Str(s) => s.clone(),
+                    _ => return Err("attribute name must be String".into()),
+                };
+                let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                let data = heap.get_mut(&id).ok_or("dangling object")?;
+                data.fields.insert(attr, args[2].clone());
+                Ok(Val::Null)
+            }
+            "__object_delattr__" => {
+                if args.len() != 2 {
+                    return Err("object.__delattr__ expects (self, name)".into());
+                }
+                let Val::Object(id) = args[0] else {
+                    return Err("object.__delattr__ target must be an Object".into());
+                };
+                let attr = match &args[1] {
+                    Val::Str(s) => s.as_str(),
+                    _ => return Err("attribute name must be String".into()),
+                };
+                let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                let data = heap.get_mut(&id).ok_or("dangling object")?;
+                data.fields
+                    .remove(attr)
+                    .ok_or_else(|| format!("undefined field '{attr}'"))?;
+                Ok(Val::Null)
+            }
+            "__type_call__" => {
+                if args.is_empty() {
+                    return Err("type.__call__ expects (cls, *args)".into());
+                }
+                let cls_name = self.resolve_class_name_arg(&args[0])?;
+                self.default_instantiate_kw(&cls_name, args[1..].to_vec(), kwargs)
+            }
+            "__type_new__" => {
+                if args.len() != 4 {
+                    return Err("type.__new__ expects (mcs, name, bases, namespace)".into());
+                }
+                let meta_name = self.resolve_class_name_arg(&args[0])?;
+                let Val::Str(ref cls_name) = args[1] else {
+                    return Err("type.__new__ name must be String".into());
+                };
+                let base_vals = self.iterable_values(&args[2])?;
+                let mut bases = Vec::with_capacity(base_vals.len());
+                for b in &base_vals {
+                    bases.push(self.resolve_class_name_arg(b)?);
+                }
+                let Val::Map(ref pairs) = args[3] else {
+                    return Err("type.__new__ namespace must be Map".into());
+                };
+                self.register_class_from_ns(&meta_name, cls_name, &bases, pairs.clone())
+            }
+            "__type_init__" => Ok(Val::Null),
+            other => self
+                .call_builtin_kw(other, args, kwargs)?
+                .ok_or_else(|| format!("unknown builtin '{other}'")),
+        }
+    }
+    fn super_target_info(&mut self, super_id: u64) -> Result<(Vec<String>, Val, bool), String> {
+        let snap = self.object_data_snapshot(super_id)?;
+        if snap.class_name != "__super__" {
+            return Err("internal error: expected __super__ object".into());
+        }
+        let thisclass = match snap.fields.get("__thisclass__") {
+            Some(Val::Str(s)) => s.clone(),
+            _ => return Err("corrupt super() object".into()),
+        };
+        let self_val = snap
+            .fields
+            .get("__self__")
+            .cloned()
+            .ok_or("corrupt super() object")?;
+        let (target_cls, is_cls_bind) = if let Some(cls_name) = self.class_object_tag(&self_val)? {
+            if self.class_is_a(&cls_name, &thisclass) {
+                (cls_name, true)
+            } else if let Val::Object(oid) = self_val {
+                (self.object_class_name(oid)?, false)
+            } else {
+                (cls_name, true)
+            }
+        } else if let Val::Object(oid) = self_val {
+            (self.object_class_name(oid)?, false)
+        } else {
+            return Err("super() second argument must be object or class".into());
+        };
+        let mro = self.class_mro_slice(&target_cls);
+        let pos = mro
+            .iter()
+            .position(|c| c == &thisclass)
+            .ok_or_else(|| format!("'{thisclass}' is not in MRO of '{target_cls}'"))?;
+        Ok((mro[pos + 1..].to_vec(), self_val, is_cls_bind))
+    }
+    fn super_get_attr(&mut self, super_id: u64, name: &str) -> Result<Val, String> {
+        let (tail_mro, self_val, is_cls_bind) = self.super_target_info(super_id)?;
+        if let Some((owner, is_attr, attr_val, method_def)) =
+            self.find_member_in_mro_slice(&tail_mro, name)
+        {
+            return self.materialize_member(
+                &owner,
+                is_attr,
+                attr_val,
+                method_def,
+                Some(self_val),
+                is_cls_bind,
+            );
+        }
+        let is_class_arg = self.class_object_tag(&self_val)?.is_some();
+        for c in &tail_mro {
+            if c == "object" {
+                if let Some(b) = match name {
+                    "__new__" => Some("__builtin__:__object_new__"),
+                    "__init__" => Some("__builtin__:__object_init__"),
+                    "__setattr__" => Some("__builtin__:__object_setattr__"),
+                    "__delattr__" => Some("__builtin__:__object_delattr__"),
+                    _ => None,
+                } {
+                    return self.make_bound_method(
+                        Val::Function(b.to_string()),
+                        self_val,
+                        Some("object"),
+                    );
+                }
+            } else if c == "type" && (is_cls_bind || is_class_arg) {
+                if let Some(b) = match name {
+                    "__call__" => Some("__builtin__:__type_call__"),
+                    "__new__" => Some("__builtin__:__type_new__"),
+                    "__init__" => Some("__builtin__:__type_init__"),
+                    _ => None,
+                } {
+                    if name == "__new__" {
+                        return Ok(Val::Function(b.to_string()));
+                    }
+                    return self.make_bound_method(
+                        Val::Function(b.to_string()),
+                        self_val,
+                        Some("type"),
+                    );
+                }
+            }
+        }
+        Err(format!("'super' object has no attribute '{name}'"))
+    }
+    fn materialize_member(
+        &mut self,
+        owner: &str,
+        is_attr: bool,
+        attr_val: Val,
+        method_def: Option<FunctionDef>,
+        recv_opt: Option<Val>,
+        is_cls_bind: bool,
+    ) -> Result<Val, String> {
+        if is_attr {
+            if let Val::Object(did) = attr_val {
+                let dcls = self.object_class_name(did)?;
+                if dcls == "__staticmethod__" {
+                    let df = self.object_data_snapshot(did)?;
+                    return df
+                        .fields
+                        .get("__func__")
+                        .cloned()
+                        .ok_or_else(|| "corrupt staticmethod".to_string());
+                }
+                if dcls == "__classmethod__" {
+                    let df = self.object_data_snapshot(did)?;
+                    let func = df
+                        .fields
+                        .get("__func__")
+                        .cloned()
+                        .ok_or_else(|| "corrupt classmethod".to_string())?;
+                    let cls_val = match recv_opt {
+                        Some(ref r) => {
+                            if is_cls_bind {
+                                r.clone()
+                            } else if let Val::Object(oid) = r {
+                                let ocls = self.object_class_name(*oid)?;
+                                self.class_object_val(&ocls)?
+                            } else {
+                                self.class_object_val(owner)?
+                            }
+                        }
+                        None => self.class_object_val(owner)?,
+                    };
+                    return self.make_bound_method(func, cls_val, Some(owner));
+                }
+                if dcls == "__property__" {
+                    if !is_cls_bind {
+                        if let Some(inst) = recv_opt {
+                            let df = self.object_data_snapshot(did)?;
+                            let fget = df.fields.get("fget").cloned().unwrap_or(Val::Null);
+                            if matches!(fget, Val::Null) {
+                                return Err("unreadable attribute (property has no getter)".into());
+                            }
+                            return self.invoke_ctx_sync(
+                                &fget,
+                                vec![inst.clone()],
+                                Vec::new(),
+                                Some(owner.to_string()),
+                                Some(inst),
+                            );
+                        }
+                    }
+                    return Ok(attr_val);
+                }
+                if let Some((_, get_def)) = self.find_method_with_owner_cached(&dcls, "__get__") {
+                    let owner_cls = match recv_opt {
+                        Some(ref r) if is_cls_bind => r.clone(),
+                        Some(Val::Object(oid)) => {
+                            let ocls = self.object_class_name(oid)?;
+                            self.class_object_val(&ocls)?
+                        }
+                        _ => self.class_object_val(owner)?,
+                    };
+                    let inst_arg = if is_cls_bind {
+                        Val::Null
+                    } else {
+                        recv_opt.unwrap_or(Val::Null)
+                    };
+                    return self.call_def_kw_ctx(
+                        get_def,
+                        vec![attr_val, inst_arg, owner_cls],
+                        Vec::new(),
+                        Some(dcls),
+                        Some(Val::Object(did)),
+                    );
+                }
+            }
+            return Ok(attr_val);
+        }
+        let def = method_def.ok_or("missing method def")?;
+        let fn_val = Val::Function(export_function_object(def)?);
+        if is_cls_bind {
+            return Ok(fn_val);
+        }
+        match recv_opt {
+            Some(inst) => self.make_bound_method(fn_val, inst, Some(owner)),
+            None => Ok(fn_val),
+        }
+    }
+    pub(crate) fn vm_get_attr(&mut self, obj: &Val, name: &str) -> Result<Val, String> {
+        if crate::py_bridge::is_py_handle(obj) {
+            return crate::py_bridge::py_get(obj, name);
+        }
+        let Val::Object(id) = *obj else {
+            if let Val::Map(pairs) = obj {
+                return pairs
+                    .iter()
+                    .find(|(k, _)| *k == Val::Str(name.to_string()))
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| format!("undefined key '{name}'"));
+            }
+            return Err("member access requires object or map".into());
+        };
+        let snap = self.object_data_snapshot(id)?;
+        if snap.class_name == "__super__" {
+            return self.super_get_attr(id, name);
+        }
+        if snap.class_name == "__property__" {
+            if matches!(name, "getter" | "setter" | "deleter") {
+                return self.make_bound_method(
+                    Val::Function(format!("__builtin__:__prop_{name}__")),
+                    Val::Object(id),
+                    None,
+                );
+            }
+            if let Some(v) = snap.fields.get(name) {
+                return Ok(v.clone());
+            }
+            return Err(format!("'property' object has no attribute '{name}'"));
+        }
+        if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+            match name {
+                "__name__" => return Ok(Val::Str(cls_name.clone())),
+                "__bases__" => {
+                    let bases = self
+                        .classes
+                        .get(cls_name)
+                        .map(|c| c.bases.clone())
+                        .unwrap_or_default();
+                    let mut out = Vec::with_capacity(bases.len());
+                    for b in &bases {
+                        out.push(self.class_object_val(b)?);
+                    }
+                    return Ok(Val::List(out));
+                }
+                "__mro__" => {
+                    let mro = self.class_mro_slice(cls_name);
+                    let mut out = Vec::with_capacity(mro.len());
+                    for c in &mro {
+                        out.push(self.class_object_val(c)?);
+                    }
+                    return Ok(Val::List(out));
+                }
+                "__dict__" => {
+                    let pairs: Vec<(Val, Val)> = self
+                        .classes
+                        .get(cls_name)
+                        .map(|c| {
+                            c.attrs
+                                .iter()
+                                .map(|(k, v)| (Val::Str(k.clone()), v.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    return Ok(Val::Map(pairs));
+                }
+                _ => {}
+            }
+            let mro = self.class_mro_slice(cls_name);
+            if let Some((owner, is_attr, attr_val, method_def)) =
+                self.find_member_in_mro_slice(&mro, name)
+            {
+                return self.materialize_member(
+                    &owner,
+                    is_attr,
+                    attr_val,
+                    method_def,
+                    Some(Val::Object(id)),
+                    true,
+                );
+            }
+            if cls_name == "object" {
+                if let Some(b) = match name {
+                    "__new__" => Some("__builtin__:__object_new__"),
+                    "__init__" => Some("__builtin__:__object_init__"),
+                    "__setattr__" => Some("__builtin__:__object_setattr__"),
+                    "__delattr__" => Some("__builtin__:__object_delattr__"),
+                    _ => None,
+                } {
+                    return Ok(Val::Function(b.to_string()));
+                }
+            } else if cls_name == "type" {
+                if let Some(b) = match name {
+                    "__new__" => Some("__builtin__:__type_new__"),
+                    "__init__" => Some("__builtin__:__type_init__"),
+                    "__call__" => Some("__builtin__:__type_call__"),
+                    _ => None,
+                } {
+                    return Ok(Val::Function(b.to_string()));
+                }
+            }
+            let meta_mro = self.class_mro_slice(&snap.class_name);
+            if let Some((owner, is_attr, attr_val, method_def)) =
+                self.find_member_in_mro_slice(&meta_mro, name)
+            {
+                return self.materialize_member(
+                    &owner,
+                    is_attr,
+                    attr_val,
+                    method_def,
+                    Some(Val::Object(id)),
+                    false,
+                );
+            }
+            return Err(format!(
+                "type object '{cls_name}' has no attribute '{name}'"
+            ));
+        }
+
+        let mro = self.class_mro_slice(&snap.class_name);
+        let hit = self.find_member_in_mro_slice(&mro, name);
+        if let Some((ref owner, true, ref attr_val, _)) = hit {
+            let is_data = self.descriptor_has_method(attr_val, "__set__")?.is_some()
+                || self
+                    .descriptor_has_method(attr_val, "__delete__")?
+                    .is_some();
+            if is_data {
+                return self.materialize_member(
+                    owner,
+                    true,
+                    attr_val.clone(),
+                    None,
+                    Some(Val::Object(id)),
+                    false,
+                );
+            }
+        }
+        if let Some(v) = snap.fields.get(name) {
+            return Ok(v.clone());
+        }
+        if let Some((owner, is_attr, attr_val, method_def)) = hit {
+            return self.materialize_member(
+                &owner,
+                is_attr,
+                attr_val,
+                method_def,
+                Some(Val::Object(id)),
+                false,
+            );
+        }
+        if name != "__getattr__" {
+            if let Some((owner, def)) =
+                self.find_method_with_owner_cached(&snap.class_name, "__getattr__")
+            {
+                return self.call_def_kw_ctx(
+                    def,
+                    vec![Val::Object(id), Val::Str(name.to_string())],
+                    Vec::new(),
+                    Some(owner),
+                    Some(Val::Object(id)),
+                );
+            }
+        }
+        Err(format!("undefined field '{name}'"))
+    }
+    pub(crate) fn vm_has_attr(&mut self, obj: &Val, name: &str) -> Result<bool, String> {
+        if crate::py_bridge::is_py_handle(obj) {
+            return crate::py_bridge::py_hasattr(obj, name);
+        }
+        Ok(self.vm_get_attr(obj, name).is_ok())
+    }
+    pub(crate) fn pat_class_pos(
+        &mut self,
+        val: &Val,
+        cls: &Val,
+        pos_len: usize,
+    ) -> Result<Val, String> {
+        let target = self.resolve_class_name_arg(cls)?;
+        if !self.value_matches(val, &target) {
+            return Ok(Val::Null);
+        }
+        if pos_len == 0 {
+            return Ok(Val::List(Vec::new()));
+        }
+        if matches!(
+            target.as_str(),
+            "int" | "float" | "str" | "bool" | "list" | "dict" | "function" | "object"
+        ) {
+            if pos_len == 1 {
+                return Ok(Val::List(vec![val.clone()]));
+            }
+            return Err(format!(
+                "{target}() accepts at most 1 positional sub-pattern ({pos_len} given)"
+            ));
+        }
+        let mro = self.class_mro_slice(&target);
+        let mut attr_names: Option<Vec<String>> = None;
+        for cname in &mro {
+            if let Some(cdef) = self.classes.get(cname) {
+                if let Some(Val::List(items)) = cdef.attrs.get("__match_args__") {
+                    let mut names = Vec::with_capacity(items.len());
+                    for item in items {
+                        let Val::Str(s) = item else {
+                            return Err(format!("{target}.__match_args__ must contain strings"));
+                        };
+                        names.push(s.clone());
+                    }
+                    attr_names = Some(names);
+                    break;
+                }
+            }
+        }
+        let attr_names = if let Some(names) = attr_names {
+            names
+        } else {
+            let mut found = Vec::new();
+            for cname in &mro {
+                if let Some(cdef) = self.classes.get(cname) {
+                    if let Some(def) = cdef
+                        .methods
+                        .get("init")
+                        .or_else(|| cdef.methods.get("__init__"))
+                    {
+                        for (p, ty) in def.params.iter() {
+                            if matches!(ty.as_deref(), Some("*") | Some("**")) {
+                                break;
+                            }
+                            if p != "self" {
+                                found.push(p.clone());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        if pos_len > attr_names.len() {
+            return Err(format!(
+                "{target}() accepts {} positional sub-patterns ({pos_len} given)",
+                attr_names.len()
+            ));
+        }
+        let mut out = Vec::with_capacity(pos_len);
+        for name in &attr_names[..pos_len] {
+            match self.vm_get_attr(val, name) {
+                Ok(v) => out.push(v),
+                Err(_) => return Ok(Val::Null),
+            }
+        }
+        Ok(Val::List(out))
+    }
+    pub(crate) fn vm_set_attr(
+        &mut self,
+        obj: &Val,
+        name: String,
+        value: Val,
+    ) -> Result<(), String> {
+        if crate::py_bridge::is_py_handle(obj) {
+            let _ = crate::py_bridge::py_set(obj, &name, &value)?;
+            return Ok(());
+        }
+        let Val::Object(id) = *obj else {
+            return Err("member assignment requires object".into());
+        };
+        let snap = self.object_data_snapshot(id)?;
+        if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+            let is_fn = matches!(value, Val::Function(ref fk) if !fk.starts_with("__builtin__:"))
+                .then(|| self.callable_def(&value).ok().map(|(_, d)| d))
+                .flatten();
+            let map = Arc::make_mut(&mut self.classes);
+            let cls = map
+                .get_mut(cls_name)
+                .ok_or_else(|| format!("unknown class '{cls_name}'"))?;
+            cls.attrs.remove(&name);
+            cls.methods.remove(&name);
+            if let Some(def) = is_fn {
+                cls.methods.insert(name, def);
+            } else {
+                cls.attrs.insert(name, value);
+            }
+            self.method_cache.clear();
+            return Ok(());
+        }
+        if name != "__setattr__" {
+            if let Some((owner, def)) =
+                self.find_method_with_owner_cached(&snap.class_name, "__setattr__")
+            {
+                if owner != "object" && owner != "type" {
+                    let _ = self.call_def_kw_ctx(
+                        def,
+                        vec![Val::Object(id), Val::Str(name), value],
+                        Vec::new(),
+                        Some(owner),
+                        Some(Val::Object(id)),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        let mro = self.class_mro_slice(&snap.class_name);
+        if let Some((owner, true, attr_val, _)) = self.find_member_in_mro_slice(&mro, &name) {
+            if let Val::Object(did) = attr_val {
+                let dcls = self.object_class_name(did)?;
+                if dcls == "__property__" {
+                    let df = self.object_data_snapshot(did)?;
+                    let fset = df.fields.get("fset").cloned().unwrap_or(Val::Null);
+                    if matches!(fset, Val::Null) {
+                        return Err(format!("property '{name}' has no setter"));
+                    }
+                    let _ = self.invoke_ctx_sync(
+                        &fset,
+                        vec![Val::Object(id), value],
+                        Vec::new(),
+                        Some(owner),
+                        Some(Val::Object(id)),
+                    )?;
+                    return Ok(());
+                }
+                if let Some((_, set_def)) = self.find_method_with_owner_cached(&dcls, "__set__") {
+                    let _ = self.call_def_kw_ctx(
+                        set_def,
+                        vec![attr_val, Val::Object(id), value],
+                        Vec::new(),
+                        Some(dcls),
+                        Some(Val::Object(did)),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+        let data = heap.get_mut(&id).ok_or("dangling object")?;
+        data.fields.insert(name, value);
+        Ok(())
+    }
+    pub(crate) fn vm_del_attr(&mut self, obj: &Val, name: &str) -> Result<(), String> {
+        let Val::Object(id) = *obj else {
+            return Err("delattr requires Object".into());
+        };
+        let snap = self.object_data_snapshot(id)?;
+        if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+            let map = Arc::make_mut(&mut self.classes);
+            let cls = map
+                .get_mut(cls_name)
+                .ok_or_else(|| format!("unknown class '{cls_name}'"))?;
+            let removed = cls.attrs.remove(name).is_some() || cls.methods.remove(name).is_some();
+            self.method_cache.clear();
+            if removed {
+                return Ok(());
+            }
+            return Err(format!(
+                "type object '{cls_name}' has no attribute '{name}'"
+            ));
+        }
+        let mro = self.class_mro_slice(&snap.class_name);
+        if let Some((owner, true, attr_val, _)) = self.find_member_in_mro_slice(&mro, name) {
+            if let Val::Object(did) = attr_val {
+                let dcls = self.object_class_name(did)?;
+                if dcls == "__property__" {
+                    let df = self.object_data_snapshot(did)?;
+                    let fdel = df.fields.get("fdel").cloned().unwrap_or(Val::Null);
+                    if matches!(fdel, Val::Null) {
+                        return Err(format!("property '{name}' has no deleter"));
+                    }
+                    let _ = self.invoke_ctx_sync(
+                        &fdel,
+                        vec![Val::Object(id)],
+                        Vec::new(),
+                        Some(owner),
+                        Some(Val::Object(id)),
+                    )?;
+                    return Ok(());
+                }
+                if let Some((_, del_def)) = self.find_method_with_owner_cached(&dcls, "__delete__")
+                {
+                    let _ = self.call_def_kw_ctx(
+                        del_def,
+                        vec![attr_val, Val::Object(id)],
+                        Vec::new(),
+                        Some(dcls),
+                        Some(Val::Object(did)),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        if name != "__delattr__" {
+            if let Some((owner, def)) =
+                self.find_method_with_owner_cached(&snap.class_name, "__delattr__")
+            {
+                if owner != "object" && owner != "type" {
+                    let _ = self.call_def_kw_ctx(
+                        def,
+                        vec![Val::Object(id), Val::Str(name.to_string())],
+                        Vec::new(),
+                        Some(owner),
+                        Some(Val::Object(id)),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+        let data = heap.get_mut(&id).ok_or("dangling object")?;
+        data.fields
+            .remove(name)
+            .ok_or_else(|| format!("undefined field '{name}'"))?;
+        Ok(())
+    }
+    fn invoke_val_in_execute_kw(
+        &mut self,
+        callee: Val,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+        active_class: Option<String>,
+        active_self: Option<Val>,
+    ) -> Result<(), String> {
+        if crate::py_bridge::is_py_handle(&callee) {
+            let res = if kwargs.is_empty() {
+                crate::py_bridge::py_call(&callee, &args, None)?
+            } else {
+                let kw_map = Val::Map(kwargs.into_iter().map(|(k, v)| (Val::Str(k), v)).collect());
+                crate::py_bridge::py_call(&callee, &args, Some(&kw_map))?
+            };
+            self.stack.push(res);
+            return Ok(());
+        }
+        if let Val::Function(ref s) = callee {
+            if let Some(bname) = s.strip_prefix("__builtin__:") {
+                let res = self.call_builtin_wrapper_sync(bname, args, kwargs)?;
+                self.stack.push(res);
+                return Ok(());
+            }
         }
         if let Val::Object(id) = callee {
-            if let Some(res) = self.try_dunder(*id, "__call__", args.clone())? {
-                return Ok(res);
+            let snap = self.object_data_snapshot(id)?;
+            if snap.class_name == "__bound_method__" {
+                let func = snap
+                    .fields
+                    .get("__func__")
+                    .cloned()
+                    .ok_or("corrupt bound method")?;
+                let bound_self = snap
+                    .fields
+                    .get("__self__")
+                    .cloned()
+                    .ok_or("corrupt bound method")?;
+                let owner = snap.fields.get("__owner__").map(|v| v.show());
+                let mut full_args = Vec::with_capacity(1 + args.len());
+                full_args.push(bound_self.clone());
+                full_args.extend(args);
+                return self.invoke_val_in_execute_kw(
+                    func,
+                    full_args,
+                    kwargs,
+                    owner,
+                    Some(bound_self),
+                );
             }
-            return Err("object has no __call__ method".into());
+            if let Some(Val::Str(cls_name)) = snap.fields.get("__veyra_class__") {
+                let inst = self.instantiate_kw(cls_name, args, kwargs)?;
+                self.stack.push(inst);
+                return Ok(());
+            }
+            let (owner, def) = self
+                .find_method_with_owner_cached(&snap.class_name, "__call__")
+                .ok_or_else(|| format!("'{}' object is not callable", snap.class_name))?;
+            let mut call_args = Vec::with_capacity(1 + args.len());
+            call_args.push(Val::Object(id));
+            call_args.extend(args);
+            return self.invoke_in_execute_kw_ctx(
+                def,
+                call_args,
+                kwargs,
+                Some(owner),
+                Some(Val::Object(id)),
+            );
         }
-        let (_, def) = self.callable_def(callee)?;
-        self.call_def(def, args)
+        let (_, def) = self.callable_def(&callee)?;
+        self.invoke_in_execute_kw_ctx(def, args, kwargs, active_class, active_self)
+    }
+    fn call_object_method_in_execute(
+        &mut self,
+        id: u64,
+        name: &str,
+        args: Vec<Val>,
+        kwargs: Vec<(String, Val)>,
+    ) -> Result<(), String> {
+        let snap = self.object_data_snapshot(id)?;
+        if snap.class_name != "__super__"
+            && snap.class_name != "__property__"
+            && snap.class_name != "__bound_method__"
+            && !snap.fields.contains_key("__veyra_class__")
+            && !snap.fields.contains_key(name)
+        {
+            let mro = self.class_mro_slice(&snap.class_name);
+            if let Some((owner, false, _, Some(def))) = self.find_member_in_mro_slice(&mro, name) {
+                let mut call_args = Vec::with_capacity(1 + args.len());
+                call_args.push(Val::Object(id));
+                call_args.extend(args);
+                return self.invoke_in_execute_kw_ctx(
+                    def,
+                    call_args,
+                    kwargs,
+                    Some(owner),
+                    Some(Val::Object(id)),
+                );
+            }
+        }
+        let member_val = self.vm_get_attr(&Val::Object(id), name)?;
+        self.invoke_val_in_execute_kw(member_val, args, kwargs, None, None)
+    }
+    fn build_class_op(
+        &mut self,
+        name: String,
+        base_count: usize,
+        body_code: Vec<Op>,
+    ) -> Result<(), String> {
+        self.ensure_builtin_classes();
+        let meta_val = self.pop()?;
+        let mut raw_bases = Vec::with_capacity(base_count);
+        for _ in 0..base_count {
+            raw_bases.push(self.pop()?);
+        }
+        raw_bases.reverse();
+        let mut bases = Vec::with_capacity(raw_bases.len());
+        for b in &raw_bases {
+            bases.push(self.resolve_class_name_arg(b)?);
+        }
+        if bases.is_empty() && name != "object" {
+            bases.push("object".to_string());
+        }
+        let mut child = Vm::new(body_code);
+        child.vars = self.vars.clone();
+        child.cells = self.cells.clone();
+        child.funcs = self.funcs.clone();
+        child.classes = self.classes.clone();
+        child.objects = self.objects.clone();
+        child.class_objects = self.class_objects.clone();
+        child.debugger = self.debugger.clone();
+        let ns_val = child.execute()?;
+        for (k, v) in child.funcs.iter() {
+            if !self.funcs.contains_key(k) {
+                Arc::make_mut(&mut self.funcs).insert(k.clone(), v.clone());
+            }
+        }
+        for (k, v) in child.classes.iter() {
+            if !self.classes.contains_key(k) {
+                Arc::make_mut(&mut self.classes).insert(k.clone(), v.clone());
+            }
+        }
+        self.method_cache.clear();
+        let Val::Map(ns_pairs) = ns_val else {
+            return Err("internal error: class body did not return namespace map".into());
+        };
+
+        let meta_name = if !matches!(meta_val, Val::Null) {
+            if let Ok(mname) = self.resolve_class_name_arg(&meta_val) {
+                mname
+            } else {
+                let mut base_objs = Vec::with_capacity(bases.len());
+                for b in &bases {
+                    base_objs.push(self.class_object_val(b)?);
+                }
+                let res = self.call_val_kw_sync(
+                    &meta_val,
+                    vec![Val::Str(name), Val::List(base_objs), Val::Map(ns_pairs)],
+                    Vec::new(),
+                )?;
+                self.stack.push(res);
+                return Ok(());
+            }
+        } else {
+            let mut chosen = "type".to_string();
+            for b in &bases {
+                if let Some(bm) = self.classes.get(b).and_then(|c| c.metaclass.clone()) {
+                    if self.class_is_a(&bm, &chosen) {
+                        chosen = bm;
+                    } else if !self.class_is_a(&chosen, &bm) {
+                        return Err("metaclass conflict among class bases".into());
+                    }
+                }
+            }
+            chosen
+        };
+
+        if meta_name == "type" {
+            let cls_obj = self.register_class_from_ns("type", &name, &bases, ns_pairs)?;
+            self.stack.push(cls_obj);
+            return Ok(());
+        }
+
+        let meta_cls_obj = self.class_object_val(&meta_name)?;
+        let mut base_objs = Vec::with_capacity(bases.len());
+        for b in &bases {
+            base_objs.push(self.class_object_val(b)?);
+        }
+        let bases_list = Val::List(base_objs);
+        let ns_map_val = Val::Map(ns_pairs);
+
+        let custom_new = self
+            .find_method_with_owner_cached(&meta_name, "__new__")
+            .filter(|(o, _)| o != "type" && o != "object");
+        let cls_obj = if let Some((new_owner, new_def)) = custom_new {
+            self.call_def_kw_ctx(
+                new_def,
+                vec![
+                    meta_cls_obj.clone(),
+                    Val::Str(name.clone()),
+                    bases_list.clone(),
+                    ns_map_val.clone(),
+                ],
+                Vec::new(),
+                Some(new_owner),
+                Some(meta_cls_obj),
+            )?
+        } else {
+            let Val::Map(ns_pairs_owned) = ns_map_val.clone() else {
+                unreachable!();
+            };
+            self.register_class_from_ns(&meta_name, &name, &bases, ns_pairs_owned)?
+        };
+
+        if let Some(created_name) = self.class_object_tag(&cls_obj)? {
+            let actual_meta = self
+                .classes
+                .get(&created_name)
+                .and_then(|c| c.metaclass.clone())
+                .unwrap_or_else(|| meta_name.clone());
+            if let Some((init_owner, init_def)) = self
+                .find_method_with_owner_cached(&actual_meta, "__init__")
+                .filter(|(o, _)| o != "type" && o != "object")
+            {
+                let _ = self.call_def_kw_ctx(
+                    init_def,
+                    vec![cls_obj.clone(), Val::Str(name), bases_list, ns_map_val],
+                    Vec::new(),
+                    Some(init_owner),
+                    Some(cls_obj.clone()),
+                )?;
+            }
+        }
+        self.stack.push(cls_obj);
+        Ok(())
     }
     pub(crate) fn sorted_with_opts(
         &mut self,
@@ -858,6 +2385,29 @@ impl Vm {
                     return Err(format!("print got unexpected keyword argument '{bad}'"));
                 }
                 self.print_val_opts(&pos, &sep, &end)?
+            }
+            "property" => {
+                let mut fget = pos.first().cloned().unwrap_or(Val::Null);
+                let mut fset = pos.get(1).cloned().unwrap_or(Val::Null);
+                let mut fdel = pos.get(2).cloned().unwrap_or(Val::Null);
+                if pos.len() > 3 {
+                    return Err(
+                        "property expects at most 3 positional arguments (fget, fset, fdel)".into(),
+                    );
+                }
+                if let Some(v) = Self::pop_kw(&mut kwargs, "fget") {
+                    fget = v;
+                }
+                if let Some(v) = Self::pop_kw(&mut kwargs, "fset") {
+                    fset = v;
+                }
+                if let Some(v) = Self::pop_kw(&mut kwargs, "fdel") {
+                    fdel = v;
+                }
+                if let Some((bad, _)) = kwargs.first() {
+                    return Err(format!("property got unexpected keyword argument '{bad}'"));
+                }
+                self.make_property_obj(fget, fset, fdel)?
             }
             "sorted" | "sort" => {
                 if pos.len() != 1 {
@@ -1705,6 +3255,26 @@ impl Vm {
                     v
                 } else if self.funcs.contains_key(&n) {
                     Val::Function(n.clone())
+                } else if self.classes.contains_key(&n) {
+                    self.class_object_val(&n)?
+                } else if matches!(
+                    n.as_str(),
+                    "property"
+                        | "staticmethod"
+                        | "classmethod"
+                        | "super"
+                        | "isinstance"
+                        | "is_instance"
+                        | "issubclass"
+                        | "mro"
+                        | "getattr"
+                        | "hasattr"
+                        | "setattr"
+                        | "delattr"
+                        | "type_of"
+                        | "callable"
+                ) {
+                    Val::Function(format!("__builtin__:{n}"))
                 } else {
                     return Err(format!("undefined name '{n}'"));
                 };
@@ -1839,15 +3409,20 @@ impl Vm {
             Op::Lt | Op::Le | Op::Gt | Op::Ge => {
                 let b = self.pop()?;
                 let a = self.pop()?;
-                let (x, y) = match (a, b) {
-                    (Val::Num(x), Val::Num(y)) => (x, y),
+                let yes = match (a, b) {
+                    (Val::Num(x), Val::Num(y)) => match op {
+                        Op::Lt => x < y,
+                        Op::Le => x <= y,
+                        Op::Gt => x > y,
+                        _ => x >= y,
+                    },
+                    (Val::Str(x), Val::Str(y)) => match op {
+                        Op::Lt => x < y,
+                        Op::Le => x <= y,
+                        Op::Gt => x > y,
+                        _ => x >= y,
+                    },
                     _ => return Err("comparison requires numbers".into()),
-                };
-                let yes = match op {
-                    Op::Lt => x < y,
-                    Op::Le => x <= y,
-                    Op::Gt => x > y,
-                    _ => x >= y,
                 };
                 self.stack.push(Val::Bool(yes));
             }
@@ -1952,44 +3527,13 @@ impl Vm {
             }
             Op::GetMember(name) => {
                 let obj = self.pop()?;
-                if crate::py_bridge::is_py_handle(&obj) {
-                    let v = crate::py_bridge::py_get(&obj, &name)?;
-                    self.stack.push(v);
-                    return Ok(None);
-                }
-                let value = match obj {
-                    Val::Object(id) => {
-                        let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-                        let data = heap.get(&id).ok_or("dangling object")?;
-                        data.fields
-                            .get(&name)
-                            .cloned()
-                            .ok_or(format!("undefined field '{name}'"))?
-                    }
-                    Val::Map(pairs) => pairs
-                        .iter()
-                        .find(|(k, _)| *k == Val::Str(name.clone()))
-                        .map(|(_, v)| v.clone())
-                        .ok_or(format!("undefined key '{name}'"))?,
-                    _ => return Err("member access requires object or map".into()),
-                };
+                let value = self.vm_get_attr(&obj, &name)?;
                 self.stack.push(value);
             }
             Op::SetMember(name) => {
                 let value = self.pop()?;
                 let obj = self.pop()?;
-                if crate::py_bridge::is_py_handle(&obj) {
-                    let _ = crate::py_bridge::py_set(&obj, &name, &value)?;
-                    return Ok(None);
-                }
-                match obj {
-                    Val::Object(id) => {
-                        let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-                        let data = heap.get_mut(&id).ok_or("dangling object")?;
-                        data.fields.insert(name, value);
-                    }
-                    _ => return Err("member assignment requires object".into()),
-                }
+                self.vm_set_attr(&obj, name, value)?;
             }
             Op::CallMethod(name, k) => {
                 let mut args = vec![];
@@ -2003,16 +3547,7 @@ impl Vm {
                         crate::py_bridge::py_call_method(&receiver, &name, &args, None)?
                     }
                     Val::Object(id) => {
-                        let class_name = {
-                            let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-                            heap.get(&id).ok_or("dangling object")?.class_name.clone()
-                        };
-                        let method = self
-                            .find_method_cached(&class_name, &name)
-                            .ok_or(format!("undefined method '{name}' on {class_name}"))?;
-                        let mut call_args = vec![Val::Object(id)];
-                        call_args.extend(args);
-                        self.invoke_in_execute(method, call_args)?;
+                        self.call_object_method_in_execute(id, &name, args, Vec::new())?;
                         return Ok(None);
                     }
                     Val::Map(mut pairs) => {
@@ -2021,6 +3556,11 @@ impl Vm {
                         {
                             if let Ok((_, def)) = self.callable_def(member) {
                                 self.invoke_in_execute(def, args)?;
+                                return Ok(None);
+                            }
+                            if matches!(member, Val::Object(_)) {
+                                let m = member.clone();
+                                self.invoke_val_in_execute_kw(m, args, Vec::new(), None, None)?;
                                 return Ok(None);
                             }
                             if crate::py_bridge::is_py_handle(member) {
@@ -2337,47 +3877,18 @@ impl Vm {
                 a.reverse();
                 if let Some(v) = self.call_builtin(&n, a.clone())? {
                     self.stack.push(v);
+                } else if let Some(val) = self.get_var(&n) {
+                    self.invoke_val_in_execute_kw(val, a, Vec::new(), None, None)?;
                 } else if self.classes.contains_key(&n) {
                     let v = self.instantiate(&n, a)?;
                     self.stack.push(v);
                 } else {
-                    match self.get_var(&n) {
-                        Some(Val::Function(target)) => {
-                            let def = if let Some(def) = self.funcs.get(&target).cloned() {
-                                def
-                            } else if let Some(def) = resolve_function_object(&target)? {
-                                def
-                            } else {
-                                return Err(format!("dangling function reference '{target}'"));
-                            };
-                            self.invoke_in_execute(def, a)?;
-                        }
-                        Some(val) if crate::py_bridge::is_py_handle(&val) => {
-                            let res = crate::py_bridge::py_call(&val, &a, None)?;
-                            self.stack.push(res);
-                        }
-                        Some(Val::Object(id)) => {
-                            let class_name = {
-                                let heap =
-                                    self.objects.lock().map_err(|_| "object heap poisoned")?;
-                                heap.get(&id).ok_or("dangling object")?.class_name.clone()
-                            };
-                            let method = self
-                                .find_method_cached(&class_name, "__call__")
-                                .ok_or(format!("'{class_name}' object is not callable"))?;
-                            let mut call_args = vec![Val::Object(id)];
-                            call_args.extend(a);
-                            self.invoke_in_execute(method, call_args)?;
-                        }
-                        _ => {
-                            let def = self
-                                .funcs
-                                .get(&n)
-                                .cloned()
-                                .ok_or(format!("unknown function or class '{n}'"))?;
-                            self.invoke_in_execute(def, a)?;
-                        }
-                    }
+                    let def = self
+                        .funcs
+                        .get(&n)
+                        .cloned()
+                        .ok_or(format!("unknown function or class '{n}'"))?;
+                    self.invoke_in_execute(def, a)?;
                 }
             }
             Op::CallExpr(k) => {
@@ -2387,24 +3898,7 @@ impl Vm {
                 }
                 a.reverse();
                 let callee = self.pop()?;
-                if crate::py_bridge::is_py_handle(&callee) {
-                    let res = crate::py_bridge::py_call(&callee, &a, None)?;
-                    self.stack.push(res);
-                } else if let Val::Object(id) = callee {
-                    let class_name = {
-                        let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-                        heap.get(&id).ok_or("dangling object")?.class_name.clone()
-                    };
-                    let method = self
-                        .find_method_cached(&class_name, "__call__")
-                        .ok_or(format!("'{class_name}' object is not callable"))?;
-                    let mut call_args = vec![Val::Object(id)];
-                    call_args.extend(a);
-                    self.invoke_in_execute(method, call_args)?;
-                } else {
-                    let (_, def) = self.callable_def(&callee)?;
-                    self.invoke_in_execute(def, a)?;
-                }
+                self.invoke_val_in_execute_kw(callee, a, Vec::new(), None, None)?;
             }
             Op::CallExt(kind, name, specs) => {
                 let mut raw_vals = Vec::with_capacity(specs.len());
@@ -2436,56 +3930,18 @@ impl Vm {
                             self.call_builtin_kw(&name, pos_args.clone(), kwargs.clone())?
                         {
                             self.stack.push(v);
+                        } else if let Some(val) = self.get_var(&name) {
+                            self.invoke_val_in_execute_kw(val, pos_args, kwargs, None, None)?;
                         } else if self.classes.contains_key(&name) {
                             let v = self.instantiate_kw(&name, pos_args, kwargs)?;
                             self.stack.push(v);
                         } else {
-                            match self.get_var(&name) {
-                                Some(Val::Function(target)) => {
-                                    let def = if let Some(def) = self.funcs.get(&target).cloned() {
-                                        def
-                                    } else if let Some(def) = resolve_function_object(&target)? {
-                                        def
-                                    } else {
-                                        return Err(format!(
-                                            "dangling function reference '{target}'"
-                                        ));
-                                    };
-                                    self.invoke_in_execute_kw(def, pos_args, kwargs)?;
-                                }
-                                Some(val) if crate::py_bridge::is_py_handle(&val) => {
-                                    let kw_map = Val::Map(
-                                        kwargs.into_iter().map(|(k, v)| (Val::Str(k), v)).collect(),
-                                    );
-                                    let res =
-                                        crate::py_bridge::py_call(&val, &pos_args, Some(&kw_map))?;
-                                    self.stack.push(res);
-                                }
-                                Some(Val::Object(id)) => {
-                                    let class_name = {
-                                        let heap = self
-                                            .objects
-                                            .lock()
-                                            .map_err(|_| "object heap poisoned")?;
-                                        heap.get(&id).ok_or("dangling object")?.class_name.clone()
-                                    };
-                                    let method =
-                                        self.find_method_cached(&class_name, "__call__").ok_or(
-                                            format!("'{class_name}' object is not callable"),
-                                        )?;
-                                    let mut call_args = vec![Val::Object(id)];
-                                    call_args.extend(pos_args);
-                                    self.invoke_in_execute_kw(method, call_args, kwargs)?;
-                                }
-                                _ => {
-                                    let def = self
-                                        .funcs
-                                        .get(&name)
-                                        .cloned()
-                                        .ok_or(format!("unknown function or class '{name}'"))?;
-                                    self.invoke_in_execute_kw(def, pos_args, kwargs)?;
-                                }
-                            }
+                            let def = self
+                                .funcs
+                                .get(&name)
+                                .cloned()
+                                .ok_or(format!("unknown function or class '{name}'"))?;
+                            self.invoke_in_execute_kw(def, pos_args, kwargs)?;
                         }
                     }
                     1 => {
@@ -2502,17 +3958,7 @@ impl Vm {
                             )?;
                             self.stack.push(res);
                         } else if let Val::Object(id) = receiver {
-                            let class_name = {
-                                let heap =
-                                    self.objects.lock().map_err(|_| "object heap poisoned")?;
-                                heap.get(&id).ok_or("dangling object")?.class_name.clone()
-                            };
-                            let method = self
-                                .find_method_cached(&class_name, &name)
-                                .ok_or(format!("undefined method '{name}' on {class_name}"))?;
-                            let mut call_args = vec![Val::Object(id)];
-                            call_args.extend(pos_args);
-                            self.invoke_in_execute_kw(method, call_args, kwargs)?;
+                            self.call_object_method_in_execute(id, &name, pos_args, kwargs)?;
                         } else if let Val::List(items) = receiver {
                             if name == "sort" && pos_args.is_empty() {
                                 let mut kw = kwargs;
@@ -2548,6 +3994,9 @@ impl Vm {
                                         Some(&kw_map),
                                     )?;
                                     self.stack.push(res);
+                                } else if matches!(member, Val::Object(_)) {
+                                    let m = member.clone();
+                                    self.invoke_val_in_execute_kw(m, pos_args, kwargs, None, None)?;
                                 } else {
                                     let (_, def) = self.callable_def(member)?;
                                     self.invoke_in_execute_kw(def, pos_args, kwargs)?;
@@ -2561,28 +4010,7 @@ impl Vm {
                     }
                     _ => {
                         let callee = self.pop()?;
-                        if crate::py_bridge::is_py_handle(&callee) {
-                            let kw_map = Val::Map(
-                                kwargs.into_iter().map(|(k, v)| (Val::Str(k), v)).collect(),
-                            );
-                            let res = crate::py_bridge::py_call(&callee, &pos_args, Some(&kw_map))?;
-                            self.stack.push(res);
-                        } else if let Val::Object(id) = callee {
-                            let class_name = {
-                                let heap =
-                                    self.objects.lock().map_err(|_| "object heap poisoned")?;
-                                heap.get(&id).ok_or("dangling object")?.class_name.clone()
-                            };
-                            let method = self
-                                .find_method_cached(&class_name, "__call__")
-                                .ok_or(format!("'{class_name}' object is not callable"))?;
-                            let mut call_args = vec![Val::Object(id)];
-                            call_args.extend(pos_args);
-                            self.invoke_in_execute_kw(method, call_args, kwargs)?;
-                        } else {
-                            let (_, def) = self.callable_def(&callee)?;
-                            self.invoke_in_execute_kw(def, pos_args, kwargs)?;
-                        }
+                        self.invoke_val_in_execute_kw(callee, pos_args, kwargs, None, None)?;
                     }
                 }
             }
@@ -2617,7 +4045,11 @@ impl Vm {
                 );
                 Arc::make_mut(&mut self.funcs).insert(name, def);
             }
+            Op::BuildClass(name, base_count, body_code) => {
+                self.build_class_op(name, base_count, body_code)?;
+            }
             Op::DefClass(name, parent, methods) => {
+                self.ensure_builtin_classes();
                 if let Some(ref p) = parent {
                     if !self.classes.contains_key(p) {
                         return Err(format!("unknown parent class '{p}'"));
@@ -2655,13 +4087,34 @@ impl Vm {
                     );
                     compiled.insert(method, def);
                 }
+                let bases = match parent {
+                    Some(p) => vec![p],
+                    None => vec!["object".to_string()],
+                };
+                let mro = compute_c3_mro(&name, &bases, |b| {
+                    self.classes
+                        .get(b)
+                        .map(|c| {
+                            if c.mro.is_empty() {
+                                vec![b.to_string(), "object".to_string()]
+                            } else {
+                                c.mro.clone()
+                            }
+                        })
+                        .ok_or_else(|| format!("unknown base class '{b}'"))
+                })?;
                 Arc::make_mut(&mut self.classes).insert(
-                    name,
+                    name.clone(),
                     ClassDef {
-                        parent,
+                        bases,
+                        metaclass: None,
+                        mro,
+                        attrs: HashMap::new(),
                         methods: compiled,
                     },
                 );
+                let cls_obj = self.class_object_val(&name)?;
+                self.set_var(name, cls_obj);
             }
             Op::Return => {
                 let val = self.pop()?;

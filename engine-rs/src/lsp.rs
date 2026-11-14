@@ -81,6 +81,16 @@ pub(crate) fn lsp_completion_items() -> JsonValue {
         "get",
         "type_of",
         "is_instance",
+        "isinstance",
+        "issubclass",
+        "type",
+        "super",
+        "property",
+        "staticmethod",
+        "classmethod",
+        "mro",
+        "delattr",
+        "object",
         "has_field",
         "append",
         "concat",
@@ -106,6 +116,39 @@ pub(crate) fn lsp_completion_items() -> JsonValue {
         "http_post",
         "json_parse",
         "json_stringify",
+        "bigint",
+        "big_add",
+        "big_sub",
+        "big_mul",
+        "big_div",
+        "big_rem",
+        "big_divmod",
+        "big_pow",
+        "big_powmod",
+        "big_gcd",
+        "big_cmp",
+        "big_bits",
+        "dec",
+        "dec_add",
+        "dec_sub",
+        "dec_mul",
+        "dec_div",
+        "dec_sqrt",
+        "dec_round",
+        "dec_quantize",
+        "dec_cmp",
+        "dec_abs",
+        "dec_neg",
+        "complex",
+        "cadd",
+        "csub",
+        "cmul",
+        "cdiv",
+        "cabs",
+        "carg",
+        "cexp",
+        "fft",
+        "ifft",
         "regex_findall",
         "sqlite_exec",
         "sqlite_query",
@@ -179,7 +222,14 @@ pub(crate) fn lsp_completion_items() -> JsonValue {
         "gpu_sigmoid",
         "gpu_scale",
         "gpu_softmax",
+        "gpu_layernorm",
+        "gpu_gelu",
+        "gpu_backends",
+        "gpu_set_backend",
+        "gpu_precision",
+        "gpu_set_precision",
         "gpu_run_hlsl",
+        "gpu_run_spirv",
         "tensor_to",
         "tensor_device",
         "tensor_default_device",
@@ -188,6 +238,10 @@ pub(crate) fn lsp_completion_items() -> JsonValue {
         "plugin_list",
         "plugin_call",
         "plugin_build",
+        "py_info",
+        "py_free",
+        "py_to_tensor",
+        "tensor_to_py",
     ];
     JsonValue::Array(
         words.iter().map(|w| serde_json::json!({
@@ -559,13 +613,14 @@ pub(crate) fn lsp_server() -> Result<(), String> {
                                                 "selectionRange": range
                                             }));
                                         }
-                                        Stmt::Class(name, _, body) => {
+                                        Stmt::Class(name, _, _, _, body) => {
                                             let range =
                                                 find_symbol_range(&src_lines, &name, &mut cursor);
                                             let mut children = vec![];
                                             for item in body {
                                                 if let Stmt::Fn(m, _, _, _)
-                                                | Stmt::AsyncFn(m, _, _, _) = item
+                                                | Stmt::AsyncFn(m, _, _, _)
+                                                | Stmt::DecoratedFn(_, m, _, _, _) = item
                                                 {
                                                     let m_range = find_symbol_range(
                                                         &src_lines,

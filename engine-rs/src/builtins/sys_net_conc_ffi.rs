@@ -825,6 +825,30 @@ impl Vm {
                 };
                 crate::py_bridge::py_exec(code)?
             }
+            "py_info" => {
+                if !a.is_empty() {
+                    return Err("py_info expects no args".into());
+                }
+                crate::py_bridge::py_info_val()
+            }
+            "py_free" => {
+                if a.len() != 1 {
+                    return Err("py_free expects Python handle".into());
+                }
+                Val::Bool(crate::py_bridge::py_free(&a[0])?)
+            }
+            "py_to_tensor" => {
+                if a.len() != 1 {
+                    return Err("py_to_tensor expects Python buffer/ndarray handle".into());
+                }
+                crate::py_bridge::py_to_tensor(&a[0])?
+            }
+            "tensor_to_py" => {
+                if a.len() != 1 {
+                    return Err("tensor_to_py expects Tensor".into());
+                }
+                crate::py_bridge::tensor_to_py(&a[0])?
+            }
             "jit_available" => {
                 if !a.is_empty() {
                     return Err("jit_available expects 0 arguments".into());
@@ -871,7 +895,10 @@ impl Vm {
                     }
                     _ => return Err("jit_compile expects Function or String".into()),
                 };
-                let ok = crate::jit::jit_try_compile(&name, &def).is_ok();
+                let ok = crate::jit::jit_try_compile(&name, &def, &|fname| {
+                    self.resolve_jit_callee(fname)
+                })
+                .is_ok();
                 Val::Bool(ok)
             }
             "plugin_load" => {
