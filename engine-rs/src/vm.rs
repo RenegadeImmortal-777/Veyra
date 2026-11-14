@@ -275,6 +275,45 @@ impl Vm {
             profile_stats: HashMap::new(),
         }
     }
+    pub(crate) fn clone_worker(&self) -> Self {
+        Self {
+            code: self.code.clone(),
+            ip: 0,
+            stack: vec![],
+            vars: self.vars.clone(),
+            cells: self.cells.clone(),
+            var_types: self.var_types.clone(),
+            consts: self.consts.clone(),
+            locals: vec![],
+            local_defined: vec![],
+            local_consts: vec![],
+            local_types: vec![],
+            return_type: None,
+            frames: Vec::new(),
+            funcs: self.funcs.clone(),
+            classes: self.classes.clone(),
+            method_cache: HashMap::new(),
+            objects: self.objects.clone(),
+            class_objects: self.class_objects.clone(),
+            gc: self.gc.clone(),
+            handlers: vec![],
+            breakpoints: HashSet::new(),
+            trace: false,
+            finished: false,
+            debug_scope: 0,
+            debugger: None,
+            call_counts: HashMap::new(),
+            active_class: None,
+            active_self: None,
+            active_auto_arena: false,
+            auto_arena_cache: HashMap::new(),
+            profiling: false,
+            profile_started_at: None,
+            profile_total_ns: 0,
+            profile_stack: Vec::new(),
+            profile_stats: HashMap::new(),
+        }
+    }
     fn nested_from_prepared(&self, prepared: PreparedCall) -> Self {
         Self {
             code: prepared.code,

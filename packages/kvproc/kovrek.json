@@ -1,0 +1,7 @@
+{
+  "name": "kvproc",
+  "version": "0.1.0",
+  "entry": "kvproc.kvr",
+  "description": "Bidirectional supervised OS process, environment, and polyglot bridge helpers for Kovrek",
+  "packages": {}
+}

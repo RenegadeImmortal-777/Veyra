@@ -1,0 +1,33 @@
+// Electron-class Desktop WebView & concurrent HTTP/SSE helpers for Kovrek
+
+fn run(spec: Map, handler: Any) -> Map {
+    return desktop_app(spec, handler);
+}
+
+fn serve(handler: Any, options: Map) -> Map {
+    return app_serve(handler, options);
+}
+
+fn sse_response(ch_id: Number) -> Map {
+    return {"stream_channel": ch_id};
+}
+
+fn json_response(status: Number, data: Any) -> Map {
+    return {
+        "status": status,
+        "content_type": "application/json; charset=utf-8",
+        "body": json_stringify(data)
+    };
+}
+
+fn html_response(status: Number, html: String) -> Map {
+    return {
+        "status": status,
+        "content_type": "text/html; charset=utf-8",
+        "body": html
+    };
+}
+
+fn runtime() -> Map {
+    return runtime_info();
+}

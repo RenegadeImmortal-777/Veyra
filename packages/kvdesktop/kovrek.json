@@ -1,0 +1,7 @@
+{
+  "name": "kvdesktop",
+  "version": "0.1.0",
+  "entry": "kvdesktop.kvr",
+  "description": "Electron-class Desktop WebView, IPC, and concurrent HTTP/SSE app shell helpers for Kovrek",
+  "packages": {}
+}

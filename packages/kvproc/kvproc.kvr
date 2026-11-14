@@ -1,0 +1,33 @@
+// Supervised OS process, environment & polyglot bridge package for Kovrek
+
+fn spawn_proc(cmd: String, args: List, opts: Map) -> Number {
+    return proc_spawn(cmd, args, opts);
+}
+
+fn read_proc(pid: Number) -> Map {
+    return proc_read(pid);
+}
+
+fn write_proc(pid: Number, text: String) -> Bool {
+    return proc_write(pid, text);
+}
+
+fn status_proc(pid: Number) -> Map {
+    return proc_status(pid);
+}
+
+fn kill_proc(pid: Number) -> Map {
+    return proc_kill(pid);
+}
+
+fn set_env(key: String, value: String) -> Bool {
+    return env_set(key, value);
+}
+
+fn all_env() -> Map {
+    return env_vars();
+}
+
+fn bridge(runtime: String, target: String, payload: Any) -> Any {
+    return bridge_call(runtime, target, payload);
+}

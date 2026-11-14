@@ -1,0 +1,29 @@
+// Standard Kovrek Node.js & npm bridge package
+
+fn available() -> Bool {
+    return node_available();
+}
+
+fn info() -> Map {
+    return node_info();
+}
+
+fn eval_js(code: String) -> Any {
+    return node_eval(code);
+}
+
+fn require_mod(mod_name: String) -> Any {
+    return node_require(mod_name);
+}
+
+fn call_mod(mod_name: String, fn_name: String, args: List) -> Any {
+    return node_call(mod_name, fn_name, args);
+}
+
+fn run_npm(args: List, cwd: String) -> Map {
+    return npm_run(args, cwd);
+}
+
+fn runtime() -> Map {
+    return runtime_info();
+}

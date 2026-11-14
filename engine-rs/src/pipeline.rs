@@ -347,19 +347,17 @@ fn builtin_effect_tag(name: &str) -> Option<&'static str> {
     match name {
         "print" | "println" | "input" | "gui_app" => Some("io"),
         "read_file" | "write_file" | "append_file" | "remove_file" | "path_exists" | "is_file"
-        | "is_dir" | "list_dir" | "mkdir" | "sqlite_open" | "sqlite_exec" | "sqlite_query" => {
-            Some("fs")
-        }
-        "http_request" | "http_get" | "http_post" | "http_serve" | "ws_connect"
-        | "actor_node_listen" | "actor_node_stop" | "actor_remote_send" | "actor_remote_ask" => {
-            Some("net")
-        }
-        "shell" | "powershell" | "ps_exec" | "bash_exec" | "spawn_process" | "exit" => {
-            Some("process")
-        }
-        "env_get" | "env_set" | "now_ms" | "time_ms" | "rand" | "rand_int" | "uuid_v4" | "cwd" => {
-            Some("env")
-        }
+        | "is_dir" | "list_dir" | "mkdir" | "fs_mkdir" | "fs_list" | "fs_walk" | "fs_remove"
+        | "fs_stat" | "fs_read_bytes" | "fs_write_bytes" | "fs_read_base64" | "sqlite_open"
+        | "sqlite_exec" | "sqlite_query" => Some("fs"),
+        "http_request" | "http_stream" | "http_get" | "http_post" | "http_serve" | "app_serve"
+        | "desktop_app" | "ws_connect" | "actor_node_listen" | "actor_node_stop"
+        | "actor_remote_send" | "actor_remote_ask" => Some("net"),
+        "shell" | "powershell" | "ps_exec" | "bash_exec" | "spawn_process" | "proc_spawn"
+        | "proc_read" | "proc_write" | "proc_status" | "proc_kill" | "node_eval"
+        | "node_require" | "node_call" | "npm_run" | "bridge_call" | "exit" => Some("process"),
+        "env_get" | "env_set" | "env_vars" | "now_ms" | "time_ms" | "rand" | "rand_int"
+        | "uuid_v4" | "cwd" => Some("env"),
         "plugin_load" | "plugin_call" | "plugin_build" | "py_import" | "py_call" | "py_eval"
         | "py_exec" | "wasm_run" => Some("ffi"),
         "gpu_map"
@@ -786,13 +784,21 @@ fn is_taint_sink(name: &str) -> bool {
             | "http_get"
             | "http_post"
             | "http_request"
+            | "http_stream"
             | "write_file"
             | "append_file"
+            | "fs_write_bytes"
             | "shell"
             | "powershell"
             | "ps_exec"
             | "bash_exec"
             | "spawn_process"
+            | "proc_spawn"
+            | "proc_write"
+            | "node_eval"
+            | "node_call"
+            | "npm_run"
+            | "bridge_call"
             | "ffi_call"
             | "py_exec"
     )

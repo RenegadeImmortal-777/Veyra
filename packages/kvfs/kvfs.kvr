@@ -5,3 +5,11 @@ fn move(source: String, destination: String) -> Null { return move_file(source, 
 fn size(path: String) -> Number { return file_size(path); }
 fn file(path: String) -> Bool { return is_file(path); }
 fn directory(path: String) -> Bool { return is_dir(path); }
+fn mkdir(path: String) -> Bool { return fs_mkdir(path); }
+fn list(path: String) -> List { return fs_list(path); }
+fn walk(path: String, max_depth: Number) -> List { return fs_walk(path, max_depth); }
+fn remove(path: String) -> Bool { return fs_remove(path); }
+fn stat(path: String) -> Any { return fs_stat(path); }
+fn read_bytes(path: String) -> List { return fs_read_bytes(path); }
+fn write_bytes(path: String, bytes: List) -> Number { return fs_write_bytes(path, bytes); }
+fn read_base64(path: String) -> String { return fs_read_base64(path); }

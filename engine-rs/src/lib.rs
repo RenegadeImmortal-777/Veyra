@@ -49,6 +49,7 @@ mod spirv;
 mod tensor;
 mod term_ui;
 mod tooling;
+mod universal_arch;
 mod value;
 mod vm;
 
@@ -67,9 +68,9 @@ use crate::pipeline::compile_source_unoptimized;
 pub use crate::pipeline::{compile_to_kvbc, disasm_source, load_source, run_kvbc, run_source};
 use crate::project::{build_project, fmt_source, project_entry, project_packages, test_project};
 use crate::registry::{
-    pkg_add, pkg_audit, pkg_build_plugin, pkg_info, pkg_install, pkg_keygen, pkg_list, pkg_pack,
-    pkg_publish, pkg_py_bridge, pkg_remove, pkg_search, pkg_sign, pkg_tree, pkg_unpack, pkg_update,
-    pkg_verify,
+    pkg_add, pkg_audit, pkg_build_plugin, pkg_info, pkg_install, pkg_js_bridge, pkg_keygen,
+    pkg_list, pkg_pack, pkg_publish, pkg_py_bridge, pkg_remove, pkg_search, pkg_sign, pkg_tree,
+    pkg_unpack, pkg_update, pkg_verify,
 };
 #[cfg(test)]
 use crate::runtime::export_function_object;
@@ -265,6 +266,23 @@ pub fn run_cli() -> ExitCode {
                     .copied()
                     .ok_or_else(|| "missing Python/PyPI package name".to_string())
                     .and_then(|pypi_name| pkg_py_bridge(pypi_name, out_dir, pip_install))
+            }
+            Some("js-bridge") => {
+                let mut npm_install = false;
+                let mut positional = Vec::new();
+                for arg in a.iter().skip(3) {
+                    if arg == "--npm-install" {
+                        npm_install = true;
+                    } else {
+                        positional.push(arg.as_str());
+                    }
+                }
+                let out_dir = positional.get(1).copied().map(Path::new);
+                positional
+                    .first()
+                    .copied()
+                    .ok_or_else(|| "missing Node.js/npm package name".to_string())
+                    .and_then(|npm_name| pkg_js_bridge(npm_name, out_dir, npm_install))
             }
             Some("serve") => {
                 let dir = a
@@ -6694,5 +6712,197 @@ assert(denied);
         pe[0xDC..0xDE].copy_from_slice(&3u16.to_le_bytes());
         patch_pe_gui_subsystem(&mut pe).expect("pe gui patch");
         assert_eq!(u16::from_le_bytes([pe[0xDC], pe[0xDD]]), 2);
+    }
+
+    #[test]
+    fn universal_architecture_fs_env_and_runtime_info() {
+        let base = std::env::temp_dir().join(format!(
+            "kovrek_uarch_fs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let sub = base.join("nested").join("deep");
+        let sub_str = sub.to_string_lossy().replace('\\', "/");
+        let file_str = sub.join("bin.dat").to_string_lossy().replace('\\', "/");
+        let base_str = base.to_string_lossy().replace('\\', "/");
+
+        let src = format!(
+            r#"
+assert(fs_mkdir("{sub_str}"));
+let n = fs_write_bytes("{file_str}", [65, 66, 67, 68]);
+assert(n == 4);
+let st = fs_stat("{file_str}");
+assert(st != null and st["is_file"] and st["size"] == 4);
+let bytes = fs_read_bytes("{file_str}");
+assert(len(bytes) == 4 and bytes[0] == 65 and bytes[3] == 68);
+assert(fs_read_base64("{file_str}") == "QUJDRA==");
+let walked = fs_walk("{base_str}", 4);
+assert(len(walked) == 1 and walked[0]["name"] == "bin.dat");
+assert(env_set("KOVREK_UARCH_TEST", "ok_123"));
+let vars = env_vars();
+assert(vars["KOVREK_UARCH_TEST"] == "ok_123");
+let rt = runtime_info();
+assert(len(rt["kovrek_version"]) > 0);
+assert(fs_remove("{base_str}"));
+assert(not fs_stat("{base_str}")["exists"]);
+"#
+        );
+        run_source(&src).expect("universal fs/env script should succeed");
+    }
+
+    #[test]
+    fn universal_architecture_proc_lifecycle() {
+        let cmd = if cfg!(windows) { "cmd" } else { "sh" };
+        let args_lit = if cfg!(windows) { r#"["/Q"]"# } else { "[]" };
+        let src = format!(
+            r#"
+let pid = proc_spawn("{cmd}", {args_lit}, {{}});
+assert(pid > 0);
+assert(proc_write(pid, "echo KOVREK_PROC_ALIVE\n"));
+let seen = false;
+let i = 0;
+while i < 40 and not seen {{
+    let rd = proc_read(pid);
+    if contains(rd["out"], "KOVREK_PROC_ALIVE") {{
+        seen = true;
+    }} else {{
+        sleep_ms(25);
+    }}
+    i = i + 1;
+}}
+assert(seen);
+let st = proc_status(pid);
+assert(st["running"]);
+let k = proc_kill(pid);
+assert(k["killed"]);
+"#
+        );
+        run_source(&src).expect("proc_spawn/write/read/kill should succeed");
+    }
+
+    #[test]
+    fn universal_architecture_node_and_pkg_bridge() {
+        if crate::universal_arch::find_node_binary().is_some() {
+            let src = r#"
+assert(node_available());
+let info = node_info();
+assert(info["available"] and len(info["version"]) > 0);
+assert(node_eval("21 * 2") == 42);
+assert(node_call("path", "basename", ["/tmp/demo/hello.kvr"]) == "hello.kvr");
+assert(bridge_call("node", "eval", "10 + 5") == 15);
+"#;
+            run_source(src).expect("node_eval/node_call should succeed when node is installed");
+        }
+        let temp_dir =
+            std::env::temp_dir().join(format!("kovrek_js_bridge_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        pkg_js_bridge("chalk", Some(&temp_dir), false).expect("pkg_js_bridge");
+        let generated = temp_dir.join("js_chalk.kvr");
+        assert!(generated.is_file());
+        let mod_src = fs::read_to_string(&generated).expect("read generated js bridge");
+        compile_source(&mod_src).expect("generated js bridge must compile cleanly");
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn universal_architecture_desktop_ipc_and_sse() {
+        let src = r##"
+fn handle_desk(req) {
+    if req["kind"] == "ipc" {
+        return {"echo": req["action"], "payload": req["payload"]};
+    }
+    return {"status": 200, "content_type": "text/plain", "body": "custom:" + req["path"]};
+}
+
+let d = desktop_app({
+    "title": "Test Shell",
+    "html": "<html><body><h1>Kovrek</h1></body></html>",
+    "headless": true,
+    "max_requests": 3,
+    "on_ready": fn(info) {
+        let r1 = http_get(info["url"] + "kovrek-ipc.js");
+        assert(contains(r1, "window.kovrek"));
+        let r2 = http_post(info["url"] + "__kovrek/invoke", json_stringify({"action": "ping", "payload": {"n": 7}}));
+        let p2 = json_parse(r2);
+        assert(p2["ok"] and p2["result"]["echo"] == "ping" and p2["result"]["payload"]["n"] == 7);
+        let r3 = http_get(info["url"] + "");
+        assert(contains(r3, "<h1>Kovrek</h1>"));
+    }
+}, handle_desk);
+assert(d["ok"] and d["port"] > 0);
+
+let s = app_serve(fn(req) {
+    if req["path"] == "/sse" {
+        let ch = channel();
+        spawn(fn(c) {
+            send(c, {"kind": "token", "text": "hi"});
+            send(c, {"kind": "done"});
+        }, [ch]);
+        return {"stream_channel": ch};
+    }
+    return {"ok": true, "path": req["path"]};
+}, {
+    "port": 0,
+    "workers": 2,
+    "max_requests": 2,
+    "on_ready": fn(port) {
+        let base = "http://127.0.0.1:" + str(port);
+        let r_json = http_get(base + "/ping");
+        assert(contains(r_json, "/ping"));
+        let got = [];
+        let st = http_stream("GET", base + "/sse", {}, null, 5000, fn(line) {
+            if starts_with(line, "data:") {
+                got.push(line);
+            }
+            return true;
+        });
+        assert(st["ok"] and len(got) >= 2);
+    }
+});
+assert(s["ok"]);
+"##;
+        run_source(src).expect("desktop_app IPC and app_serve SSE should succeed");
+    }
+
+    #[test]
+    fn universal_architecture_gui_memo_and_timer() {
+        let spec = Val::Map(vec![
+            (Val::Str("title".into()), Val::Str("Memo Window".into())),
+            (Val::Str("timer_ms".into()), Val::Num(200.0)),
+            (
+                Val::Str("rows".into()),
+                Val::List(vec![
+                    Val::Map(vec![
+                        (Val::Str("type".into()), Val::Str("memo".into())),
+                        (Val::Str("id".into()), Val::Str("out".into())),
+                        (Val::Str("text".into()), Val::Str("line1\nline2".into())),
+                        (Val::Str("height".into()), Val::Num(180.0)),
+                    ]),
+                    Val::Map(vec![
+                        (Val::Str("type".into()), Val::Str("progress".into())),
+                        (Val::Str("id".into()), Val::Str("bar".into())),
+                        (Val::Str("value".into()), Val::Num(0.25)),
+                    ]),
+                ]),
+            ),
+        ]);
+        let mut layout = crate::gui_native::parse_gui_layout(&spec).expect("memo layout");
+        assert_eq!(layout.timer_ms, Some(200));
+        let rects = crate::gui_native::compute_hit_rects(&layout, 480, 400);
+        assert_eq!(rects.len(), 2);
+        let patch = Val::Map(vec![
+            (Val::Str("out".into()), Val::Str("updated\noutput".into())),
+            (Val::Str("bar".into()), Val::Num(0.75)),
+        ]);
+        let (close_req, changed) = crate::gui_native::apply_layout_updates(&mut layout, &patch);
+        assert!(!close_req && changed);
+        if let crate::gui_native::LayoutEntry::Single(w) = &layout.entries[0] {
+            assert_eq!(w.text, "updated\noutput");
+        } else {
+            panic!("expected memo widget");
+        }
     }
 }

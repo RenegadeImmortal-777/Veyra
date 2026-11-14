@@ -369,7 +369,22 @@
                                       "source":  "../packages/kvsemver",
                                       "entry":  "kvsemver.kvr",
                                       "version":  "0.1.0"
-                                  }
+                                  },
+                     "kvnode":  {
+                                    "source":  "../packages/kvnode",
+                                    "entry":  "kvnode.kvr",
+                                    "version":  "0.1.0"
+                                },
+                     "kvdesktop":  {
+                                       "source":  "../packages/kvdesktop",
+                                       "entry":  "kvdesktop.kvr",
+                                       "version":  "0.1.0"
+                                   },
+                     "kvproc":  {
+                                    "source":  "../packages/kvproc",
+                                    "entry":  "kvproc.kvr",
+                                    "version":  "0.1.0"
+                                }
                  },
     "registry_version":  1
 }

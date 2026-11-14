@@ -240,6 +240,69 @@ impl Vm {
                 ])
             }
             #[cfg(feature = "native-services")]
+            "http_stream" => {
+                crate::runtime::require_cap("net")?;
+                if a.len() != 6 {
+                    return Err(
+                        "http_stream expects (method, url, headers_map, body_or_null, timeout_ms, on_line_fn)"
+                            .into(),
+                    );
+                }
+                let method_text = match &a[0] {
+                    Val::Str(s) => s.to_uppercase(),
+                    _ => return Err("http_stream method must be String".into()),
+                };
+                let url = match &a[1] {
+                    Val::Str(s) => s.clone(),
+                    _ => return Err("http_stream url must be String".into()),
+                };
+                let headers = match &a[2] {
+                    Val::Map(items) => items.clone(),
+                    _ => return Err("http_stream headers must be Map".into()),
+                };
+                let timeout = match a[4] {
+                    Val::Num(n) => n.max(1.0) as u64,
+                    _ => return Err("http_stream timeout_ms must be Number".into()),
+                };
+                let on_line = a[5].clone();
+                if !self.is_callable_val(&on_line) {
+                    return Err("http_stream on_line_fn must be callable".into());
+                }
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_millis(timeout))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let method = reqwest::Method::from_bytes(method_text.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                let mut request = client.request(method, url);
+                for (k, v) in headers {
+                    request = request.header(k.show(), v.show());
+                }
+                if !matches!(a[3], Val::Null) {
+                    let body = match &a[3] {
+                        Val::Str(s) => s.clone(),
+                        other => json_stringify_value(other)?,
+                    };
+                    request = request.body(body);
+                }
+                let response = request.send().map_err(|e| e.to_string())?;
+                let status = response.status();
+                let mut line_count = 0usize;
+                for line_res in std::io::BufRead::lines(std::io::BufReader::new(response)) {
+                    let line = line_res.map_err(|e| e.to_string())?;
+                    line_count += 1;
+                    let keep_going = self.invoke_callable_sync(&on_line, vec![Val::Str(line)])?;
+                    if matches!(keep_going, Val::Bool(false)) {
+                        break;
+                    }
+                }
+                Val::Map(vec![
+                    (Val::Str("status".into()), Val::Num(status.as_u16() as f64)),
+                    (Val::Str("ok".into()), Val::Bool(status.is_success())),
+                    (Val::Str("lines".into()), Val::Num(line_count as f64)),
+                ])
+            }
+            #[cfg(feature = "native-services")]
             "http_get" => {
                 crate::runtime::require_cap("net")?;
                 if a.len() != 1 {

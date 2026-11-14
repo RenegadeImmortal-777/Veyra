@@ -6576,6 +6576,128 @@ impl Rt {
                     (Val::Str("err".into()), Val::Str(String::from_utf8_lossy(&out.stderr).into())),
                 ])
             }
+            "fs_mkdir" => {
+                let p = match args.first() {
+                    Some(Val::Str(s)) => s.clone(),
+                    _ => return Err(Flow::Err("fs_mkdir expects String path".into())),
+                };
+                std::fs::create_dir_all(&p).map_err(|e| Flow::Err(e.to_string()))?;
+                Val::Bool(true)
+            }
+            "fs_list" => {
+                let p = match args.first() {
+                    Some(Val::Str(s)) => s.clone(),
+                    _ => return Err(Flow::Err("fs_list expects String path".into())),
+                };
+                let mut rows = Vec::new();
+                for entry in std::fs::read_dir(&p).map_err(|e| Flow::Err(e.to_string()))? {
+                    let e = entry.map_err(|err| Flow::Err(err.to_string()))?;
+                    let meta = e.metadata().map_err(|err| Flow::Err(err.to_string()))?;
+                    rows.push(Val::Map(vec![
+                        (Val::Str("name".into()), Val::Str(e.file_name().to_string_lossy().into())),
+                        (Val::Str("path".into()), Val::Str(e.path().to_string_lossy().into())),
+                        (Val::Str("is_dir".into()), Val::Bool(meta.is_dir())),
+                        (Val::Str("is_file".into()), Val::Bool(meta.is_file())),
+                        (Val::Str("size".into()), Val::Num(meta.len() as f64)),
+                    ]));
+                }
+                Val::List(rows)
+            }
+            "fs_remove" => {
+                let p = match args.first() {
+                    Some(Val::Str(s)) => s.clone(),
+                    _ => return Err(Flow::Err("fs_remove expects String path".into())),
+                };
+                let path = std::path::Path::new(&p);
+                if !path.exists() {
+                    Val::Bool(false)
+                } else if path.is_dir() {
+                    std::fs::remove_dir_all(path).map_err(|e| Flow::Err(e.to_string()))?;
+                    Val::Bool(true)
+                } else {
+                    std::fs::remove_file(path).map_err(|e| Flow::Err(e.to_string()))?;
+                    Val::Bool(true)
+                }
+            }
+            "fs_stat" => {
+                let p = match args.first() {
+                    Some(Val::Str(s)) => s.clone(),
+                    _ => return Err(Flow::Err("fs_stat expects String path".into())),
+                };
+                let path = std::path::Path::new(&p);
+                if !path.exists() {
+                    Val::Map(vec![
+                        (Val::Str("exists".into()), Val::Bool(false)),
+                        (Val::Str("is_dir".into()), Val::Bool(false)),
+                        (Val::Str("is_file".into()), Val::Bool(false)),
+                        (Val::Str("size".into()), Val::Num(0.0)),
+                    ])
+                } else {
+                    let meta = std::fs::metadata(path).map_err(|e| Flow::Err(e.to_string()))?;
+                    Val::Map(vec![
+                        (Val::Str("exists".into()), Val::Bool(true)),
+                        (Val::Str("path".into()), Val::Str(p)),
+                        (Val::Str("is_dir".into()), Val::Bool(meta.is_dir())),
+                        (Val::Str("is_file".into()), Val::Bool(meta.is_file())),
+                        (Val::Str("size".into()), Val::Num(meta.len() as f64)),
+                    ])
+                }
+            }
+            "fs_read_bytes" => {
+                let p = match args.first() {
+                    Some(Val::Str(s)) => s.clone(),
+                    _ => return Err(Flow::Err("fs_read_bytes expects String path".into())),
+                };
+                let bytes = std::fs::read(&p).map_err(|e| Flow::Err(e.to_string()))?;
+                Val::List(bytes.into_iter().map(|b| Val::Num(b as f64)).collect())
+            }
+            "fs_write_bytes" => {
+                if args.len() != 2 {
+                    return Err(Flow::Err("fs_write_bytes expects (path, bytes)".into()));
+                }
+                let p = match &args[0] {
+                    Val::Str(s) => s.clone(),
+                    _ => return Err(Flow::Err("fs_write_bytes path must be String".into())),
+                };
+                let bytes: Vec<u8> = match &args[1] {
+                    Val::List(xs) => xs
+                        .iter()
+                        .map(|v| match v {
+                            Val::Num(n) => Ok((*n as i64).clamp(0, 255) as u8),
+                            _ => Err(Flow::Err("byte list must contain Numbers".into())),
+                        })
+                        .collect::<Result<Vec<u8>, _>>()?,
+                    _ => return Err(Flow::Err("fs_write_bytes bytes must be List".into())),
+                };
+                let count = bytes.len();
+                std::fs::write(&p, &bytes).map_err(|e| Flow::Err(e.to_string()))?;
+                Val::Num(count as f64)
+            }
+            "env_set" => {
+                if args.len() != 2 {
+                    return Err(Flow::Err("env_set expects (key, value)".into()));
+                }
+                let (k, v) = (self.show_val_runtime(&args[0])?, self.show_val_runtime(&args[1])?);
+                unsafe { std::env::set_var(k, v) };
+                Val::Bool(true)
+            }
+            "env_vars" => Val::Map(
+                std::env::vars()
+                    .map(|(k, v)| (Val::Str(k), Val::Str(v)))
+                    .collect(),
+            ),
+            "node_available" => Val::Bool(
+                Command::new(if cfg!(windows) { "node.exe" } else { "node" })
+                    .arg("--version")
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false),
+            ),
+            "runtime_info" => Val::Map(vec![
+                (Val::Str("platform".into()), Val::Str(std::env::consts::OS.into())),
+                (Val::Str("arch".into()), Val::Str(std::env::consts::ARCH.into())),
+                (Val::Str("aot".into()), Val::Bool(true)),
+            ]),
             _ => return Ok(None),
         };
         Ok(Some(out))

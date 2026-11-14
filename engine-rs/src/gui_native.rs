@@ -32,6 +32,7 @@ pub(crate) enum WidgetKind {
     Display { align: TextAlign },
     Button { role: String, flex: f32 },
     List { items: Vec<String>, scroll: usize },
+    Memo { scroll: usize },
     Progress { value: f64 },
 }
 
@@ -66,6 +67,7 @@ pub(crate) struct GuiLayout {
     pub(crate) width: i32,
     pub(crate) height: i32,
     pub(crate) theme: ThemeMode,
+    pub(crate) timer_ms: Option<u64>,
     pub(crate) entries: Vec<LayoutEntry>,
 }
 
@@ -89,6 +91,7 @@ pub(crate) enum UiEvent {
     Paste {
         text: String,
     },
+    Tick,
 }
 
 fn map_str(pairs: &[(Val, Val)], key: &str) -> Option<String> {
@@ -141,6 +144,7 @@ fn parse_widget(pairs: &[(Val, Val)], fallback_idx: usize) -> Result<WidgetNode,
     let default_h = match wtype.as_str() {
         "display" => 62,
         "list" => 96,
+        "memo" => 160,
         "button" => 44,
         "progress" => 26,
         _ => 26,
@@ -165,6 +169,7 @@ fn parse_widget(pairs: &[(Val, Val)], fallback_idx: usize) -> Result<WidgetNode,
             };
             WidgetKind::List { items, scroll: 0 }
         }
+        "memo" => WidgetKind::Memo { scroll: 0 },
         "progress" => {
             let value = match map_val(pairs, "value") {
                 Some(Val::Num(n)) => n.clamp(0.0, 1.0),
@@ -192,6 +197,10 @@ pub(crate) fn parse_gui_layout(spec: &Val) -> Result<GuiLayout, String> {
     let theme = match map_str(root, "theme").as_deref() {
         Some("light") => ThemeMode::Light,
         _ => ThemeMode::Dark,
+    };
+    let timer_ms = match map_val(root, "timer_ms") {
+        Some(Val::Num(n)) if *n >= 16.0 => Some((*n as u64).clamp(16, 60_000)),
+        _ => None,
     };
     let mut entries = Vec::new();
     let Some(Val::List(rows)) = map_val(root, "rows") else {
@@ -225,6 +234,7 @@ pub(crate) fn parse_gui_layout(spec: &Val) -> Result<GuiLayout, String> {
         width,
         height,
         theme,
+        timer_ms,
         entries,
     })
 }
@@ -414,6 +424,9 @@ fn ui_event_to_val(ev: &UiEvent) -> Val {
             pairs.push((Val::Str("kind".into()), Val::Str("paste".into())));
             pairs.push((Val::Str("text".into()), Val::Str(text.clone())));
         }
+        UiEvent::Tick => {
+            pairs.push((Val::Str("kind".into()), Val::Str("tick".into())));
+        }
     }
     Val::Map(pairs)
 }
@@ -443,6 +456,7 @@ mod win32_backend {
     const WM_ERASEBKGND: u32 = 0x0014;
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_CHAR: u32 = 0x0102;
+    const WM_TIMER: u32 = 0x0113;
     const WM_MOUSEMOVE: u32 = 0x0200;
     const WM_LBUTTONDOWN: u32 = 0x0201;
     const WM_LBUTTONUP: u32 = 0x0202;
@@ -457,7 +471,9 @@ mod win32_backend {
     const DT_CENTER: u32 = 0x0001;
     const DT_RIGHT: u32 = 0x0002;
     const DT_VCENTER: u32 = 0x0004;
+    const DT_WORDBREAK: u32 = 0x0010;
     const DT_SINGLELINE: u32 = 0x0020;
+    const DT_EDITCONTROL: u32 = 0x2000;
     const DT_END_ELLIPSIS: u32 = 0x8000;
 
     const CF_UNICODETEXT: u32 = 13;
@@ -569,6 +585,8 @@ mod win32_backend {
         set_cursor: unsafe extern "system" fn(isize) -> isize,
         track_mouse_event: unsafe extern "system" fn(*mut TrackMouseEventStruct) -> i32,
         get_key_state: unsafe extern "system" fn(i32) -> i16,
+        set_timer: unsafe extern "system" fn(isize, usize, u32, usize) -> usize,
+        kill_timer: unsafe extern "system" fn(isize, usize) -> i32,
         fill_rect: unsafe extern "system" fn(isize, *const Rect, isize) -> i32,
         draw_text: unsafe extern "system" fn(isize, *const u16, i32, *mut Rect, u32) -> i32,
         open_clipboard: unsafe extern "system" fn(isize) -> i32,
@@ -653,6 +671,8 @@ mod win32_backend {
                 set_cursor: sym!(user32, b"SetCursor\0", _),
                 track_mouse_event: sym!(user32, b"TrackMouseEvent\0", _),
                 get_key_state: sym!(user32, b"GetKeyState\0", _),
+                set_timer: sym!(user32, b"SetTimer\0", _),
+                kill_timer: sym!(user32, b"KillTimer\0", _),
                 fill_rect: sym!(user32, b"FillRect\0", _),
                 draw_text: sym!(user32, b"DrawTextW\0", _),
                 open_clipboard: sym!(user32, b"OpenClipboard\0", _),
@@ -1085,6 +1105,36 @@ mod win32_backend {
                         }
                     }
                 }
+                WidgetKind::Memo { scroll } => {
+                    unsafe {
+                        draw_rounded_box(&st.api, mem_dc, hit, 12, pal.card, pal.card_border);
+                        (st.api.select_object)(mem_dc, f_list);
+                        (st.api.set_text_color)(mem_dc, pal.text_primary);
+                    }
+                    let lines: Vec<&str> = widget.text.lines().collect();
+                    let start = (*scroll).min(lines.len().saturating_sub(1));
+                    let visible_txt = if lines.is_empty() {
+                        String::new()
+                    } else {
+                        lines[start..].join("\n")
+                    };
+                    let mut tr = Rect {
+                        left: hit.x + 12,
+                        top: hit.y + 8,
+                        right: hit.x + hit.w - 12,
+                        bottom: hit.y + hit.h - 8,
+                    };
+                    let wtxt = wide(&visible_txt);
+                    unsafe {
+                        (st.api.draw_text)(
+                            mem_dc,
+                            wtxt.as_ptr(),
+                            -1,
+                            &mut tr,
+                            DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL,
+                        );
+                    }
+                }
                 WidgetKind::Progress { value } => {
                     unsafe {
                         draw_rounded_box(&st.api, mem_dc, hit, 10, pal.prog_track, pal.card_border);
@@ -1371,16 +1421,28 @@ mod win32_backend {
                 let delta = ((wparam >> 16) as u16 as i16) as i32;
                 let step = if delta > 0 { -1isize } else { 1isize };
                 for entry in &mut st.layout.entries {
-                    if let LayoutEntry::Single(w) = entry
-                        && let WidgetKind::List { items, scroll } = &mut w.kind
-                        && !items.is_empty()
-                    {
-                        let next = (*scroll as isize + step)
-                            .clamp(0, items.len().saturating_sub(1) as isize);
-                        *scroll = next as usize;
+                    if let LayoutEntry::Single(w) = entry {
+                        match &mut w.kind {
+                            WidgetKind::List { items, scroll } if !items.is_empty() => {
+                                let next = (*scroll as isize + step)
+                                    .clamp(0, items.len().saturating_sub(1) as isize);
+                                *scroll = next as usize;
+                            }
+                            WidgetKind::Memo { scroll } if !w.text.is_empty() => {
+                                let line_count = w.text.lines().count().max(1);
+                                let next = (*scroll as isize + step)
+                                    .clamp(0, line_count.saturating_sub(1) as isize);
+                                *scroll = next as usize;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 unsafe { (st.api.invalidate_rect)(hwnd, std::ptr::null(), 0) };
+                0
+            }
+            WM_TIMER => {
+                st.events.push_back(UiEvent::Tick);
                 0
             }
             WM_KEYDOWN => {
@@ -1536,12 +1598,15 @@ mod win32_backend {
         if hwnd == 0 {
             return Err("gui_app: CreateWindowExW failed".into());
         }
-        let (set_ptr_fn, show_fn, update_fn) = {
+        let (set_ptr_fn, show_fn, update_fn, set_timer_fn, kill_timer_fn, timer_ms) = {
             let st = state.borrow();
             (
                 st.api.set_window_long_ptr,
                 st.api.show_window,
                 st.api.update_window,
+                st.api.set_timer,
+                st.api.kill_timer,
+                st.layout.timer_ms,
             )
         };
         unsafe {
@@ -1549,6 +1614,9 @@ mod win32_backend {
             enable_dark_frame(hwnd, dark_mode);
             show_fn(hwnd, SW_SHOW);
             update_fn(hwnd);
+            if let Some(ms) = timer_ms {
+                set_timer_fn(hwnd, 1, ms as u32, 0);
+            }
         }
 
         // Send initial lifecycle event so app can populate initial widgets dynamically.
@@ -1617,6 +1685,9 @@ mod win32_backend {
             }
             let wm_wait = state.borrow().api.wait_message;
             unsafe { wm_wait() };
+        }
+        if timer_ms.is_some() {
+            unsafe { kill_timer_fn(hwnd, 1) };
         }
         unsafe { set_ptr_fn(hwnd, GWLP_USERDATA, 0) };
         Ok(())

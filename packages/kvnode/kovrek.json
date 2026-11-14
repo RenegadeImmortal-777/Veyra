@@ -1,0 +1,7 @@
+{
+  "name": "kvnode",
+  "version": "0.1.0",
+  "entry": "kvnode.kvr",
+  "description": "Sovereign Node.js and npm interoperability package for Kovrek",
+  "packages": {}
+}
