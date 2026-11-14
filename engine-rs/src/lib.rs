@@ -269,6 +269,35 @@ pub fn run_cli() -> ExitCode {
             path.and_then(|p| load_source(p.to_string_lossy().as_ref()))
                 .and_then(|s| compile_source(&s).map(|_| println!("OK")))
         }
+        Some("verify") => {
+            let path = match a.get(2) {
+                Some(p) => Ok(PathBuf::from(p)),
+                None => project_entry(),
+            };
+            path.and_then(|p| load_source(p.to_string_lossy().as_ref()))
+                .and_then(|s| {
+                    let report = crate::pipeline::verify_source_strict(&s)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
+                    );
+                    if report.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                        Ok(())
+                    } else {
+                        let diags = report
+                            .get("diagnostics")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            })
+                            .unwrap_or_else(|| "verification failed".to_string());
+                        Err(diags)
+                    }
+                })
+        }
         Some("run") => (|| -> Result<(), String> {
             let mut caps_arg: Option<Vec<String>> = None;
             let mut file_arg: Option<PathBuf> = None;
@@ -434,9 +463,14 @@ pub fn run_cli() -> ExitCode {
             let mut run_fn: Option<String> = None;
             let mut run_args: Vec<f64> = Vec::new();
             let mut disasm = false;
+            let mut wasi = false;
             let mut idx = 2usize;
             while idx < a.len() {
                 match a[idx].as_str() {
+                    "--wasi" => {
+                        wasi = true;
+                        idx += 1;
+                    }
                     "-o" | "--out" => {
                         let out = a.get(idx + 1).ok_or("missing output path after -o")?;
                         output_arg = Some(PathBuf::from(out));
@@ -462,7 +496,7 @@ pub fn run_cli() -> ExitCode {
                         input_arg = Some(PathBuf::from(&a[idx]));
                         idx += 1;
                     }
-                    _ => return Err("usage: veyra wasm <file.vy> [-o out.wasm] [--disasm] [--run <fn> [args...]]".into()),
+                    _ => return Err("usage: veyra wasm [--wasi] <file.vy> [-o out.wasm] [--disasm] [--run <fn> [args...]]".into()),
                 }
             }
             let input = match input_arg {
@@ -474,13 +508,13 @@ pub fn run_cli() -> ExitCode {
                 && input.extension().and_then(|e| e.to_str()) != Some("wasm")
             {
                 let out = output_arg.unwrap_or_else(|| input.with_extension("wasm"));
-                return crate::native_codegen::compile_file_to_wasm(&input, &out);
+                return crate::native_codegen::compile_file_to_wasm_with_opts(&input, &out, wasi);
             }
             let bytes = if input.extension().and_then(|e| e.to_str()) == Some("wasm") {
                 fs::read(&input).map_err(|e| e.to_string())?
             } else {
                 let src = load_source(input.to_string_lossy().as_ref())?;
-                crate::native_codegen::compile_source_to_wasm(&src)?
+                crate::native_codegen::compile_source_to_wasm_with_opts(&src, wasi)?
             };
             if let Some(out) = output_arg {
                 if let Some(parent) = out.parent()
@@ -5032,5 +5066,958 @@ if jit_available() {
 }
 "#;
         assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn ir_ssa_propagation_algebraic_and_dce() {
+        let vy_src = r#"
+fn compute(x: Int) -> Int {
+    let a = 6;
+    let b = a * 2 + 1;
+    let c = x * 1 + 0;
+    let sq = c ** 2;
+    let zeroed = x - x;
+    return b + sq + zeroed;
+}
+assert(compute(5) == 38);
+let stats = ir_stats("fn k(x: Int) -> Int { let a = 3; let b = a + 4; let z = x * 1 + 0; if false { return 999; } return b + z; }");
+assert(stats["ops_after"] < stats["ops_before"]);
+assert(stats["constants_folded"] >= 1);
+assert(stats["algebraic_simplified"] >= 1);
+assert(stats["dead_removed"] >= 1);
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn formal_taint_linear_ownership_and_interval_verifier() {
+        // 1. Safe verified code runs cleanly and passes strict verification.
+        let safe_src = r#"
+@verify
+fn safe_div(a: Int, b: Int) -> Int {
+    requires(a >= 0, "a >= 0");
+    requires(b >= 2, "b >= 2");
+    ensures(a / b >= 0, "valid");
+    let arr = [10, 20, 30];
+    return arr[1] + a / b;
+}
+
+@secret
+fn load_token() -> String {
+    return "sk-live-secret";
+}
+
+@linear
+fn open_conn(name: String) -> String {
+    return "conn:" + name;
+}
+
+@linear("h")
+fn close_conn(h: String) {
+    linear_consume(h);
+}
+
+let tok = load_token();
+let clean = sanitize(tok);
+print(clean);
+let conn = open_conn("primary");
+close_conn(conn);
+assert(safe_div(10, 2) == 25);
+"#;
+        assert_eq!(run_source(safe_src), Ok(()));
+        let ok_report = crate::pipeline::verify_source_strict(safe_src).unwrap();
+        assert_eq!(ok_report["ok"], serde_json::json!(true));
+        assert!(ok_report["contracts_proven"].as_u64().unwrap() >= 1);
+
+        // 2. Unsanitized secret taint flow to print/sql/exec must fail static check.
+        let taint_leak = r#"
+@secret
+fn api_key() -> String {
+    return "secret-key";
+}
+let k = api_key();
+let derived = "bearer " + k;
+print(derived);
+"#;
+        let err_taint = compile_source(taint_leak).unwrap_err();
+        assert!(
+            err_taint.contains("security error") || err_taint.contains("tainted"),
+            "expected taint leak error, got: {err_taint}"
+        );
+
+        // 3. Linear ownership: use-after-consume, double-consume, leak, branch mismatch.
+        let double_consume = r#"
+@linear
+fn open_res() -> String { return "r"; }
+let r = open_res();
+linear_consume(r);
+linear_consume(r);
+"#;
+        let err_double = compile_source(double_consume).unwrap_err();
+        assert!(err_double.contains("ownership error"), "got: {err_double}");
+
+        let leaked = r#"
+@linear
+fn open_res() -> String { return "r"; }
+let r = open_res();
+"#;
+        let err_leak = compile_source(leaked).unwrap_err();
+        assert!(err_leak.contains("ownership error"), "got: {err_leak}");
+
+        // 4. Static verifier rejects potential division by zero & OOB index in @verify fns.
+        let unsafe_div = r#"
+@verify
+fn bad_div(a: Int, b: Int) -> Int {
+    return a / b;
+}
+"#;
+        let bad_div_report = crate::pipeline::verify_source_strict(unsafe_div).unwrap();
+        assert_eq!(bad_div_report["ok"], serde_json::json!(false));
+
+        let oob_src = r#"
+@verify
+fn bad_idx() -> Int {
+    let arr = [1, 2, 3];
+    return arr[5];
+}
+"#;
+        let oob_report = crate::pipeline::verify_source_strict(oob_src).unwrap();
+        assert_eq!(oob_report["ok"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn ffi_struct_bindgen_mem_and_dynamic_multi_arg_cabi() {
+        let dir = std::env::temp_dir().join(format!(
+            "veyra_ffi_sprint2_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let rs_path = dir.join("cabi8.rs");
+        let rust_cdylib = r#"
+use std::ffi::{CStr, c_char};
+
+#[repr(C)]
+pub struct Packet {
+    pub id: i32,
+    pub pad: i32,
+    pub weight: f64,
+    pub scale: f32,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mix_8_args(
+    a: i32,
+    b: f64,
+    c: i64,
+    d: f32,
+    e: u32,
+    flag: bool,
+    label: *const c_char,
+    pkt: *mut Packet,
+) -> f64 {
+    let s = if label.is_null() { "" } else { unsafe { CStr::from_ptr(label).to_str().unwrap_or("") } };
+    let p = unsafe { &mut *pkt };
+    let bonus = if flag { 10.0 } else { 0.0 };
+    p.scale = p.scale * 2.0;
+    (a as f64) + b + (c as f64) + (d as f64) + (e as f64) + bonus + (s.len() as f64) + (p.id as f64) + p.weight
+}
+"#;
+        fs::write(&rs_path, rust_cdylib).unwrap();
+        let dll_path = dir.join(format!("cabi8.{}", crate::plugin::platform_shared_ext()));
+        let built = crate::plugin::build_rust_plugin(&rs_path, &dll_path).unwrap();
+
+        let header = r#"
+#define VEYRA_FFI_VER 2
+enum Mode { MODE_OFF = 0, MODE_ACTIVE = 5, MODE_TURBO };
+typedef struct {
+    int id;
+    int pad;
+    double weight;
+    float scale;
+} Packet;
+double mix_8_args(int a, double b, long long c, float d, unsigned int e, bool flag, const char* label, void* pkt);
+"#;
+        let bindings =
+            crate::plugin::ffi_bindgen(header, built.to_string_lossy().as_ref()).unwrap();
+        assert!(bindings.contains("let VEYRA_FFI_VER = 2;"));
+        assert!(bindings.contains("let MODE_TURBO = 6;"));
+        assert!(bindings.contains("let Packet_SIZE = 24;"));
+        assert!(bindings.contains("fn Packet_pack"));
+        assert!(bindings.contains("fn Packet_unpack"));
+
+        let driver = format!(
+            "{bindings}\n\
+assert(VEYRA_FFI_VER == 2);\n\
+assert(MODE_ACTIVE == 5 and MODE_TURBO == 6);\n\
+assert(Packet_SIZE == 24);\n\
+let p = Packet_alloc();\n\
+Packet_pack(p, 7, 0, 3.25, 1.5);\n\
+let initial = Packet_unpack(p);\n\
+assert(initial[\"id\"] == 7);\n\
+assert(abs(initial[\"weight\"] - 3.25) < 0.0001);\n\
+assert(abs(initial[\"scale\"] - 1.5) < 0.0001);\n\
+let res = mix_8_args(10, 2.5, 100, 1.5, 4, true, \"veyra\", p);\n\
+assert(abs(res - 143.25) < 0.0001, \"res=\" + str(res));\n\
+let after = Packet_unpack(p);\n\
+assert(abs(after[\"scale\"] - 3.0) < 0.0001);\n\
+let oob_caught = false;\n\
+try {{ let _ = mem_read_i32(p, 200); }} catch err {{ oob_caught = true; }}\n\
+assert(oob_caught);\n\
+assert(mem_free(p) == true);\n\
+let df_caught = false;\n\
+try {{ mem_free(p); }} catch err {{ df_caught = true; }}\n\
+assert(df_caught);\n\
+let cap_denied = false;\n\
+try {{ cap_restrict(\"math\", fn() {{ mem_alloc(8); }}); }} catch err {{ cap_denied = true; }}\n\
+assert(cap_denied);\n"
+        );
+        assert_eq!(run_source(&driver), Ok(()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jit_alloc_list_wasm_wasi_strings_arrays_and_direct_aot_strings() {
+        // 1. JIT dynamic [..] list allocation + extended math helpers + List return
+        let jit_vy = r#"
+fn build_vec(a: Float, b: Float) -> List {
+    let v = [a + b, hypot(a, b), log2(8), fmod(17, 5), log10(1000)];
+    v[0] = v[0] * 2;
+    return v;
+}
+fn empty_len() -> Float {
+    let e = [];
+    return len(e);
+}
+let out = [];
+for i in range(0, 120) {
+    out = build_vec(3, 4);
+}
+assert(len(out) == 5);
+assert(abs(out[0] - 14) < 0.0001);
+assert(abs(out[1] - 5) < 0.0001);
+assert(abs(out[2] - 3) < 0.0001);
+assert(abs(out[3] - 2) < 0.0001);
+assert(abs(out[4] - 3) < 0.0001);
+for i in range(0, 80) {
+    assert(empty_len() == 0);
+}
+"#;
+        assert_eq!(run_source(jit_vy), Ok(()));
+
+        // 2. WASM + WASI linear memory, string literals, fixed arrays, _start, fd_write
+        let wasm_src = r#"
+fn calc(k: Int) -> Int {
+    let arr = [10, 20, k];
+    arr[1] = 77;
+    return arr[1] + arr[-1] + len(arr);
+}
+let greeting = "veyra-wasi";
+print(greeting);
+print(len(greeting));
+let res = calc(30);
+print(res);
+return res;
+"#;
+        let wasi_bytes =
+            crate::native_codegen::compile_source_to_wasm_with_opts(wasm_src, true).unwrap();
+        let wat = crate::native_codegen::wasm_disasm(&wasi_bytes).unwrap();
+        assert!(wat.contains("wasi_snapshot_preview1"), "{wat}");
+        assert!(wat.contains("fd_write"), "{wat}");
+        assert!(wat.contains("(export \"memory\" (memory 0))"), "{wat}");
+        assert!(wat.contains("(export \"_start\""), "{wat}");
+        let (_start_res, start_prints) =
+            crate::native_codegen::wasm_run(&wasi_bytes, "_start", &[]).unwrap();
+        assert_eq!(start_prints, vec!["veyra-wasi", "10", "110"]);
+        let (main_res, _) = crate::native_codegen::wasm_run(&wasi_bytes, "main", &[]).unwrap();
+        assert_eq!(main_res, 110.0);
+
+        let wasm_vy = r#"
+let b = wasm_compile("let s = \"hi\"; print(s); return len(s);", true);
+let r = wasm_run(b, "_start");
+assert(len(r["prints"]) == 1);
+assert(r["prints"][0] == "hi");
+let m = wasm_run(b, "main");
+assert(m["result"] == 2);
+"#;
+        assert_eq!(run_source(wasm_vy), Ok(()));
+
+        // 3. Direct zero-toolchain PE32+ / ELF64 strings + arrays
+        let aot_src = r#"
+fn banner() -> String {
+    return "hello aot";
+}
+let msg = banner();
+print(msg);
+print(len(msg));
+let xs = [10, 20, 30];
+xs[1] = 55;
+print(len(xs));
+print(xs[1] + xs[-1]);
+"#;
+        let elf = crate::native_codegen::compile_source_to_direct_binary(
+            aot_src,
+            crate::native_codegen::DirectNativeFormat::Elf64,
+        )
+        .unwrap();
+        assert_eq!(&elf[0..4], b"\x7FELF");
+        let pe = crate::native_codegen::compile_source_to_direct_binary(
+            aot_src,
+            crate::native_codegen::DirectNativeFormat::Pe64,
+        )
+        .unwrap();
+        assert_eq!(&pe[0..2], b"MZ");
+        #[cfg(target_os = "windows")]
+        {
+            let dir = std::env::temp_dir().join("veyra_sprint3_aot_test");
+            let _ = std::fs::create_dir_all(&dir);
+            let exe = dir.join("aot_str_arr.exe");
+            std::fs::write(&exe, &pe).unwrap();
+            let out = std::process::Command::new(&exe).output().unwrap();
+            assert!(out.status.success(), "exit={:?}", out.status);
+            let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+            assert_eq!(stdout, "hello aot\n9\n3\n85\n");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn sim_deterministic_cluster_and_partition_replay() {
+        let vy_src = r#"
+fn run_cluster(seed: Int) -> Map {
+    sim_start(seed);
+    let node_a = sim_actor_spawn("nodeA", fn(msg, state) {
+        if msg["kind"] == "ping" {
+            sim_actor_send("nodeA", "nodeB", {"kind": "pong", "v": msg["v"] + 1}, 5);
+        }
+        return {"state": state + msg["v"], "reply": state + msg["v"]};
+    }, {"init": 0});
+
+    let node_b = sim_actor_spawn("nodeB", fn(msg, state) {
+        return {"state": state + msg["v"], "reply": state + msg["v"]};
+    }, {"init": 100});
+
+    assert(node_a == "nodeA" and node_b == "nodeB");
+    assert(sim_actor_send("client", "nodeA", {"kind": "ping", "v": 10}, 3) == true);
+    assert(sim_actor_send("client", "nodeA", {"kind": "inc", "v": 2}, 1) == true);
+
+    // Step earliest event (tick=1, v=2) before tick=3
+    let ev1 = sim_step();
+    assert(ev1["tick"] == 1 and ev1["to"] == "nodeA" and ev1["state"] == 2);
+    assert(sim_now() == 1);
+
+    // Step second event (tick=3, v=10), which enqueues nodeA -> nodeB at tick=8
+    let ev2 = sim_step();
+    assert(ev2["tick"] == 3 and ev2["state"] == 12);
+
+    // Inject network partition between nodeA and nodeB BEFORE healing.
+    assert(sim_partition("nodeA", "nodeB", 1.0) == true);
+    assert(sim_actor_send("nodeA", "nodeB", {"kind": "blocked", "v": 999}, 2) == false);
+
+    // Heal partition and send another message from nodeA to nodeB
+    assert(sim_partition("nodeA", "nodeB", 0.0) == true);
+    assert(sim_actor_send("nodeA", "nodeB", {"kind": "after_heal", "v": 4}, 2) == true);
+
+    let summary = sim_run_until();
+    assert(summary["remaining"] == 0);
+    return {
+        "a": sim_actor_state("nodeA"),
+        "b": sim_actor_state("nodeB"),
+        "tick": summary["tick"],
+        "trace": sim_trace()
+    };
+}
+
+let r1 = run_cluster(4242);
+let r2 = run_cluster(4242);
+assert(r1["a"] == 12);
+assert(r1["b"] == 115); // 100 + 11 (from tick=8 pong) + 4 (after heal); blocked 999 was dropped
+assert(r1["a"] == r2["a"] and r1["b"] == r2["b"]);
+assert(r1["tick"] == r2["tick"]);
+assert(len(r1["trace"]) == len(r2["trace"]) and len(r1["trace"]) >= 6);
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn supervised_actors_one_for_all_and_rest_for_one() {
+        let vy_src = r#"
+fn make_worker() -> Function {
+    return fn(msg, state) {
+        if msg == "inc" {
+            return {"state": state + 1, "reply": state + 1};
+        }
+        if msg == "get" {
+            return {"state": state, "reply": state};
+        }
+        if msg == "crash" {
+            throw "boom";
+        }
+        return {"state": state, "reply": null};
+    };
+}
+
+// 1. rest_for_one: middle child crash must NOT restart earlier child[0], MUST restart child[1] and child[2]
+let sup_rfo = supervisor_spawn("rest_for_one", [
+    {"name": "db", "handler": make_worker(), "init": 10},
+    {"name": "cache", "handler": make_worker(), "init": 20},
+    {"name": "api", "handler": make_worker(), "init": 30}
+]);
+let st_rfo = supervisor_status(sup_rfo);
+let rfo_ids = st_rfo["child_ids"];
+let c_db = rfo_ids[0];
+let c_cache = rfo_ids[1];
+let c_api = rfo_ids[2];
+
+assert(actor_mailbox_len(c_db) >= 0);
+assert(actor_ask(c_db, "inc") == 11);
+assert(actor_ask(c_cache, "inc") == 21);
+assert(actor_ask(c_api, "inc") == 31);
+
+let err_rfo = "";
+try {
+    actor_ask(c_cache, "crash");
+} catch e {
+    err_rfo = str(e);
+}
+assert(contains(err_rfo, "boom"), err_rfo);
+
+// db stayed running with incremented state 11; cache & api restarted to init states 20 & 30
+assert(actor_status(c_db)["restarts"] == 0);
+assert(actor_ask(c_db, "get") == 11);
+assert(actor_status(c_cache)["restarts"] >= 1);
+assert(actor_ask(c_cache, "get") == 20);
+assert(actor_status(c_api)["restarts"] >= 1);
+assert(actor_ask(c_api, "get") == 30);
+
+assert(actor_stop(c_db) and actor_stop(c_cache) and actor_stop(c_api));
+
+// 2. one_for_all: middle child crash restarts ALL children [0, 1, 2]
+let sup_ofa = supervisor_spawn("one_for_all", [
+    {"name": "w0", "handler": make_worker(), "init": 1},
+    {"name": "w1", "handler": make_worker(), "init": 2},
+    {"name": "w2", "handler": make_worker(), "init": 3}
+]);
+let ofa_ids = supervisor_status(sup_ofa)["child_ids"];
+assert(actor_ask(ofa_ids[0], "inc") == 2);
+assert(actor_ask(ofa_ids[2], "inc") == 4);
+
+let err_ofa = "";
+try {
+    actor_ask(ofa_ids[1], "crash");
+} catch e {
+    err_ofa = str(e);
+}
+assert(contains(err_ofa, "boom"));
+assert(actor_status(ofa_ids[0])["restarts"] >= 1);
+assert(actor_status(ofa_ids[1])["restarts"] >= 1);
+assert(actor_status(ofa_ids[2])["restarts"] >= 1);
+assert(actor_ask(ofa_ids[0], "get") == 1);
+assert(actor_ask(ofa_ids[2], "get") == 3);
+assert(supervisor_status(sup_ofa)["restarts"] >= 1);
+
+assert(actor_stop(ofa_ids[0]) and actor_stop(ofa_ids[1]) and actor_stop(ofa_ids[2]));
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn gc_generational_write_barrier_and_arena_scope() {
+        let vy_src = r#"
+class BoxNode {
+    fn init(self, tag: String) -> Null {
+        self.tag = tag;
+        self.child = null;
+        return null;
+    }
+}
+
+// Allocate an object and promote it to old_gen via minor GC.
+let old_holder = BoxNode("old");
+let r_minor1 = gc_collect("minor");
+assert(r_minor1["mode"] == "minor");
+assert(r_minor1["minor_collections"] >= 1);
+assert(r_minor1["promotions"] >= 1);
+assert(gc_stats()["old_objects"] >= 1);
+
+// Mutate old_holder field to hold a newly allocated nursery child -> write barrier fires!
+let young_child = BoxNode("young_live");
+old_holder.child = young_child;
+young_child = null; // only reachable via old_holder -> remembered_set!
+
+fn alloc_nursery_garbage() -> Null {
+    let i = 0;
+    while i < 10 {
+        let g = BoxNode("dead_" + str(i));
+        i = i + 1;
+    }
+    return null;
+}
+alloc_nursery_garbage();
+
+let st_wb = gc_stats();
+assert(st_wb["write_barriers"] >= 1, "expected write barrier on old->nursery store");
+assert(st_wb["remembered_set"] >= 1, "expected remembered_set entry");
+
+let r_minor2 = gc_collect("minor");
+assert(r_minor2["collected"] >= 10, "expected dead nursery objects freed in minor GC");
+// Live young_child must survive via remembered set and retain its tag!
+assert(old_holder.child != null and old_holder.child.tag == "young_live");
+
+let r_major = gc_collect("major");
+assert(r_major["mode"] == "major" and r_major["major_collections"] >= 1);
+assert(r_major["last_pause_ns"] >= 0 and r_major["total_pause_ns"] >= r_major["last_pause_ns"]);
+
+// Arena scope reclaims non-escaping temporaries immediately while preserving returned object!
+let before_arena = gc_stats()["arena_freed"];
+let escaped = arena_scope(fn() {
+    let tmp1 = BoxNode("tmp1");
+    let tmp2 = BoxNode("tmp2");
+    tmp1.child = tmp2;
+    return BoxNode("escaped_ok");
+});
+assert(escaped.tag == "escaped_ok");
+let after_arena = gc_stats()["arena_freed"];
+assert(after_arena >= before_arena + 2, "expected arena_scope to free 2 dead temporaries");
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn gpu_extended_fused_ops_linear_and_devices() {
+        let vy_src = r#"
+let devs = gpu_devices();
+assert(len(devs) >= 1);
+let has_active = false;
+for d in devs {
+    if d["active"] == true {
+        has_active = true;
+    }
+}
+assert(has_active == true, "expected an active backend in gpu_devices()");
+
+let ops = ["div", "silu", "clamp:-1.0,2.0", "pow_scalar:2.0", "recip"];
+let insp = gpu_fuse_inspect(ops);
+assert(len(insp["spirv_words"]) > 20);
+assert(int(insp["spirv_words"][0]) == 119734787);
+assert(contains(insp["hlsl"], "clamp") and contains(insp["hlsl"], "CSMain"));
+
+// Verify div -> silu -> clamp(-1, 2) -> pow2
+let y = gpu_fuse(["div", "silu", "clamp:-1.0,2.0", "pow_scalar:2.0"], [4.0, -4.0], [2.0, 2.0]);
+assert(len(y) == 2);
+let expected0 = (2.0 / (1.0 + exp(-2.0)));
+let expected0_sq = expected0 * expected0;
+assert(abs(y[0] - expected0_sq) < 0.001, "y0=" + str(y[0]));
+let expected1 = (-2.0 / (1.0 + exp(2.0)));
+assert(abs(y[1] - (expected1 * expected1)) < 0.001, "y1=" + str(y[1]));
+
+// Verify recip on list
+let r = gpu_fuse(["recip"], [2.0, 4.0], 0.0);
+assert(abs(r[0] - 0.5) < 0.0001 and abs(r[1] - 0.25) < 0.0001);
+
+// Verify gpu_fused_linear on both Matrix Lists and Tensors with bias + relu / silu
+let x_mat = [[1.0, 2.0], [3.0, -1.0]];
+let w_mat = [[1.0, 0.0], [2.0, -1.0]];
+let lin_relu = gpu_fused_linear(x_mat, w_mat, [-4.0, 2.0], "relu");
+// row 0: [1*1+2*2-4 = 1, 1*0+2*-1+2 = 0] -> relu [1, 0]
+// row 1: [3*1-1*2-4 = -3, 3*0-1*-1+2 = 3] -> relu [0, 3]
+assert(abs(lin_relu[0][0] - 1.0) < 0.0001 and abs(lin_relu[0][1] - 0.0) < 0.0001);
+assert(abs(lin_relu[1][0] - 0.0) < 0.0001 and abs(lin_relu[1][1] - 3.0) < 0.0001);
+
+let tx = tensor([[1.0, -2.0]], false);
+let tw = tensor([[2.0, 1.0], [1.0, -1.0]], false);
+let tb = tensor([0.5, -1.0], false);
+// row 0 before act: [0.5, 2.0]; silu(0.5) ~ 0.3112, silu(2.0) ~ 1.7616
+let t_silu = gpu_fused_linear(tx, tw, tb, "silu");
+assert(tensor_shape(t_silu) == [1, 2]);
+let tv = tensor_values(t_silu);
+assert(abs(tv[0] - (0.5 / (1.0 + exp(-0.5)))) < 0.001);
+assert(abs(tv[1] - (2.0 / (1.0 + exp(-2.0)))) < 0.001);
+"#;
+        assert_eq!(run_source(vy_src), Ok(()));
+    }
+
+    #[test]
+    fn dlpack_strided_and_non_contiguous_import() {
+        // 1. Direct zero-dependency C-ABI DLTensor strided layout check (non-contiguous + negative stride + byte_offset)
+        let backing = vec![10.0, 99.0, 20.0, 99.0, 30.0, 99.0, 40.0, 99.0];
+        let (shape, vals) =
+            crate::py_bridge::read_strided_dlpack_f64_for_test(&backing, &[2, 2], Some(&[4, 2]), 0)
+                .unwrap();
+        assert_eq!(shape, vec![2, 2]);
+        assert_eq!(vals, vec![10.0, 20.0, 30.0, 40.0]);
+
+        // Negative stride traversal starting at last valid element via byte_offset
+        let (neg_shape, neg_vals) = crate::py_bridge::read_strided_dlpack_f64_for_test(
+            &backing,
+            &[2],
+            Some(&[-2]),
+            (6 * std::mem::size_of::<f64>()) as u64,
+        )
+        .unwrap();
+        assert_eq!(neg_shape, vec![2]);
+        assert_eq!(neg_vals, vec![40.0, 30.0]);
+
+        // Empty shape [0, 3] must succeed without touching out-of-bounds memory
+        let (empty_shape, empty_vals) =
+            crate::py_bridge::read_strided_dlpack_f64_for_test(&[], &[0, 3], None, 0).unwrap();
+        assert_eq!(empty_shape, vec![0, 3]);
+        assert!(empty_vals.is_empty());
+
+        // 2. Live NumPy transposed + strided slice via DLPack when CPython+NumPy is installed
+        if crate::py_bridge::py_eval("1 + 1", None).is_ok() {
+            let vy_src = r#"
+let has_np = py_eval("__import__('importlib.util', fromlist=['find_spec']).find_spec('numpy') is not None");
+if has_np {
+    let np = py_import("numpy");
+    let base = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+    // Transposed view is non-contiguous (Fortran order)
+    let trans = base.T;
+    let vt = py_from_dlpack(trans);
+    assert(tensor_shape(vt) == [3, 2]);
+    assert(tensor_values(vt) == [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+
+    // Step-sliced negative stride view
+    let rev = py_eval("__import__('numpy').array([10.0, 20.0, 30.0, 40.0])[::-2]");
+    let vr = py_from_dlpack(rev);
+    assert(tensor_shape(vr) == [2]);
+    assert(tensor_values(vr) == [40.0, 20.0]);
+
+    py_free(rev);
+    py_free(trans);
+    py_free(base);
+    py_free(np);
+}
+"#;
+            assert_eq!(run_source(vy_src), Ok(()));
+        }
+    }
+
+    #[test]
+    fn notebook_reactive_topological_dag_cycle_and_export() {
+        let dir = env::temp_dir().join("veyra_notebook_dag_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let nb_file = dir.join(".veyra-notebook.json");
+        let session = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::server::NotebookSession::new(Some(nb_file)),
+        ));
+
+        // Add out-of-order downstream first? Let's test normal order then reactive cascade:
+        // c_base -> c_mid -> c_leaf, plus independent cell c_indep
+        let (st1, _, b1) = crate::server::handle_notebook_api_request(
+            &session,
+            "POST",
+            "/api/notebook/run",
+            r#"{"id":"c_base","source":"let a = 5;"}"#,
+        );
+        assert_eq!(st1, 200);
+        let j1: serde_json::Value = serde_json::from_str(&b1).unwrap();
+        assert!(j1["error"].is_null());
+
+        let _ = crate::server::handle_notebook_api_request(
+            &session,
+            "POST",
+            "/api/notebook/run",
+            r#"{"id":"c_indep","source":"let z = 77;"}"#,
+        );
+        let _ = crate::server::handle_notebook_api_request(
+            &session,
+            "POST",
+            "/api/notebook/run",
+            r#"{"id":"c_leaf","source":"let c = b * 10;\nprint(c);"}"#,
+        );
+        let _ = crate::server::handle_notebook_api_request(
+            &session,
+            "POST",
+            "/api/notebook/run",
+            r#"{"id":"c_mid","source":"let b = a + 2;\nprint(b);"}"#,
+        );
+
+        // Update c_base: both c_mid AND c_leaf must cascade in topological order (c_mid before c_leaf)!
+        let (st_upd, _, b_upd) = crate::server::handle_notebook_api_request(
+            &session,
+            "POST",
+            "/api/notebook/run",
+            r#"{"id":"c_base","source":"let a = 10;"}"#,
+        );
+        assert_eq!(st_upd, 200);
+        let j_upd: serde_json::Value = serde_json::from_str(&b_upd).unwrap();
+        assert_eq!(
+            j_upd["cascade_updated"],
+            serde_json::json!(["c_mid", "c_leaf"])
+        );
+
+        let (_, _, state_raw) =
+            crate::server::handle_notebook_api_request(&session, "GET", "/api/notebook/state", "");
+        let state_json: serde_json::Value = serde_json::from_str(&state_raw).unwrap();
+        let cells = state_json["cells"].as_array().unwrap();
+        let leaf = cells.iter().find(|c| c["id"] == "c_leaf").unwrap();
+        assert_eq!(leaf["stdout"].as_str().unwrap().trim(), "120"); // (10 + 2) * 10
+
+        let (st_dag, _, dag_raw) =
+            crate::server::handle_notebook_api_request(&session, "GET", "/api/notebook/dag", "");
+        assert_eq!(st_dag, 200);
+        let dag_json: serde_json::Value = serde_json::from_str(&dag_raw).unwrap();
+        assert_eq!(dag_json["has_cycle"], false);
+        let order = dag_json["order"].as_array().unwrap();
+        let pos_base = order.iter().position(|x| x == "c_base").unwrap();
+        let pos_mid = order.iter().position(|x| x == "c_mid").unwrap();
+        let pos_leaf = order.iter().position(|x| x == "c_leaf").unwrap();
+        assert!(pos_base < pos_mid && pos_mid < pos_leaf);
+
+        // Export topological .vy script: c_mid must appear before c_leaf
+        let (st_exp, _, exp_text) =
+            crate::server::handle_notebook_api_request(&session, "GET", "/api/notebook/export", "");
+        assert_eq!(st_exp, 200);
+        assert!(exp_text.find("c_mid").unwrap() < exp_text.find("c_leaf").unwrap());
+
+        // Inject cycle: make c_base depend on c!
+        let (_, _, cyc_raw) = crate::server::handle_notebook_api_request(
+            &session,
+            "POST",
+            "/api/notebook/run",
+            r#"{"id":"c_base","source":"let a = c + 1;"}"#,
+        );
+        let cyc_json: serde_json::Value = serde_json::from_str(&cyc_raw).unwrap();
+        assert!(
+            cyc_json["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("NotebookCycleError"),
+            "expected NotebookCycleError, got {cyc_json}"
+        );
+        let (_, _, dag_cyc_raw) =
+            crate::server::handle_notebook_api_request(&session, "GET", "/api/notebook/dag", "");
+        let dag_cyc: serde_json::Value = serde_json::from_str(&dag_cyc_raw).unwrap();
+        assert_eq!(dag_cyc["has_cycle"], true);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dap_reversible_watchpoints_forward_and_reverse_continue() {
+        use std::collections::VecDeque;
+        use std::io::{BufReader, Read, Write};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        #[derive(Clone, Default)]
+        struct MemPipe(Arc<(Mutex<(VecDeque<u8>, bool)>, Condvar)>);
+        impl Read for MemPipe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let (lock, cv) = &*self.0;
+                let mut g = lock.lock().unwrap();
+                while g.0.is_empty() && !g.1 {
+                    g = cv.wait(g).unwrap();
+                }
+                if g.0.is_empty() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(g.0.len());
+                for b in buf.iter_mut().take(n) {
+                    *b = g.0.pop_front().unwrap();
+                }
+                Ok(n)
+            }
+        }
+        impl Write for MemPipe {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let (lock, cv) = &*self.0;
+                let mut g = lock.lock().unwrap();
+                g.0.extend(buf);
+                cv.notify_all();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let prog = env::temp_dir().join("veyra_dap_watchpoint_test.vy");
+        fs::write(
+            &prog,
+            "let x = 1;\nlet y = 2;\nx = 10;\ny = 99;\nx = 20;\nprint(x + y);\n",
+        )
+        .unwrap();
+
+        let mut c2s = MemPipe::default();
+        let s2c = MemPipe::default();
+        let srv_handle = std::thread::spawn({
+            let si = c2s.clone();
+            let so = s2c.clone();
+            move || crate::dap::run_dap_with_io(BufReader::new(si), Box::new(so))
+        });
+        let mut reader = BufReader::new(s2c);
+        let mut seq = 1u64;
+        let mut send_req = |cmd: &str, args: serde_json::Value| {
+            let payload = serde_json::json!({
+                "seq": seq,
+                "type": "request",
+                "command": cmd,
+                "arguments": args
+            });
+            seq += 1;
+            let body = serde_json::to_string(&payload).unwrap();
+            let raw = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+            c2s.write_all(raw.as_bytes()).unwrap();
+            c2s.flush().unwrap();
+        };
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        let recv_resp =
+            |r: &mut BufReader<MemPipe>, evs: &mut Vec<serde_json::Value>, cmd: &str| {
+                loop {
+                    let m = crate::dap::read_dap_message(r).unwrap().unwrap();
+                    if m.get("type").and_then(|v| v.as_str()) == Some("response")
+                        && m.get("command").and_then(|v| v.as_str()) == Some(cmd)
+                    {
+                        assert_eq!(
+                            m.get("success").and_then(|v| v.as_bool()),
+                            Some(true),
+                            "{m}"
+                        );
+                        return m;
+                    }
+                    evs.push(m);
+                }
+            };
+        let wait_ev = |r: &mut BufReader<MemPipe>, evs: &mut Vec<serde_json::Value>, ev: &str| {
+            if let Some(pos) = evs
+                .iter()
+                .position(|m| m.get("event").and_then(|v| v.as_str()) == Some(ev))
+            {
+                return evs.remove(pos);
+            }
+            loop {
+                let m = crate::dap::read_dap_message(r).unwrap().unwrap();
+                if m.get("event").and_then(|v| v.as_str()) == Some(ev) {
+                    return m;
+                }
+                evs.push(m);
+            }
+        };
+
+        send_req("initialize", serde_json::json!({}));
+        let init_resp = recv_resp(&mut reader, &mut events, "initialize");
+        assert_eq!(
+            init_resp
+                .pointer("/body/supportsDataBreakpoints")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        wait_ev(&mut reader, &mut events, "initialized");
+
+        send_req(
+            "launch",
+            serde_json::json!({ "program": prog.to_string_lossy(), "stopOnEntry": true }),
+        );
+        recv_resp(&mut reader, &mut events, "launch");
+
+        send_req("dataBreakpointInfo", serde_json::json!({ "name": "x" }));
+        let info_resp = recv_resp(&mut reader, &mut events, "dataBreakpointInfo");
+        assert_eq!(
+            info_resp.pointer("/body/dataId").and_then(|v| v.as_str()),
+            Some("x")
+        );
+
+        send_req(
+            "setDataBreakpoints",
+            serde_json::json!({ "breakpoints": [{ "dataId": "x" }] }),
+        );
+        recv_resp(&mut reader, &mut events, "setDataBreakpoints");
+
+        send_req("configurationDone", serde_json::json!({}));
+        recv_resp(&mut reader, &mut events, "configurationDone");
+        let e1 = wait_ev(&mut reader, &mut events, "stopped");
+        assert_eq!(
+            e1.pointer("/body/reason").and_then(|v| v.as_str()),
+            Some("entry")
+        );
+
+        // Forward continue stops on first data breakpoint (after `let x = 1;`)
+        send_req("continue", serde_json::json!({}));
+        recv_resp(&mut reader, &mut events, "continue");
+        let w1 = wait_ev(&mut reader, &mut events, "stopped");
+        assert_eq!(
+            w1.pointer("/body/reason").and_then(|v| v.as_str()),
+            Some("data breakpoint")
+        );
+        send_req("evaluate", serde_json::json!({ "expression": "x" }));
+        assert_eq!(
+            recv_resp(&mut reader, &mut events, "evaluate")
+                .pointer("/body/result")
+                .and_then(|v| v.as_str()),
+            Some("1")
+        );
+
+        // Next forward continue skips `let y = 2` and `x = 10;` execution until x==10 observed
+        send_req("continue", serde_json::json!({}));
+        recv_resp(&mut reader, &mut events, "continue");
+        let w2 = wait_ev(&mut reader, &mut events, "stopped");
+        assert_eq!(
+            w2.pointer("/body/reason").and_then(|v| v.as_str()),
+            Some("data breakpoint")
+        );
+        send_req("evaluate", serde_json::json!({ "expression": "x" }));
+        assert_eq!(
+            recv_resp(&mut reader, &mut events, "evaluate")
+                .pointer("/body/result")
+                .and_then(|v| v.as_str()),
+            Some("10")
+        );
+
+        // Forward to x == 20
+        send_req("continue", serde_json::json!({}));
+        recv_resp(&mut reader, &mut events, "continue");
+        let w3 = wait_ev(&mut reader, &mut events, "stopped");
+        assert_eq!(
+            w3.pointer("/body/reason").and_then(|v| v.as_str()),
+            Some("data breakpoint")
+        );
+        send_req("evaluate", serde_json::json!({ "expression": "x" }));
+        assert_eq!(
+            recv_resp(&mut reader, &mut events, "evaluate")
+                .pointer("/body/result")
+                .and_then(|v| v.as_str()),
+            Some("20")
+        );
+
+        // Reverse continue must rewind past y = 99 right to where x transitioned 10 -> 20 (data breakpoint)
+        send_req("reverseContinue", serde_json::json!({}));
+        recv_resp(&mut reader, &mut events, "reverseContinue");
+        let rev1 = wait_ev(&mut reader, &mut events, "stopped");
+        assert_eq!(
+            rev1.pointer("/body/reason").and_then(|v| v.as_str()),
+            Some("data breakpoint")
+        );
+        send_req("evaluate", serde_json::json!({ "expression": "x" }));
+        assert_eq!(
+            recv_resp(&mut reader, &mut events, "evaluate")
+                .pointer("/body/result")
+                .and_then(|v| v.as_str()),
+            Some("10")
+        );
+
+        // Second reverse continue rewinds x: 10 -> 1
+        send_req("reverseContinue", serde_json::json!({}));
+        recv_resp(&mut reader, &mut events, "reverseContinue");
+        let rev2 = wait_ev(&mut reader, &mut events, "stopped");
+        assert_eq!(
+            rev2.pointer("/body/reason").and_then(|v| v.as_str()),
+            Some("data breakpoint")
+        );
+        send_req("evaluate", serde_json::json!({ "expression": "x" }));
+        assert_eq!(
+            recv_resp(&mut reader, &mut events, "evaluate")
+                .pointer("/body/result")
+                .and_then(|v| v.as_str()),
+            Some("1")
+        );
+
+        send_req("disconnect", serde_json::json!({}));
+        recv_resp(&mut reader, &mut events, "disconnect");
+        srv_handle.join().unwrap().unwrap();
+        let _ = fs::remove_file(&prog);
     }
 }

@@ -20,23 +20,25 @@ release date in the source material; earlier entries are undated.
 ## 12.0 Sovereign
 
 Self-hosting, language parity, compiler optimization, tensor broadcasting, and 8-pillar horizon release.
-Release gate verified **2026-11-14**.
+Release gate verified **2026-11-14** (**123/123** unit tests, **74/74** packages, **8/8** release gates).
 
-- **WebAssembly & Direct Zero-Toolchain Native Binaries (`native_codegen.rs`, `cli.rs`)**:
-  - Added standalone `.wasm` emission, disassembly, and stack VM execution (`veyra wasm [file.vy] [-o out.wasm] [--disasm] [--run <fn> [args...]]`, `wasm_compile`, `wasm_disasm`, `wasm_run`).
-  - Added direct zero-toolchain PE32+ and ELF64 x86_64 executable emission (`veyra aot [--direct] [--elf|--pe]`).
+- **IR Optimizer, Formal Taint, Linear Ownership & Interval Verifier (`ir.rs`, `pipeline.rs`)**:
+  - Added SSA copy/constant propagation, algebraic identities, dead code elimination (`ir_stats`), formal `@secret`/`sanitize(...)` information-flow taint verification, `@linear`/`linear_consume(...)` ownership analysis across branches, and `@verify` static interval/bounds proofs.
+- **WebAssembly/WASI & Direct Zero-Toolchain Native Binaries (`native_codegen.rs`, `cli.rs`)**:
+  - Added standalone `.wasm` emission, disassembly, and stack VM execution with WASI linear-memory string & array lowering (`veyra wasm [file.vy] [-o out.wasm] [--disasm] [--run <fn> [args...]]`, `wasm_compile`, `wasm_disasm`, `wasm_run`).
+  - Added direct zero-toolchain PE32+ and ELF64 x86_64 executable emission supporting heap/linear strings & arrays (`veyra aot [--direct] [--elf|--pe]`).
 - **Contracts, Static Effects & Capability Security (`pipeline.rs`, `runtime.rs`, `registry.rs`)**:
   - Added runtime `requires`/`ensures` contracts (`ContractError`) and transitive call-graph static effect verification for `@pure` and `@effect(...)`.
   - Added runtime capability sandboxing (`veyra run --caps c1,c2`, `cap_current`, `cap_restrict`, manifest `"capabilities"`, `veyra audit`) and reproducible `.vypkg.json` bundles.
-- **Heterogeneous Fused GPU Shaders & CPython DLPack Interop (`spirv.rs`, `gpu.rs`, `py_bridge.rs`)**:
-  - Added `gpu_fuse` and `gpu_fuse_inspect` generating single-pass SPIR-V (`spirv_fused_ewise`) and HLSL `cs_5_0` (`hlsl_fused_ewise`) kernels with CPU fallback.
-  - Added PyCapsule `DLManagedTensor` / `DLManagedTensorVersioned` zero-copy tensor interop (`tensor_to_dlpack`, `py_from_dlpack`), verified with NumPy and PyTorch.
-- **Mark-Sweep Cycle-Collecting GC, Deterministic Simulation & Supervised Actors (`vm.rs`, `sim_actor.rs`)**:
-  - Added worklist mark-sweep object GC across VM roots (`gc_collect`, `gc_stats`, `gc_pause`, `gc_resume`).
-  - Added SplitMix64 deterministic simulation (`sim_start`, `sim_stop`, `sim_now`, `sim_advance`, `sim_rand`, `sim_fault`, `sim_log`) and supervised actors (`actor_spawn`, `actor_send`, `actor_ask`, `actor_stop`, `actor_status`).
-- **Pure-Rust C Header Bindgen, Reversible DAP, Reactive Notebook & Native JIT (`plugin.rs`, `dap.rs`, `server.rs`, `jit.rs`)**:
-  - Added `veyra ffi bindgen <header.h> <lib_path> [-o out.vy]`, `ffi_bindgen`, and capability-gated `ffi_call`.
-  - Added time-travel reversible DAP (`stepBack`, `reverseContinue` over `TraceSnapshot` history), persistent reactive notebook server (`veyra notebook [dir] [port]`), and native JIT `Op::SetIndex` + `JitReturnKind::NumList` support.
+- **Heterogeneous Fused GPU Shaders, Fused Linear & Strided DLPack Interop (`spirv.rs`, `gpu.rs`, `py_bridge.rs`)**:
+  - Extended `gpu_fuse` & `gpu_fuse_inspect` (`div`, `silu`, `clamp`, `pow_scalar`, `recip`), added single-pass fused GEMM+bias+activation (`gpu_fused_linear`) in SPIR-V & HLSL `cs_5_0`, and added `gpu_devices` hardware/software adapter reporting.
+  - Added contiguous + arbitrary strided/non-contiguous PyCapsule `DLManagedTensor` / `DLManagedTensorVersioned` zero-copy tensor interop (`tensor_to_dlpack`, `py_from_dlpack`), verified with NumPy and PyTorch.
+- **2-Gen Nursery/Old GC, `arena_scope`, Virtual-Clock Cluster & OTP Supervisors (`vm.rs`, `sim_actor.rs`)**:
+  - Upgraded object GC to 2-generation nursery/old-gen with remembered-set write barriers (`gc_collect("minor"|"major")`, `gc_stats`, `gc_pause`, `gc_resume`) and deterministic LIFO `arena_scope(fn)`.
+  - Added SplitMix64 virtual-clock discrete-event actor clusters (`sim_actor_spawn`, `sim_actor_send`, `sim_step`, `sim_run_until`, `sim_partition`, `sim_actor_state`, `sim_trace`) and OTP-style supervision trees (`supervisor_spawn` with `"one_for_one"`, `"one_for_all"`, `"rest_for_one"`, `supervisor_status`, `actor_mailbox_len`).
+- **FFI Struct Bindgen, Dynamic C-ABI, Reversible DAP Watchpoints, DAG Notebooks & Native JIT (`plugin.rs`, `dap.rs`, `server.rs`, `jit.rs`)**:
+  - Added C header `struct`/`enum`/`#define` bindgen (`veyra ffi bindgen`), dynamic multi-arg x86_64 C-ABI calls (`ffi_call`), and bounded `mem_*` linear heap buffers.
+  - Added time-travel reversible DAP with forward & reverse data watchpoints (`stepBack`, `reverseContinue`, `dataBreakpointInfo`, `setDataBreakpoints`), AST dependency-driven topological DAG notebooks with cycle detection + `/api/notebook/dag` + `/api/notebook/export`, and native JIT dynamic `[..]` lists + `log2`/`hypot`/`fmod`/`atan2` + `Op::SetIndex` + `NumList` returns.
 
 - **Self-Hosted Compiler (`compiler-vy/src/main.vy`) & `.vybc` Bytecode**:
   - Added portable `veyra-bc-v1` (`.vybc`) bytecode serialization with SHA-256 tamper

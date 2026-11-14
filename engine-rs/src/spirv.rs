@@ -76,6 +76,7 @@ const DEC_DESCRIPTOR_SET: u32 = 34;
 const DEC_OFFSET: u32 = 35;
 const BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28;
 
+const GLSL_POW: u32 = 26;
 const GLSL_EXP: u32 = 27;
 const GLSL_SQRT: u32 = 31;
 const GLSL_FMAX: u32 = 40;
@@ -904,6 +905,7 @@ pub(crate) enum FusedEwiseOp {
     Add,
     Sub,
     Mul,
+    Div,
     AddScalar(f32),
     Scale(f32),
     Abs,
@@ -911,14 +913,73 @@ pub(crate) enum FusedEwiseOp {
     Sqrt,
     Relu,
     Sigmoid,
+    Silu,
     Gelu,
     Tanh,
+    Clamp(f32, f32),
+    PowScalar(f32),
+    Recip,
+}
+
+fn spirv_sigmoid(m: &mut SpvModule, x: u32) -> u32 {
+    let f1 = m.c_f32(1.0);
+    let neg = m.fneg(x);
+    let e = m.glsl1(GLSL_EXP, neg);
+    let denom = m.fadd(f1, e);
+    m.fdiv(f1, denom)
+}
+
+fn spirv_silu(m: &mut SpvModule, x: u32) -> u32 {
+    let sig = spirv_sigmoid(m, x);
+    m.fmul(x, sig)
+}
+
+fn spirv_clamp(m: &mut SpvModule, x: u32, lo: f32, hi: f32) -> u32 {
+    let f_lo = m.c_f32(lo);
+    let f_hi = m.c_f32(hi);
+    let ge_lo = m.glsl2(GLSL_FMAX, x, f_lo);
+    let gt_hi = m.id();
+    m.op(OP_FORD_GREATER_THAN, &[m.t_bool, gt_hi, ge_lo, f_hi]);
+    let clamped = m.id();
+    m.op(169u16, &[m.t_f32, clamped, gt_hi, f_hi, ge_lo]);
+    clamped
+}
+
+fn spirv_tanh(m: &mut SpvModule, x: u32) -> u32 {
+    let f1 = m.c_f32(1.0);
+    let f2 = m.c_f32(2.0);
+    let two_x = m.fmul(f2, x);
+    let clamped = spirv_clamp(m, two_x, -18.0, 18.0);
+    let ex = m.glsl1(GLSL_EXP, clamped);
+    let ep1 = m.fadd(ex, f1);
+    let two_over = m.fdiv(f2, ep1);
+    m.fsub(f1, two_over)
+}
+
+fn spirv_gelu(m: &mut SpvModule, x: u32) -> u32 {
+    let f2 = m.c_f32(2.0);
+    let f_half = m.c_f32(0.5);
+    let f_k0 = m.c_f32(0.797_884_6);
+    let f_k1 = m.c_f32(0.044_715);
+    let f1 = m.c_f32(1.0);
+    let x2 = m.fmul(x, x);
+    let x3 = m.fmul(x2, x);
+    let cx3 = m.fmul(f_k1, x3);
+    let inner = m.fadd(x, cx3);
+    let y = m.fmul(f_k0, inner);
+    let y2 = m.fmul(f2, y);
+    let clamped = spirv_clamp(m, y2, -18.0, 18.0);
+    let ex = m.glsl1(GLSL_EXP, clamped);
+    let ep1 = m.fadd(ex, f1);
+    let two_over = m.fdiv(f2, ep1);
+    let one_plus_tanh = m.fsub(f2, two_over);
+    let half_x = m.fmul(f_half, x);
+    m.fmul(half_x, one_plus_tanh)
 }
 
 /// Compiles an elementwise DAG sequence into a single straight-line SPIR-V 1.0 compute kernel
 /// executing all fused operations in SSA registers with zero intermediate buffer writes.
 pub(crate) fn spirv_fused_ewise(ops: &[FusedEwiseOp]) -> Vec<u32> {
-    const OP_SELECT: u16 = 169;
     let mut m = SpvModule::new(256, 1, 1, 1);
     let len = m.load_pc_u32(0);
     let i = m.gid_comp(0);
@@ -953,6 +1014,10 @@ pub(crate) fn spirv_fused_ewise(ops: &[FusedEwiseOp]) -> Vec<u32> {
                 let b = get_b(&mut m);
                 m.fmul(acc, b)
             }
+            FusedEwiseOp::Div => {
+                let b = get_b(&mut m);
+                m.fdiv(acc, b)
+            }
             FusedEwiseOp::AddScalar(s) => {
                 let c = m.c_f32(s);
                 m.fadd(acc, c)
@@ -962,6 +1027,10 @@ pub(crate) fn spirv_fused_ewise(ops: &[FusedEwiseOp]) -> Vec<u32> {
                 m.fmul(acc, c)
             }
             FusedEwiseOp::Neg => m.fneg(acc),
+            FusedEwiseOp::Recip => {
+                let f1 = m.c_f32(1.0);
+                m.fdiv(f1, acc)
+            }
             FusedEwiseOp::Abs => {
                 let neg = m.fneg(acc);
                 m.glsl2(GLSL_FMAX, acc, neg)
@@ -975,58 +1044,84 @@ pub(crate) fn spirv_fused_ewise(ops: &[FusedEwiseOp]) -> Vec<u32> {
                 let f0 = m.c_f32(0.0);
                 m.glsl2(GLSL_FMAX, acc, f0)
             }
-            FusedEwiseOp::Sigmoid => {
-                let f1 = m.c_f32(1.0);
-                let neg = m.fneg(acc);
-                let e = m.glsl1(GLSL_EXP, neg);
-                let denom = m.fadd(f1, e);
-                m.fdiv(f1, denom)
-            }
-            FusedEwiseOp::Tanh => {
-                let f1 = m.c_f32(1.0);
-                let f2 = m.c_f32(2.0);
-                let f18 = m.c_f32(18.0);
-                let fn18 = m.c_f32(-18.0);
-                let two_x = m.fmul(f2, acc);
-                let ge_lo = m.glsl2(GLSL_FMAX, two_x, fn18);
-                let gt_hi = m.id();
-                m.op(OP_FORD_GREATER_THAN, &[m.t_bool, gt_hi, ge_lo, f18]);
-                let clamped = m.id();
-                m.op(OP_SELECT, &[m.t_f32, clamped, gt_hi, f18, ge_lo]);
-                let ex = m.glsl1(GLSL_EXP, clamped);
-                let ep1 = m.fadd(ex, f1);
-                let two_over = m.fdiv(f2, ep1);
-                m.fsub(f1, two_over)
-            }
-            FusedEwiseOp::Gelu => {
-                let f1 = m.c_f32(1.0);
-                let f2 = m.c_f32(2.0);
-                let f_half = m.c_f32(0.5);
-                let f_k0 = m.c_f32(0.797_884_6);
-                let f_k1 = m.c_f32(0.044_715);
-                let f18 = m.c_f32(18.0);
-                let fn18 = m.c_f32(-18.0);
-                let x2 = m.fmul(acc, acc);
-                let x3 = m.fmul(x2, acc);
-                let cx3 = m.fmul(f_k1, x3);
-                let inner = m.fadd(acc, cx3);
-                let y = m.fmul(f_k0, inner);
-                let y2 = m.fmul(f2, y);
-                let ge_lo = m.glsl2(GLSL_FMAX, y2, fn18);
-                let gt_hi = m.id();
-                m.op(OP_FORD_GREATER_THAN, &[m.t_bool, gt_hi, ge_lo, f18]);
-                let clamped = m.id();
-                m.op(OP_SELECT, &[m.t_f32, clamped, gt_hi, f18, ge_lo]);
-                let ex = m.glsl1(GLSL_EXP, clamped);
-                let ep1 = m.fadd(ex, f1);
-                let two_over = m.fdiv(f2, ep1);
-                let one_plus_tanh = m.fsub(f2, two_over);
-                let half_x = m.fmul(f_half, acc);
-                m.fmul(half_x, one_plus_tanh)
+            FusedEwiseOp::Sigmoid => spirv_sigmoid(&mut m, acc),
+            FusedEwiseOp::Silu => spirv_silu(&mut m, acc),
+            FusedEwiseOp::Tanh => spirv_tanh(&mut m, acc),
+            FusedEwiseOp::Gelu => spirv_gelu(&mut m, acc),
+            FusedEwiseOp::Clamp(lo, hi) => spirv_clamp(&mut m, acc, lo.min(hi), lo.max(hi)),
+            FusedEwiseOp::PowScalar(p) => {
+                if p == 0.0 {
+                    m.c_f32(1.0)
+                } else if p == 1.0 {
+                    acc
+                } else if p == 2.0 {
+                    m.fmul(acc, acc)
+                } else if p == 3.0 {
+                    let x2 = m.fmul(acc, acc);
+                    m.fmul(x2, acc)
+                } else {
+                    let f0 = m.c_f32(0.0);
+                    let safe = m.glsl2(GLSL_FMAX, acc, f0);
+                    let c_p = m.c_f32(p);
+                    m.glsl2(GLSL_POW, safe, c_p)
+                }
             }
         };
     }
 
     m.store_out(i, acc);
+    m.finish()
+}
+
+/// Generates single-pass SPIR-V for fused `Y[M, N] = act(X[M, K] @ W[K, N] + bias[N])`.
+/// Buffer B packs `[W (K*N floats), bias (N floats)]` when `has_bias == true`.
+/// `act_code`: 0=none, 1=relu, 2=gelu, 3=silu. PushConstants: `[M, K, N, 0]`, LocalSize(16, 16, 1).
+pub(crate) fn spirv_fused_linear(act_code: u32, has_bias: bool) -> Vec<u32> {
+    let mut m = SpvModule::new(16, 16, 1, 4);
+    let dim_m = m.load_pc_u32(0);
+    let dim_k = m.load_pc_u32(1);
+    let dim_n = m.load_pc_u32(2);
+
+    let col = m.gid_comp(0);
+    let row = m.gid_comp(1);
+
+    let oob_r = m.id();
+    let oob_c = m.id();
+    m.op(OP_UGREATER_THAN_EQUAL, &[m.t_bool, oob_r, row, dim_m]);
+    m.guard_oob(oob_r);
+    m.op(OP_UGREATER_THAN_EQUAL, &[m.t_bool, oob_c, col, dim_n]);
+    m.guard_oob(oob_c);
+
+    let row_k = m.umul(row, dim_k);
+    let c0 = m.c_u32(0);
+    let f0 = m.c_f32(0.0);
+
+    let mut acc = m.for_range_acc(c0, dim_k, f0, |m, p_idx, acc| {
+        let a_idx = m.uadd(row_k, p_idx);
+        let p_n = m.umul(p_idx, dim_n);
+        let b_idx = m.uadd(p_n, col);
+        let av = m.load_buf(m.var_a, a_idx);
+        let bv = m.load_buf(m.var_b, b_idx);
+        let prod = m.fmul(av, bv);
+        m.fadd(acc, prod)
+    });
+
+    if has_bias {
+        let kn = m.umul(dim_k, dim_n);
+        let bias_idx = m.uadd(kn, col);
+        let bv = m.load_buf(m.var_b, bias_idx);
+        acc = m.fadd(acc, bv);
+    }
+
+    acc = match act_code {
+        1 => m.glsl2(GLSL_FMAX, acc, f0),
+        2 => spirv_gelu(&mut m, acc),
+        3 => spirv_silu(&mut m, acc),
+        _ => acc,
+    };
+
+    let row_n = m.umul(row, dim_n);
+    let out_idx = m.uadd(row_n, col);
+    m.store_out(out_idx, acc);
     m.finish()
 }

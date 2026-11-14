@@ -1833,81 +1833,15 @@ impl PyCapiInner {
             let managed = ptr as *mut DLManagedTensor;
             unsafe { &(*managed).dl_tensor }
         };
-        if dl.device.device_type != 1 {
-            let dev = dl.device.device_type;
-            if owns_cap {
-                unsafe { (self.py_dec_ref)(cap) };
-            }
-            return Err(format!(
-                "DLPack tensor uses non-CPU device_type={dev}; move to CPU first"
-            ));
-        }
-        if dl.dtype.lanes != 1 {
-            if owns_cap {
-                unsafe { (self.py_dec_ref)(cap) };
-            }
-            return Err("DLPack vector lanes != 1 unsupported".into());
-        }
-
-        let ndim = dl.ndim.max(0) as usize;
-        let shape: Vec<usize> = if ndim == 0 || dl.shape.is_null() {
-            vec![1]
-        } else {
-            unsafe { std::slice::from_raw_parts(dl.shape, ndim) }
-                .iter()
-                .map(|&d| d.max(0) as usize)
-                .collect()
-        };
-        let total: usize = shape.iter().product::<usize>().max(1);
-        let elem_bytes = (usize::from(dl.dtype.bits) / 8).max(1);
-        let mut strides: Vec<isize> = if ndim > 0 && !dl.strides.is_null() {
-            unsafe { std::slice::from_raw_parts(dl.strides, ndim) }
-                .iter()
-                .map(|&s| s as isize)
-                .collect()
-        } else {
-            let mut st = vec![1isize; shape.len()];
-            let mut acc = 1isize;
-            for i in (0..shape.len()).rev() {
-                st[i] = acc;
-                acc *= shape[i].max(1) as isize;
-            }
-            st
-        };
-        if strides.is_empty() {
-            strides.push(1);
-        }
-
-        let base_ptr = unsafe { (dl.data as *const u8).add(dl.byte_offset as usize) };
-        let mut out = Vec::with_capacity(total);
-        if total > 0 && !dl.data.is_null() {
-            let mut coords = vec![0usize; shape.len()];
-            for _ in 0..total {
-                let mut elem_off = 0isize;
-                for (ax, &c) in coords.iter().enumerate() {
-                    elem_off += (c as isize) * strides[ax];
+        let (shape, out) = match unsafe { read_raw_dltensor(dl) } {
+            Ok(v) => v,
+            Err(e) => {
+                if owns_cap {
+                    unsafe { (self.py_dec_ref)(cap) };
                 }
-                let ptr_elem = unsafe { base_ptr.offset(elem_off * (elem_bytes as isize)) };
-                let slice = unsafe { std::slice::from_raw_parts(ptr_elem, elem_bytes) };
-                let Some(val) = decode_dl_scalar(dl.dtype, slice) else {
-                    if owns_cap {
-                        unsafe { (self.py_dec_ref)(cap) };
-                    }
-                    return Err(format!(
-                        "unsupported DLPack dtype (code={}, bits={})",
-                        dl.dtype.code, dl.dtype.bits
-                    ));
-                };
-                out.push(val);
-                for ax in (0..shape.len()).rev() {
-                    coords[ax] += 1;
-                    if coords[ax] < shape[ax].max(1) {
-                        break;
-                    }
-                    coords[ax] = 0;
-                }
+                return Err(e);
             }
-        }
+        };
 
         // Consume capsule per DLPack specification: mark 'used_*' and invoke deleter once.
         unsafe {
@@ -2026,6 +1960,110 @@ impl PyCapiInner {
         unsafe { (self.py_dec_ref)(wrapper) };
         handle
     }
+}
+
+unsafe fn read_raw_dltensor(dl: &DLTensor) -> Result<(Vec<usize>, Vec<f64>), String> {
+    if dl.device.device_type != 1 {
+        return Err(format!(
+            "DLPack tensor uses non-CPU device_type={}; move to CPU first",
+            dl.device.device_type
+        ));
+    }
+    if dl.dtype.lanes != 1 {
+        return Err("DLPack vector lanes != 1 unsupported".into());
+    }
+    let ndim = dl.ndim.max(0) as usize;
+    let shape: Vec<usize> = if ndim == 0 || dl.shape.is_null() {
+        vec![1]
+    } else {
+        unsafe { std::slice::from_raw_parts(dl.shape, ndim) }
+            .iter()
+            .map(|&d| d.max(0) as usize)
+            .collect()
+    };
+    let total: usize = shape.iter().product();
+    let elem_bytes = (usize::from(dl.dtype.bits) / 8).max(1);
+    let mut strides: Vec<isize> = if ndim > 0 && !dl.strides.is_null() {
+        unsafe { std::slice::from_raw_parts(dl.strides, ndim) }
+            .iter()
+            .map(|&s| s as isize)
+            .collect()
+    } else {
+        let mut st = vec![1isize; shape.len()];
+        let mut acc = 1isize;
+        for i in (0..shape.len()).rev() {
+            st[i] = acc;
+            acc *= shape[i].max(1) as isize;
+        }
+        st
+    };
+    if strides.is_empty() {
+        strides.push(1);
+    }
+    let mut out = Vec::with_capacity(total);
+    if total > 0 && !dl.data.is_null() {
+        let base_ptr = unsafe { (dl.data as *const u8).add(dl.byte_offset as usize) };
+        let mut coords = vec![0usize; shape.len()];
+        for _ in 0..total {
+            let mut elem_off = 0isize;
+            for (ax, &c) in coords.iter().enumerate() {
+                elem_off += (c as isize) * strides[ax];
+            }
+            let ptr_elem = unsafe { base_ptr.offset(elem_off * (elem_bytes as isize)) };
+            let slice = unsafe { std::slice::from_raw_parts(ptr_elem, elem_bytes) };
+            let Some(val) = decode_dl_scalar(dl.dtype, slice) else {
+                return Err(format!(
+                    "unsupported DLPack dtype (code={}, bits={})",
+                    dl.dtype.code, dl.dtype.bits
+                ));
+            };
+            out.push(val);
+            for ax in (0..shape.len()).rev() {
+                coords[ax] += 1;
+                if coords[ax] < shape[ax].max(1) {
+                    break;
+                }
+                coords[ax] = 0;
+            }
+        }
+    }
+    Ok((shape, out))
+}
+
+#[cfg(test)]
+pub(crate) fn read_strided_dlpack_f64_for_test(
+    buf: &[f64],
+    shape: &[i64],
+    strides: Option<&[i64]>,
+    byte_offset: u64,
+) -> Result<(Vec<usize>, Vec<f64>), String> {
+    let mut shape_vec = shape.to_vec();
+    let mut strides_vec = strides.map(|s| s.to_vec()).unwrap_or_default();
+    let dl = DLTensor {
+        data: buf.as_ptr() as *mut c_void,
+        device: DLDevice {
+            device_type: 1,
+            device_id: 0,
+        },
+        ndim: shape_vec.len() as c_int,
+        dtype: DLDataType {
+            code: 2,
+            bits: 64,
+            lanes: 1,
+        },
+        shape: if shape_vec.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            shape_vec.as_mut_ptr()
+        },
+        strides: if strides.is_some() {
+            strides_vec.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        },
+        byte_offset,
+    };
+    unsafe { read_raw_dltensor(&dl) }
 }
 
 static DLPACK_GET_NAME: OnceLock<usize> = OnceLock::new();

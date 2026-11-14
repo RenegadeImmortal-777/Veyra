@@ -249,6 +249,42 @@ impl Vm {
                     _ => return Err("log10 expects Number".into()),
                 }
             }
+            "log2" => {
+                if a.len() != 1 {
+                    return Err("log2 expects number".into());
+                }
+                match a[0] {
+                    Val::Num(n) => Val::Num(n.log2()),
+                    _ => return Err("log2 expects Number".into()),
+                }
+            }
+            "hypot" => {
+                if a.len() != 2 {
+                    return Err("hypot expects x,y".into());
+                }
+                match (&a[0], &a[1]) {
+                    (Val::Num(x), Val::Num(y)) => Val::Num(x.hypot(*y)),
+                    _ => return Err("hypot expects Numbers".into()),
+                }
+            }
+            "fmod" => {
+                if a.len() != 2 {
+                    return Err("fmod expects x,y".into());
+                }
+                match (&a[0], &a[1]) {
+                    (Val::Num(x), Val::Num(y)) => Val::Num(x % y),
+                    _ => return Err("fmod expects Numbers".into()),
+                }
+            }
+            "atan2" => {
+                if a.len() != 2 {
+                    return Err("atan2 expects y,x".into());
+                }
+                match (&a[0], &a[1]) {
+                    (Val::Num(y), Val::Num(x)) => Val::Num(y.atan2(*x)),
+                    _ => return Err("atan2 expects Numbers".into()),
+                }
+            }
             "pow" => {
                 if a.len() < 2 || a.len() > 3 {
                     return Err("pow expects base,exponent[,modulus]".into());

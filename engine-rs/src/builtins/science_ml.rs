@@ -61,6 +61,26 @@ fn parse_pos_int(arg: Option<&Val>, default: usize, label: &str) -> Result<usize
     }
 }
 
+fn parse_simple_fused_op(name: &str) -> Result<crate::spirv::FusedEwiseOp, String> {
+    use crate::spirv::FusedEwiseOp;
+    match name {
+        "add" => Ok(FusedEwiseOp::Add),
+        "sub" => Ok(FusedEwiseOp::Sub),
+        "mul" => Ok(FusedEwiseOp::Mul),
+        "div" => Ok(FusedEwiseOp::Div),
+        "abs" => Ok(FusedEwiseOp::Abs),
+        "neg" => Ok(FusedEwiseOp::Neg),
+        "recip" => Ok(FusedEwiseOp::Recip),
+        "sqrt" => Ok(FusedEwiseOp::Sqrt),
+        "relu" => Ok(FusedEwiseOp::Relu),
+        "sigmoid" => Ok(FusedEwiseOp::Sigmoid),
+        "silu" => Ok(FusedEwiseOp::Silu),
+        "gelu" => Ok(FusedEwiseOp::Gelu),
+        "tanh" => Ok(FusedEwiseOp::Tanh),
+        other => Err(format!("unsupported fused gpu op '{other}'")),
+    }
+}
+
 fn parse_fused_gpu_ops(val: &Val) -> Result<Vec<crate::spirv::FusedEwiseOp>, String> {
     use crate::spirv::FusedEwiseOp;
     let Val::List(items) = val else {
@@ -72,29 +92,45 @@ fn parse_fused_gpu_ops(val: &Val) -> Result<Vec<crate::spirv::FusedEwiseOp>, Str
             Val::Str(s) => {
                 let s = s.trim();
                 if let Some((op, arg)) = s.split_once(':') {
-                    let v: f32 = arg
-                        .trim()
-                        .parse()
-                        .map_err(|_| format!("invalid fused scalar arg '{arg}'"))?;
-                    match op.trim() {
-                        "add_scalar" | "bias" => FusedEwiseOp::AddScalar(v),
-                        "scale" | "mul_scalar" => FusedEwiseOp::Scale(v),
+                    let op_name = op.trim();
+                    let arg = arg.trim();
+                    match op_name {
+                        "add_scalar" | "bias" => {
+                            let v: f32 = arg
+                                .parse()
+                                .map_err(|_| format!("invalid fused scalar arg '{arg}'"))?;
+                            FusedEwiseOp::AddScalar(v)
+                        }
+                        "scale" | "mul_scalar" => {
+                            let v: f32 = arg
+                                .parse()
+                                .map_err(|_| format!("invalid fused scalar arg '{arg}'"))?;
+                            FusedEwiseOp::Scale(v)
+                        }
+                        "pow" | "pow_scalar" => {
+                            let v: f32 = arg
+                                .parse()
+                                .map_err(|_| format!("invalid fused pow arg '{arg}'"))?;
+                            FusedEwiseOp::PowScalar(v)
+                        }
+                        "clamp" => {
+                            let (lo_s, hi_s) = arg
+                                .split_once(',')
+                                .ok_or("clamp fused op expects 'clamp:lo,hi'")?;
+                            let lo: f32 = lo_s
+                                .trim()
+                                .parse()
+                                .map_err(|_| format!("invalid clamp lo '{lo_s}'"))?;
+                            let hi: f32 = hi_s
+                                .trim()
+                                .parse()
+                                .map_err(|_| format!("invalid clamp hi '{hi_s}'"))?;
+                            FusedEwiseOp::Clamp(lo, hi)
+                        }
                         other => return Err(format!("unsupported fused gpu op '{other}'")),
                     }
                 } else {
-                    match s {
-                        "add" => FusedEwiseOp::Add,
-                        "sub" => FusedEwiseOp::Sub,
-                        "mul" => FusedEwiseOp::Mul,
-                        "abs" => FusedEwiseOp::Abs,
-                        "neg" => FusedEwiseOp::Neg,
-                        "sqrt" => FusedEwiseOp::Sqrt,
-                        "relu" => FusedEwiseOp::Relu,
-                        "sigmoid" => FusedEwiseOp::Sigmoid,
-                        "gelu" => FusedEwiseOp::Gelu,
-                        "tanh" => FusedEwiseOp::Tanh,
-                        other => return Err(format!("unsupported fused gpu op '{other}'")),
-                    }
+                    parse_simple_fused_op(s)?
                 }
             }
             Val::Map(pairs) => {
@@ -108,23 +144,31 @@ fn parse_fused_gpu_ops(val: &Val) -> Result<Vec<crate::spirv::FusedEwiseOp>, Str
                     Some(_) => return Err("fused gpu op 'val' must be Number".into()),
                 };
                 match op_name.as_str() {
-                    "add" => FusedEwiseOp::Add,
-                    "sub" => FusedEwiseOp::Sub,
-                    "mul" => FusedEwiseOp::Mul,
-                    "abs" => FusedEwiseOp::Abs,
-                    "neg" => FusedEwiseOp::Neg,
-                    "sqrt" => FusedEwiseOp::Sqrt,
-                    "relu" => FusedEwiseOp::Relu,
-                    "sigmoid" => FusedEwiseOp::Sigmoid,
-                    "gelu" => FusedEwiseOp::Gelu,
-                    "tanh" => FusedEwiseOp::Tanh,
                     "add_scalar" | "bias" => {
                         FusedEwiseOp::AddScalar(scalar.ok_or("bias op requires 'val'")?)
                     }
                     "scale" | "mul_scalar" => {
                         FusedEwiseOp::Scale(scalar.ok_or("scale op requires 'val'")?)
                     }
-                    other => return Err(format!("unsupported fused gpu op '{other}'")),
+                    "pow" | "pow_scalar" => {
+                        FusedEwiseOp::PowScalar(scalar.ok_or("pow_scalar op requires 'val'")?)
+                    }
+                    "clamp" => {
+                        let lo = match map_lookup(pairs, &Val::Str("min".into()))
+                            .or_else(|| map_lookup(pairs, &Val::Str("lo".into())))
+                        {
+                            Some(Val::Num(n)) => *n as f32,
+                            _ => return Err("clamp op requires numeric 'min'".into()),
+                        };
+                        let hi = match map_lookup(pairs, &Val::Str("max".into()))
+                            .or_else(|| map_lookup(pairs, &Val::Str("hi".into())))
+                        {
+                            Some(Val::Num(n)) => *n as f32,
+                            _ => return Err("clamp op requires numeric 'max'".into()),
+                        };
+                        FusedEwiseOp::Clamp(lo, hi)
+                    }
+                    other => parse_simple_fused_op(other)?,
                 }
             }
             _ => return Err("gpu_fuse ops entries must be String or Map".into()),
@@ -1661,13 +1705,7 @@ impl Vm {
                 if !a.is_empty() {
                     return Err("gpu_devices expects 0 arguments".into());
                 }
-                if let Val::Map(pairs) = crate::gpu::gpu_info_val() {
-                    map_lookup(&pairs, &Val::Str("adapters".into()))
-                        .cloned()
-                        .unwrap_or(Val::List(Vec::new()))
-                } else {
-                    Val::List(Vec::new())
-                }
+                crate::gpu::gpu_devices_val()
             }
             "gpu_matmul" => {
                 if a.len() != 2 {
@@ -1955,6 +1993,83 @@ impl Vm {
                     ),
                     (Val::Str("hlsl".into()), Val::Str(hlsl)),
                 ])
+            }
+            "gpu_fused_linear" => {
+                crate::runtime::require_cap("gpu")?;
+                if a.len() < 2 || a.len() > 4 {
+                    return Err("gpu_fused_linear expects (x, w[, bias[, act]])".into());
+                }
+                let act = match a.get(3) {
+                    None | Some(Val::Null) => "none",
+                    Some(Val::Str(s)) => s.as_str(),
+                    Some(_) => return Err("gpu_fused_linear activation must be String".into()),
+                };
+                let is_tensor_io = tensor_id(&a[0]).is_ok() || tensor_id(&a[1]).is_ok();
+                let (x_data, m, k) = if let Ok(tid) = tensor_id(&a[0]) {
+                    let snap = tensor_snapshot(tid)?;
+                    if snap.shape.len() == 2 {
+                        (snap.data, snap.shape[0], snap.shape[1])
+                    } else if snap.shape.len() == 1 {
+                        (snap.data, 1, snap.shape[0])
+                    } else {
+                        return Err("gpu_fused_linear expects 1D or 2D x tensor".into());
+                    }
+                } else {
+                    let mat = as_matrix(&a[0])?;
+                    let mr = mat.len();
+                    let mc = mat[0].len();
+                    (mat.into_iter().flatten().collect(), mr, mc)
+                };
+                let (w_data, wk, ncols) = if let Ok(tid) = tensor_id(&a[1]) {
+                    let snap = tensor_snapshot(tid)?;
+                    if snap.shape.len() != 2 {
+                        return Err("gpu_fused_linear expects 2D w tensor".into());
+                    }
+                    (snap.data, snap.shape[0], snap.shape[1])
+                } else {
+                    let mat = as_matrix(&a[1])?;
+                    let wr = mat.len();
+                    let wc = mat[0].len();
+                    (mat.into_iter().flatten().collect(), wr, wc)
+                };
+                if k != wk {
+                    return Err(format!(
+                        "gpu_fused_linear shape mismatch: x col {k} != w row {wk}"
+                    ));
+                }
+                let bias_opt = match a.get(2) {
+                    None | Some(Val::Null) => None,
+                    Some(v) => {
+                        let bv = if let Ok(tid) = tensor_id(v) {
+                            tensor_snapshot(tid)?.data
+                        } else {
+                            as_num_list(v)?
+                        };
+                        if bv.len() != ncols {
+                            return Err(format!(
+                                "gpu_fused_linear bias len {} != output cols {}",
+                                bv.len(),
+                                ncols
+                            ));
+                        }
+                        Some(bv)
+                    }
+                };
+                let out = crate::gpu::gpu_fused_linear_f64(
+                    &x_data,
+                    &w_data,
+                    bias_opt.as_deref(),
+                    m,
+                    k,
+                    ncols,
+                    act,
+                )?;
+                if is_tensor_io {
+                    tensor_store_on_device(out, vec![m, ncols], false, TensorOp::Leaf, "gpu")?
+                } else {
+                    let rows = out.chunks(ncols).map(|r| r.to_vec()).collect::<Vec<_>>();
+                    matrix_to_val(rows)
+                }
             }
             _ => return Ok(None),
         };

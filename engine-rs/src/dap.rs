@@ -197,6 +197,8 @@ struct DebugState {
     stop_on_entry: bool,
     step: StepAction,
     breakpoints: HashMap<String, HashSet<usize>>,
+    data_breakpoints: HashSet<String>,
+    last_watched_values: HashMap<String, Option<String>>,
     frames: Vec<ActiveFrame>,
     history: VecDeque<TraceSnapshot>,
     history_cursor: Option<usize>,
@@ -297,6 +299,8 @@ impl DebugSession {
                 stop_on_entry,
                 step: StepAction::Run,
                 breakpoints: HashMap::new(),
+                data_breakpoints: HashSet::new(),
+                last_watched_values: HashMap::new(),
                 frames: Vec::new(),
                 history: VecDeque::new(),
                 history_cursor: None,
@@ -411,6 +415,36 @@ impl DebugSession {
         Ok(results)
     }
 
+    pub(crate) fn set_data_breakpoints(&self, names: &[String]) -> Result<Vec<JsonValue>, String> {
+        let mut g = self.state.lock().map_err(|_| "dap state poisoned")?;
+        g.data_breakpoints.clear();
+        g.last_watched_values.clear();
+        let current_frames: Vec<ActiveFrame> = Self::displayed_frames(&g).to_vec();
+        let mut results = Vec::with_capacity(names.len());
+        for (idx, raw) in names.iter().enumerate() {
+            let clean = raw.trim();
+            if clean.is_empty() {
+                results.push(json!({ "verified": false, "id": idx + 1 }));
+                continue;
+            }
+            g.data_breakpoints.insert(clean.to_string());
+            let baseline = current_frames
+                .iter()
+                .rev()
+                .find_map(|f| f.vars.get(clean).map(Val::show));
+            g.last_watched_values.insert(clean.to_string(), baseline);
+            results.push(json!({ "verified": true, "id": idx + 1 }));
+        }
+        Ok(results)
+    }
+
+    fn snapshot_var_repr(frames: &[ActiveFrame], name: &str) -> Option<String> {
+        frames
+            .iter()
+            .rev()
+            .find_map(|f| f.vars.get(name).map(Val::show))
+    }
+
     pub(crate) fn mark_configured(&self) -> Result<(), String> {
         let mut g = self.state.lock().map_err(|_| "dap state poisoned")?;
         g.configured = true;
@@ -519,6 +553,7 @@ impl DebugSession {
             .history_cursor
             .unwrap_or_else(|| g.history.len().saturating_sub(1));
         let mut target = None;
+        let watched: Vec<String> = g.data_breakpoints.iter().cloned().collect();
         for idx in (0..cur).rev() {
             if let Some(snap) = g.history.get(idx)
                 && let Some(top) = snap.frames.last()
@@ -530,6 +565,18 @@ impl DebugSession {
                 {
                     target = Some((idx, "breakpoint"));
                     break;
+                }
+                if !watched.is_empty()
+                    && let Some(next_snap) = g.history.get(idx + 1)
+                {
+                    let changed = watched.iter().any(|w| {
+                        Self::snapshot_var_repr(&snap.frames, w)
+                            != Self::snapshot_var_repr(&next_snap.frames, w)
+                    });
+                    if changed {
+                        target = Some((idx, "data breakpoint"));
+                        break;
+                    }
                 }
             }
         }
@@ -617,6 +664,24 @@ impl DebugSession {
 
         let depth = g.frames.len();
         let norm_file = normalize_path(&file);
+        let mut watch_hit = false;
+        if is_stmt_entry
+            && line > 0
+            && g.last_stop_site != Some((scope_id, ip))
+            && !g.data_breakpoints.is_empty()
+        {
+            let watched: Vec<String> = g.data_breakpoints.iter().cloned().collect();
+            for w in watched {
+                let cur_repr = Self::snapshot_var_repr(&g.frames, &w);
+                let prev = g.last_watched_values.get(&w).cloned().unwrap_or(None);
+                if cur_repr != prev {
+                    if cur_repr.is_some() || prev.is_some() {
+                        watch_hit = true;
+                    }
+                    g.last_watched_values.insert(w, cur_repr);
+                }
+            }
+        }
         let stop_reason = if g.stop_on_entry && is_stmt_entry && line > 0 {
             g.stop_on_entry = false;
             Some("entry")
@@ -626,6 +691,8 @@ impl DebugSession {
                 .is_some_and(|set| set.contains(&line))
             {
                 Some("breakpoint")
+            } else if watch_hit {
+                Some("data breakpoint")
             } else {
                 match g.step {
                     StepAction::PauseNext => Some("pause"),
@@ -978,6 +1045,7 @@ impl DapServer {
                         "supportsConfigurationDoneRequest": true,
                         "supportsEvaluateForHovers": true,
                         "supportsStepBack": true,
+                        "supportsDataBreakpoints": true,
                         "supportsTerminateRequest": true,
                         "supportsSingleThreadExecutionRequests": true
                     })),
@@ -1057,6 +1125,62 @@ impl DapServer {
                     lines
                         .into_iter()
                         .map(|line| json!({"verified": false, "line": line}))
+                        .collect()
+                };
+                self.sink.send_response(
+                    seq,
+                    cmd,
+                    true,
+                    Some(json!({ "breakpoints": bps })),
+                    None,
+                )?;
+            }
+            "dataBreakpointInfo" => {
+                let name = args
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let data_id = if name.is_empty() {
+                    JsonValue::Null
+                } else {
+                    JsonValue::String(name.to_string())
+                };
+                self.sink.send_response(
+                    seq,
+                    cmd,
+                    true,
+                    Some(json!({
+                        "dataId": data_id,
+                        "description": if name.is_empty() {
+                            "No watchable variable specified".to_string()
+                        } else {
+                            format!("Break on value change of '{name}'")
+                        },
+                        "accessTypes": ["write"],
+                        "canPersist": false
+                    })),
+                    None,
+                )?;
+            }
+            "setDataBreakpoints" => {
+                let names: Vec<String> = args
+                    .get("breakpoints")
+                    .and_then(JsonValue::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|b| b.get("dataId").and_then(JsonValue::as_str))
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let bps = if let Some(ref s) = self.session {
+                    s.set_data_breakpoints(&names)?
+                } else {
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| json!({"verified": false, "id": i + 1}))
                         .collect()
                 };
                 self.sink.send_response(

@@ -459,6 +459,9 @@ pub(crate) struct NotebookCellResult {
     pub(crate) value: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) exec_count: usize,
+    pub(crate) defs: Vec<String>,
+    pub(crate) refs: Vec<String>,
+    pub(crate) cascade_updated: Vec<String>,
 }
 
 pub(crate) struct NotebookSession {
@@ -470,6 +473,15 @@ pub(crate) struct NotebookSession {
     >,
     class_objects: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     pub(crate) cells: std::collections::BTreeMap<String, NotebookCellResult>,
+    cell_order: Vec<String>,
+    cell_deps: std::collections::BTreeMap<
+        String,
+        (
+            std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<String>,
+        ),
+    >,
     exec_counter: usize,
     storage_file: Option<PathBuf>,
 }
@@ -485,6 +497,8 @@ impl NotebookSession {
                 std::collections::HashMap::new(),
             )),
             cells: std::collections::BTreeMap::new(),
+            cell_order: Vec::new(),
+            cell_deps: std::collections::BTreeMap::new(),
             exec_counter: 0,
             storage_file,
         }
@@ -498,6 +512,8 @@ impl NotebookSession {
         self.class_objects =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         self.cells.clear();
+        self.cell_order.clear();
+        self.cell_deps.clear();
         self.exec_counter = 0;
         self.persist();
     }
@@ -520,6 +536,8 @@ impl NotebookSession {
                     "value": c.value,
                     "error": c.error,
                     "exec_count": c.exec_count,
+                    "defs": c.defs,
+                    "refs": c.refs,
                 })
             })
             .collect();
@@ -528,12 +546,101 @@ impl NotebookSession {
         }
     }
 
-    pub(crate) fn eval_cell(&mut self, cell_id: &str, source: &str) -> NotebookCellResult {
-        self.exec_counter += 1;
-        let exec_count = self.exec_counter;
+    fn compute_dag_over(
+        order_ids: &[String],
+        deps_map: &std::collections::BTreeMap<
+            String,
+            (
+                std::collections::BTreeSet<String>,
+                std::collections::BTreeSet<String>,
+                std::collections::BTreeSet<String>,
+            ),
+        >,
+    ) -> (
+        std::collections::BTreeMap<String, Vec<String>>,
+        Vec<String>,
+        Vec<String>,
+    ) {
+        let mut adj: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut indeg: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for id in order_ids {
+            adj.entry(id.clone()).or_default();
+            indeg.entry(id.clone()).or_insert(0);
+        }
+        for i in 0..order_ids.len() {
+            for j in 0..order_ids.len() {
+                if i == j {
+                    continue;
+                }
+                let u = &order_ids[i];
+                let v = &order_ids[j];
+                let Some((u_defs, u_assigns, _)) = deps_map.get(u) else {
+                    continue;
+                };
+                let Some((v_defs, v_assigns, v_refs)) = deps_map.get(v) else {
+                    continue;
+                };
+                let def_edge = u_defs
+                    .iter()
+                    .any(|s| v_refs.contains(s) || v_assigns.contains(s));
+                let assign_to_reader = u_assigns
+                    .iter()
+                    .any(|s| v_refs.contains(s) && !v_defs.contains(s) && !v_assigns.contains(s));
+                if def_edge || assign_to_reader {
+                    if adj.get_mut(u).is_some_and(|set| set.insert(v.clone())) {
+                        *indeg.entry(v.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        let order_rank: std::collections::HashMap<&str, usize> = order_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| (s.as_str(), idx))
+            .collect();
+        let mut ready: Vec<String> = order_ids
+            .iter()
+            .filter(|id| indeg.get(*id).copied().unwrap_or(0) == 0)
+            .cloned()
+            .collect();
+        let mut topo = Vec::with_capacity(order_ids.len());
+        while !ready.is_empty() {
+            let cur = ready.remove(0);
+            topo.push(cur.clone());
+            if let Some(nbrs) = adj.get(&cur) {
+                for nxt in nbrs {
+                    if let Some(d) = indeg.get_mut(nxt) {
+                        *d = d.saturating_sub(1);
+                        if *d == 0 {
+                            ready.push(nxt.clone());
+                        }
+                    }
+                }
+                ready.sort_by_key(|id| order_rank.get(id.as_str()).copied().unwrap_or(usize::MAX));
+            }
+        }
+        let cycle_cells: Vec<String> = order_ids
+            .iter()
+            .filter(|id| !topo.contains(id))
+            .cloned()
+            .collect();
+        let adj_vec = adj
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect();
+        (adj_vec, topo, cycle_cells)
+    }
+
+    fn execute_single_cell(
+        &mut self,
+        _cell_id: &str,
+        source: &str,
+    ) -> (String, Option<String>, Option<String>) {
         let trimmed = source.trim();
         let mut is_expr_fallback = false;
-
         let predeclared: Vec<String> = self
             .vars
             .keys()
@@ -556,7 +663,7 @@ impl NotebookSession {
             }
         };
 
-        let (stdout, value, error) = match compiled {
+        match compiled {
             Err(e) => (String::new(), None, Some(e)),
             Ok((code, local_names)) => {
                 if code.is_empty() {
@@ -602,7 +709,93 @@ impl NotebookSession {
                     }
                 }
             }
-        };
+        }
+    }
+
+    pub(crate) fn eval_cell(&mut self, cell_id: &str, source: &str) -> NotebookCellResult {
+        self.exec_counter += 1;
+        let exec_count = self.exec_counter;
+        let (defs_set, assigns_set, refs_set) = crate::pipeline::analyze_cell_deps(source);
+        let defs_vec: Vec<String> = defs_set.iter().cloned().collect();
+        let refs_vec: Vec<String> = refs_set.iter().cloned().collect();
+
+        let is_new = !self.cell_order.iter().any(|c| c == cell_id);
+        let mut next_order = self.cell_order.clone();
+        if is_new {
+            next_order.push(cell_id.to_string());
+        }
+        let mut next_deps = self.cell_deps.clone();
+        next_deps.insert(cell_id.to_string(), (defs_set, assigns_set, refs_set));
+
+        let (adj, topo, cycle_cells) = Self::compute_dag_over(&next_order, &next_deps);
+        if !cycle_cells.is_empty() {
+            let err_msg = format!(
+                "NotebookCycleError: cyclic dependency among cells {:?}",
+                cycle_cells
+            );
+            self.cell_order = next_order;
+            self.cell_deps = next_deps;
+            let result = NotebookCellResult {
+                cell_id: cell_id.to_string(),
+                source: source.to_string(),
+                stdout: String::new(),
+                value: None,
+                error: Some(err_msg),
+                exec_count,
+                defs: defs_vec,
+                refs: refs_vec,
+                cascade_updated: Vec::new(),
+            };
+            self.cells.insert(cell_id.to_string(), result.clone());
+            self.persist();
+            return result;
+        }
+
+        self.cell_order = next_order;
+        self.cell_deps = next_deps;
+        let (stdout, value, error) = self.execute_single_cell(cell_id, source);
+
+        // Find all strict downstream cells in topological order and re-execute when cell succeeded.
+        let mut downstream_set = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        if error.is_none() {
+            queue.push_back(cell_id.to_string());
+            while let Some(cur) = queue.pop_front() {
+                if let Some(nbrs) = adj.get(&cur) {
+                    for nxt in nbrs {
+                        if nxt != cell_id && downstream_set.insert(nxt.clone()) {
+                            queue.push_back(nxt.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cascade_updated = Vec::new();
+        for dep_id in topo {
+            if !downstream_set.contains(&dep_id) {
+                continue;
+            }
+            let Some(prev) = self.cells.get(&dep_id).cloned() else {
+                continue;
+            };
+            self.exec_counter += 1;
+            let c_exec = self.exec_counter;
+            let (c_out, c_val, c_err) = self.execute_single_cell(&dep_id, &prev.source);
+            let updated = NotebookCellResult {
+                cell_id: dep_id.clone(),
+                source: prev.source,
+                stdout: c_out,
+                value: c_val,
+                error: c_err,
+                exec_count: c_exec,
+                defs: prev.defs,
+                refs: prev.refs,
+                cascade_updated: Vec::new(),
+            };
+            self.cells.insert(dep_id.clone(), updated);
+            cascade_updated.push(dep_id);
+        }
 
         let result = NotebookCellResult {
             cell_id: cell_id.to_string(),
@@ -611,10 +804,153 @@ impl NotebookSession {
             value,
             error,
             exec_count,
+            defs: defs_vec,
+            refs: refs_vec,
+            cascade_updated,
         };
         self.cells.insert(cell_id.to_string(), result.clone());
         self.persist();
         result
+    }
+
+    pub(crate) fn dag_info(&self) -> JsonValue {
+        let (adj, topo, cycle_cells) = Self::compute_dag_over(&self.cell_order, &self.cell_deps);
+        let nodes: Vec<JsonValue> = self
+            .cell_order
+            .iter()
+            .map(|id| {
+                let (defs, assigns, refs) = self.cell_deps.get(id).cloned().unwrap_or_default();
+                serde_json::json!({
+                    "id": id,
+                    "defs": defs.into_iter().collect::<Vec<_>>(),
+                    "assigns": assigns.into_iter().collect::<Vec<_>>(),
+                    "refs": refs.into_iter().collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let mut edges = Vec::new();
+        for (from, tos) in adj {
+            for to in tos {
+                edges.push(serde_json::json!({ "from": from, "to": to }));
+            }
+        }
+        serde_json::json!({
+            "nodes": nodes,
+            "edges": edges,
+            "order": topo,
+            "has_cycle": !cycle_cells.is_empty(),
+            "cycle_cells": cycle_cells,
+        })
+    }
+
+    pub(crate) fn export_script(&self) -> String {
+        let (_, topo, _) = Self::compute_dag_over(&self.cell_order, &self.cell_deps);
+        let ordered = if topo.is_empty() {
+            self.cell_order.clone()
+        } else {
+            topo
+        };
+        let mut out = String::new();
+        for id in ordered {
+            if let Some(cell) = self.cells.get(&id) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("// --- cell: {} ---\n", cell.cell_id));
+                out.push_str(cell.source.trim_end());
+                out.push('\n');
+            }
+        }
+        out
+    }
+}
+
+pub(crate) fn handle_notebook_api_request(
+    session: &std::sync::Arc<std::sync::Mutex<NotebookSession>>,
+    method: &str,
+    url: &str,
+    body: &str,
+) -> (u16, &'static str, String) {
+    match (method, url) {
+        ("GET", "/api/notebook/state") => {
+            let Ok(guard) = session.lock() else {
+                return (500, "text/plain", "500 Session error".into());
+            };
+            let items: Vec<JsonValue> = guard
+                .cells
+                .values()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.cell_id,
+                        "source": c.source,
+                        "stdout": c.stdout,
+                        "value": c.value,
+                        "error": c.error,
+                        "exec_count": c.exec_count,
+                        "defs": c.defs,
+                        "refs": c.refs,
+                    })
+                })
+                .collect();
+            (
+                200,
+                "application/json",
+                serde_json::to_string(&serde_json::json!({ "cells": items })).unwrap_or_default(),
+            )
+        }
+        ("GET", "/api/notebook/dag") => {
+            let Ok(guard) = session.lock() else {
+                return (500, "text/plain", "500 Session error".into());
+            };
+            (
+                200,
+                "application/json",
+                serde_json::to_string(&guard.dag_info()).unwrap_or_default(),
+            )
+        }
+        ("GET", "/api/notebook/export") => {
+            let Ok(guard) = session.lock() else {
+                return (500, "text/plain", "500 Session error".into());
+            };
+            (200, "text/plain; charset=utf-8", guard.export_script())
+        }
+        ("POST", "/api/notebook/run") => {
+            let parsed: JsonValue = serde_json::from_str(body).unwrap_or_default();
+            let cid = parsed
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("cell1");
+            let src = parsed
+                .get("source")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let Ok(mut guard) = session.lock() else {
+                return (500, "text/plain", "500 Session error".into());
+            };
+            let res = guard.eval_cell(cid, src);
+            (
+                200,
+                "application/json",
+                serde_json::to_string(&serde_json::json!({
+                    "id": res.cell_id,
+                    "stdout": res.stdout,
+                    "value": res.value,
+                    "error": res.error,
+                    "exec_count": res.exec_count,
+                    "defs": res.defs,
+                    "refs": res.refs,
+                    "cascade_updated": res.cascade_updated,
+                }))
+                .unwrap_or_default(),
+            )
+        }
+        ("POST", "/api/notebook/reset") => {
+            if let Ok(mut guard) = session.lock() {
+                guard.reset();
+            }
+            (200, "application/json", r#"{"ok":true}"#.into())
+        }
+        _ => (404, "text/plain", "404 Not Found".into()),
     }
 }
 
@@ -646,89 +982,25 @@ async function resetNb(){await fetch('/api/notebook/reset',{method:'POST'});out.
     for mut req in server.incoming_requests() {
         let method = req.method().as_str().to_string();
         let url = req.url().split('?').next().unwrap_or("/").to_string();
-        let response = match (method.as_str(), url.as_str()) {
-            ("GET", "/") => {
-                let mut r = Response::from_string(UI_HTML);
-                if let Ok(h) =
-                    Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-                {
-                    r.add_header(h);
-                }
-                r
+        let response = if method == "GET" && url == "/" {
+            let mut r = Response::from_string(UI_HTML);
+            if let Ok(h) =
+                Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+            {
+                r.add_header(h);
             }
-            ("GET", "/api/notebook/state") => {
-                let Ok(guard) = session.lock() else {
-                    let _ = req.respond(
-                        Response::from_string("500 Session error")
-                            .with_status_code(StatusCode(500)),
-                    );
-                    continue;
-                };
-                let items: Vec<JsonValue> = guard
-                    .cells
-                    .values()
-                    .map(|c| {
-                        serde_json::json!({
-                            "id": c.cell_id,
-                            "source": c.source,
-                            "stdout": c.stdout,
-                            "value": c.value,
-                            "error": c.error,
-                            "exec_count": c.exec_count,
-                        })
-                    })
-                    .collect();
-                let mut r = Response::from_string(
-                    serde_json::to_string(&serde_json::json!({ "cells": items }))
-                        .unwrap_or_default(),
-                );
-                if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
-                    r.add_header(h);
-                }
-                r
-            }
-            ("POST", "/api/notebook/run") => {
-                let mut body = String::new();
+            r
+        } else {
+            let mut body = String::new();
+            if method == "POST" {
                 let _ = req.as_reader().read_to_string(&mut body);
-                let parsed: JsonValue = serde_json::from_str(&body).unwrap_or_default();
-                let cid = parsed
-                    .get("id")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("cell1");
-                let src = parsed
-                    .get("source")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("");
-                let Ok(mut guard) = session.lock() else {
-                    let _ = req.respond(
-                        Response::from_string("500 Session error")
-                            .with_status_code(StatusCode(500)),
-                    );
-                    continue;
-                };
-                let res = guard.eval_cell(cid, src);
-                let mut r = Response::from_string(
-                    serde_json::to_string(&serde_json::json!({
-                        "id": res.cell_id,
-                        "stdout": res.stdout,
-                        "value": res.value,
-                        "error": res.error,
-                        "exec_count": res.exec_count,
-                    }))
-                    .unwrap_or_default(),
-                );
-                if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
-                    r.add_header(h);
-                }
-                r
             }
-            ("POST", "/api/notebook/reset") => {
-                if let Ok(mut guard) = session.lock() {
-                    guard.reset();
-                }
-                Response::from_string(r#"{"ok":true}"#)
+            let (status, ctype, text) = handle_notebook_api_request(&session, &method, &url, &body);
+            let mut r = Response::from_string(text).with_status_code(StatusCode(status));
+            if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()) {
+                r.add_header(h);
             }
-            _ => Response::from_string("404 Not Found").with_status_code(StatusCode(404)),
+            r
         };
         req.respond(response).map_err(|e| e.to_string())?;
     }

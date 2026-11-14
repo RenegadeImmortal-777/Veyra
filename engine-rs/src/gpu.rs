@@ -2583,6 +2583,88 @@ pub(crate) fn gpu_available() -> bool {
     vulkan_backend::with_vulkan(|_| Ok(true)).unwrap_or(false)
 }
 
+pub(crate) fn gpu_devices_val() -> Val {
+    let active = resolve_backend();
+    let mut devices = Vec::new();
+
+    if let Ok(vk_list) = vulkan_backend::with_vulkan(|st| {
+        Ok(st
+            .adapters
+            .iter()
+            .map(|a| {
+                let is_active =
+                    matches!(active, ResolvedBackend::Vulkan) && a.index == st.active_adapter.index;
+                Val::Map(vec![
+                    (Val::Str("backend".into()), Val::Str("vulkan".into())),
+                    (Val::Str("index".into()), Val::Num(a.index as f64)),
+                    (Val::Str("name".into()), Val::Str(a.name.clone())),
+                    (Val::Str("vendor_id".into()), Val::Num(a.vendor_id as f64)),
+                    (Val::Str("device_id".into()), Val::Num(a.device_id as f64)),
+                    (
+                        Val::Str("dedicated_vram_mb".into()),
+                        Val::Num(a.dedicated_vram_mb),
+                    ),
+                    (Val::Str("shared_mem_mb".into()), Val::Num(a.shared_mem_mb)),
+                    (Val::Str("is_hardware".into()), Val::Bool(!a.is_software)),
+                    (Val::Str("is_software".into()), Val::Bool(a.is_software)),
+                    (Val::Str("supports_f64".into()), Val::Bool(false)),
+                    (Val::Str("active".into()), Val::Bool(is_active)),
+                ])
+            })
+            .collect::<Vec<_>>())
+    }) {
+        devices.extend(vk_list);
+    }
+
+    #[cfg(windows)]
+    if let Ok(d3d_list) = d3d11_backend::with_d3d11(|st| {
+        Ok(st
+            .adapters
+            .iter()
+            .map(|a| {
+                let is_active =
+                    matches!(active, ResolvedBackend::D3D11) && a.index == st.active_adapter.index;
+                Val::Map(vec![
+                    (Val::Str("backend".into()), Val::Str("d3d11".into())),
+                    (Val::Str("index".into()), Val::Num(a.index as f64)),
+                    (Val::Str("name".into()), Val::Str(a.name.clone())),
+                    (Val::Str("vendor_id".into()), Val::Num(a.vendor_id as f64)),
+                    (Val::Str("device_id".into()), Val::Num(a.device_id as f64)),
+                    (
+                        Val::Str("dedicated_vram_mb".into()),
+                        Val::Num(a.dedicated_vram_mb),
+                    ),
+                    (Val::Str("shared_mem_mb".into()), Val::Num(a.shared_mem_mb)),
+                    (Val::Str("is_hardware".into()), Val::Bool(!a.is_software)),
+                    (Val::Str("is_software".into()), Val::Bool(a.is_software)),
+                    (Val::Str("supports_f64".into()), Val::Bool(st.supports_f64)),
+                    (Val::Str("active".into()), Val::Bool(is_active)),
+                ])
+            })
+            .collect::<Vec<_>>())
+    }) {
+        devices.extend(d3d_list);
+    }
+
+    devices.push(Val::Map(vec![
+        (Val::Str("backend".into()), Val::Str("cpu-fallback".into())),
+        (Val::Str("index".into()), Val::Num(0.0)),
+        (Val::Str("name".into()), Val::Str("CPU Thread Pool".into())),
+        (Val::Str("vendor_id".into()), Val::Num(0.0)),
+        (Val::Str("device_id".into()), Val::Num(0.0)),
+        (Val::Str("dedicated_vram_mb".into()), Val::Num(0.0)),
+        (Val::Str("shared_mem_mb".into()), Val::Num(0.0)),
+        (Val::Str("is_hardware".into()), Val::Bool(false)),
+        (Val::Str("is_software".into()), Val::Bool(true)),
+        (Val::Str("supports_f64".into()), Val::Bool(true)),
+        (
+            Val::Str("active".into()),
+            Val::Bool(matches!(active, ResolvedBackend::Cpu)),
+        ),
+    ]));
+    Val::List(devices)
+}
+
 pub(crate) fn gpu_info_val() -> Val {
     let avail_backends = gpu_backends().into_iter().map(Val::Str).collect::<Vec<_>>();
     let want_f64 = current_precision_pref() == PrecisionPref::F64;
@@ -3189,7 +3271,7 @@ pub(crate) fn hlsl_fused_ewise(ops: &[crate::spirv::FusedEwiseOp]) -> String {
     let needs_b = ops.iter().any(|op| {
         matches!(
             op,
-            FusedEwiseOp::Add | FusedEwiseOp::Sub | FusedEwiseOp::Mul
+            FusedEwiseOp::Add | FusedEwiseOp::Sub | FusedEwiseOp::Mul | FusedEwiseOp::Div
         )
     });
     if needs_b {
@@ -3200,13 +3282,32 @@ pub(crate) fn hlsl_fused_ewise(ops: &[crate::spirv::FusedEwiseOp]) -> String {
             FusedEwiseOp::Add => s.push_str("  x = x + b;\n"),
             FusedEwiseOp::Sub => s.push_str("  x = x - b;\n"),
             FusedEwiseOp::Mul => s.push_str("  x = x * b;\n"),
+            FusedEwiseOp::Div => s.push_str("  x = x / b;\n"),
             FusedEwiseOp::AddScalar(v) => s.push_str(&format!("  x = x + {:.9};\n", v)),
             FusedEwiseOp::Scale(v) => s.push_str(&format!("  x = x * {:.9};\n", v)),
             FusedEwiseOp::Abs => s.push_str("  x = abs(x);\n"),
             FusedEwiseOp::Neg => s.push_str("  x = -x;\n"),
+            FusedEwiseOp::Recip => s.push_str("  x = 1.0 / x;\n"),
             FusedEwiseOp::Sqrt => s.push_str("  x = sqrt(max(x, 0.0));\n"),
             FusedEwiseOp::Relu => s.push_str("  x = max(x, 0.0);\n"),
             FusedEwiseOp::Sigmoid => s.push_str("  x = 1.0 / (1.0 + exp(-x));\n"),
+            FusedEwiseOp::Silu => s.push_str("  x = x / (1.0 + exp(-x));\n"),
+            FusedEwiseOp::Clamp(lo, hi) => {
+                let (a, b) = (lo.min(hi), lo.max(hi));
+                s.push_str(&format!("  x = clamp(x, {:.9}, {:.9});\n", a, b));
+            }
+            FusedEwiseOp::PowScalar(p) => {
+                if p == 0.0 {
+                    s.push_str("  x = 1.0;\n");
+                } else if p == 1.0 {
+                } else if p == 2.0 {
+                    s.push_str("  x = x * x;\n");
+                } else if p == 3.0 {
+                    s.push_str("  x = x * x * x;\n");
+                } else {
+                    s.push_str(&format!("  x = pow(max(x, 0.0), {:.9});\n", p));
+                }
+            }
             FusedEwiseOp::Tanh => {
                 s.push_str("  float t2 = clamp(2.0 * x, -18.0, 18.0); x = 1.0 - 2.0 / (exp(t2) + 1.0);\n")
             }
@@ -3219,25 +3320,57 @@ pub(crate) fn hlsl_fused_ewise(ops: &[crate::spirv::FusedEwiseOp]) -> String {
     s
 }
 
+fn hlsl_fused_linear(act_code: u32, has_bias: bool) -> String {
+    let mut s = String::from(
+        "cbuffer Params : register(b0) { uint M; uint K; uint N; uint _p3; };\n\
+         StructuredBuffer<float> A : register(t0);\n\
+         StructuredBuffer<float> B : register(t1);\n\
+         RWStructuredBuffer<float> Out : register(u0);\n\
+         [numthreads(16, 16, 1)]\n\
+         void CSMain(uint3 dtid : SV_DispatchThreadID) {\n\
+           uint col = dtid.x; uint row = dtid.y;\n\
+           if (row >= M || col >= N) return;\n\
+           float acc = 0.0;\n\
+           uint rk = row * K;\n\
+           for (uint p = 0; p < K; p++) { acc += A[rk + p] * B[p * N + col]; }\n",
+    );
+    if has_bias {
+        s.push_str("  acc += B[K * N + col];\n");
+    }
+    match act_code {
+        1 => s.push_str("  acc = max(acc, 0.0);\n"),
+        2 => s.push_str("  float y = 0.79788456 * (acc + 0.044715 * acc * acc * acc); float y2 = clamp(2.0 * y, -18.0, 18.0); acc = 0.5 * acc * (2.0 - 2.0 / (exp(y2) + 1.0));\n"),
+        3 => s.push_str("  acc = acc / (1.0 + exp(-acc));\n"),
+        _ => {}
+    }
+    s.push_str("  Out[row * N + col] = acc;\n}\n");
+    s
+}
+
 fn fused_pipeline_hash(ops: &[crate::spirv::FusedEwiseOp]) -> u64 {
     use crate::spirv::FusedEwiseOp;
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for &op in ops {
-        let (tag, bits) = match op {
-            FusedEwiseOp::Add => (1u64, 0u32),
-            FusedEwiseOp::Sub => (2, 0),
-            FusedEwiseOp::Mul => (3, 0),
-            FusedEwiseOp::AddScalar(v) => (4, v.to_bits()),
-            FusedEwiseOp::Scale(v) => (5, v.to_bits()),
-            FusedEwiseOp::Abs => (6, 0),
-            FusedEwiseOp::Neg => (7, 0),
-            FusedEwiseOp::Sqrt => (8, 0),
-            FusedEwiseOp::Relu => (9, 0),
-            FusedEwiseOp::Sigmoid => (10, 0),
-            FusedEwiseOp::Gelu => (11, 0),
-            FusedEwiseOp::Tanh => (12, 0),
+        let (tag, lo_bits, hi_bits) = match op {
+            FusedEwiseOp::Add => (1u64, 0u32, 0u32),
+            FusedEwiseOp::Sub => (2, 0, 0),
+            FusedEwiseOp::Mul => (3, 0, 0),
+            FusedEwiseOp::AddScalar(v) => (4, v.to_bits(), 0),
+            FusedEwiseOp::Scale(v) => (5, v.to_bits(), 0),
+            FusedEwiseOp::Abs => (6, 0, 0),
+            FusedEwiseOp::Neg => (7, 0, 0),
+            FusedEwiseOp::Sqrt => (8, 0, 0),
+            FusedEwiseOp::Relu => (9, 0, 0),
+            FusedEwiseOp::Sigmoid => (10, 0, 0),
+            FusedEwiseOp::Gelu => (11, 0, 0),
+            FusedEwiseOp::Tanh => (12, 0, 0),
+            FusedEwiseOp::Div => (13, 0, 0),
+            FusedEwiseOp::Silu => (14, 0, 0),
+            FusedEwiseOp::Clamp(lo, hi) => (15, lo.to_bits(), hi.to_bits()),
+            FusedEwiseOp::PowScalar(p) => (16, p.to_bits(), 0),
+            FusedEwiseOp::Recip => (17, 0, 0),
         };
-        h ^= (tag << 32) | u64::from(bits);
+        h ^= (tag << 48) | (u64::from(hi_bits) << 32) | u64::from(lo_bits);
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h
@@ -3309,14 +3442,21 @@ pub(crate) fn gpu_fuse_f64(ops: &[crate::spirv::FusedEwiseOp], a: &[f64], b: &[f
                     FusedEwiseOp::Add => x + b_val,
                     FusedEwiseOp::Sub => x - b_val,
                     FusedEwiseOp::Mul => x * b_val,
+                    FusedEwiseOp::Div => x / b_val,
                     FusedEwiseOp::AddScalar(s) => x + f64::from(s),
                     FusedEwiseOp::Scale(s) => x * f64::from(s),
                     FusedEwiseOp::Abs => x.abs(),
                     FusedEwiseOp::Neg => -x,
+                    FusedEwiseOp::Recip => 1.0 / x,
                     FusedEwiseOp::Sqrt => x.max(0.0).sqrt(),
                     FusedEwiseOp::Relu => x.max(0.0),
                     FusedEwiseOp::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+                    FusedEwiseOp::Silu => x / (1.0 + (-x).exp()),
                     FusedEwiseOp::Tanh => x.tanh(),
+                    FusedEwiseOp::Clamp(lo, hi) => {
+                        x.clamp(f64::from(lo.min(hi)), f64::from(lo.max(hi)))
+                    }
+                    FusedEwiseOp::PowScalar(p) => x.powf(f64::from(p)),
                     FusedEwiseOp::Gelu => {
                         let y = 0.797_884_560_802_865_4 * (x + 0.044_715 * x * x * x);
                         0.5 * x * (1.0 + y.tanh())
@@ -3326,4 +3466,113 @@ pub(crate) fn gpu_fuse_f64(ops: &[crate::spirv::FusedEwiseOp], a: &[f64], b: &[f
             x
         })
         .collect()
+}
+
+pub(crate) fn gpu_fused_linear_f64(
+    x: &[f64],
+    w: &[f64],
+    bias: Option<&[f64]>,
+    m: usize,
+    k: usize,
+    n: usize,
+    act: &str,
+) -> Result<Vec<f64>, String> {
+    let act_code: u32 = match act {
+        "none" | "" => 0,
+        "relu" => 1,
+        "gelu" => 2,
+        "silu" => 3,
+        other => {
+            return Err(format!(
+                "gpu_fused_linear unsupported activation '{other}'; expected 'none', 'relu', 'gelu', or 'silu'"
+            ));
+        }
+    };
+    if m == 0 || k == 0 || n == 0 {
+        return Ok(vec![0.0; m * n]);
+    }
+    GPU_FUSED_KERNELS.fetch_add(1, Ordering::Relaxed);
+    let has_bias = bias.is_some();
+    let gx = (n as u32).div_ceil(16);
+    let gy = (m as u32).div_ceil(16);
+    let want_f64 = current_precision_pref() == PrecisionPref::F64;
+
+    if matches!(
+        resolve_backend(),
+        ResolvedBackend::D3D11 | ResolvedBackend::Vulkan
+    ) && !want_f64
+    {
+        let af: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        let mut bf: Vec<f32> = Vec::with_capacity(w.len() + bias.map(|b| b.len()).unwrap_or(0));
+        bf.extend(w.iter().map(|&v| v as f32));
+        if let Some(b) = bias {
+            bf.extend(b.iter().map(|&v| v as f32));
+        }
+        match resolve_backend() {
+            ResolvedBackend::D3D11 => {
+                #[cfg(windows)]
+                {
+                    let src = hlsl_fused_linear(act_code, has_bias);
+                    let key = format!("veyra:fused_linear:{act_code}:{}", usize::from(has_bias));
+                    if let Ok(out) = d3d11_backend::with_d3d11(|st| {
+                        st.dispatch(
+                            &key,
+                            &src,
+                            "CSMain",
+                            &af,
+                            &bf,
+                            m * n,
+                            &[m as u32, k as u32, n as u32, 0],
+                            (gx, gy, 1),
+                        )
+                    }) {
+                        return Ok(out.into_iter().map(|v| v as f64).collect());
+                    }
+                }
+            }
+            ResolvedBackend::Vulkan => {
+                let spv = crate::spirv::spirv_fused_linear(act_code, has_bias);
+                let key = format!("vk:fused_linear:{act_code}:{}", usize::from(has_bias));
+                if let Ok(out) = vulkan_backend::with_vulkan(|st| {
+                    st.dispatch(
+                        &key,
+                        &spv,
+                        &af,
+                        &bf,
+                        m * n,
+                        &[m as u32, k as u32, n as u32, 0],
+                        (gx, gy, 1),
+                    )
+                }) {
+                    return Ok(out.into_iter().map(|v| v as f64).collect());
+                }
+            }
+            ResolvedBackend::Cpu => {}
+        }
+    }
+
+    let mut out = vec![0.0; m * n];
+    for r in 0..m {
+        let rk = r * k;
+        let rn = r * n;
+        for c in 0..n {
+            let mut acc = 0.0;
+            for p in 0..k {
+                acc += x[rk + p] * w[p * n + c];
+            }
+            if let Some(b) = bias {
+                acc += b[c];
+            }
+            out[rn + c] = match act_code {
+                1 => acc.max(0.0),
+                2 => {
+                    let y = 0.797_884_560_802_865_4 * (acc + 0.044_715 * acc * acc * acc);
+                    0.5 * acc * (1.0 + y.tanh())
+                }
+                3 => acc / (1.0 + (-acc).exp()),
+                _ => acc,
+            };
+        }
+    }
+    Ok(out)
 }

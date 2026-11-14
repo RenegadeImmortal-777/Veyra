@@ -7,13 +7,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 
 use crate::ast::{CallArg, Expr, Pattern, SeqElem, Stmt};
 use crate::bytecode::{Op, decode_bytecode, encode_bytecode};
 use crate::compiler::{CompiledDebug, Compiler};
 use crate::dap::DebugMap;
-use crate::ir::optimize_bytecode;
+use crate::ir::{optimize_bytecode, optimize_bytecode_with_stats};
 use crate::lexer::lex_with_lines;
 use crate::parser::Parser;
 use crate::project::project_root;
@@ -206,18 +206,80 @@ pub fn load_source(path: &str) -> Result<String, String> {
     load_source_with_lines(path).map(|(src, _)| src)
 }
 
+fn is_static_marker_name(name: &str) -> bool {
+    matches!(
+        name,
+        "pure" | "effect" | "verify" | "secret" | "tainted" | "linear" | "sanitize"
+    )
+}
+
 pub(crate) fn is_static_effect_decorator(e: &Expr) -> bool {
     match e {
-        Expr::Var(n) => n == "pure",
-        Expr::Call(n, _) => n == "pure" || n == "effect",
+        Expr::Var(n) => is_static_marker_name(n),
+        Expr::Call(n, _) => is_static_marker_name(n),
         Expr::CallExt {
             callee,
             method: None,
             ..
-        } => {
-            matches!(&**callee, Expr::Var(n) if n == "pure" || n == "effect")
-        }
+        } => matches!(&**callee, Expr::Var(n) if is_static_marker_name(n)),
         _ => false,
+    }
+}
+
+fn decorator_string_args(decs: &[Expr], target: &str) -> (bool, Vec<String>) {
+    let mut matched = false;
+    let mut args_out = Vec::new();
+    for d in decs {
+        match d {
+            Expr::Var(n) if n == target => matched = true,
+            Expr::Call(n, args) if n == target => {
+                matched = true;
+                for a in args {
+                    if let Expr::Str(s) = a {
+                        args_out.push(s.clone());
+                    }
+                }
+            }
+            Expr::CallExt {
+                callee,
+                method: None,
+                args,
+            } if matches!(&**callee, Expr::Var(n) if n == target) => {
+                matched = true;
+                for a in args {
+                    if let CallArg::Pos(Expr::Str(s)) = a {
+                        args_out.push(s.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (matched, args_out)
+}
+
+fn extract_direct_call(e: &Expr) -> Option<(&str, Vec<&Expr>)> {
+    match e {
+        Expr::Call(n, args) => Some((n.as_str(), args.iter().collect())),
+        Expr::CallExt {
+            callee,
+            method: None,
+            args,
+        } => {
+            if let Expr::Var(n) = callee.as_ref() {
+                let pos = args
+                    .iter()
+                    .filter_map(|a| match a {
+                        CallArg::Pos(x) | CallArg::Kw(_, x) => Some(x),
+                        _ => None,
+                    })
+                    .collect();
+                Some((n.as_str(), pos))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -295,9 +357,11 @@ fn builtin_effect_tag(name: &str) -> Option<&'static str> {
         }
         "plugin_load" | "plugin_call" | "plugin_build" | "py_import" | "py_call" | "py_eval"
         | "py_exec" | "wasm_run" => Some("ffi"),
-        "gpu_map" | "gpu_reduce" | "gpu_matmul" | "gpu_fuse" => Some("gpu"),
-        "actor_spawn" | "actor_send" | "actor_ask" | "actor_stop" | "sim_start" | "sim_stop"
-        | "cap_restrict" | "gc_collect" | "gc_pause" | "gc_resume" => Some("state"),
+        "gpu_map" | "gpu_reduce" | "gpu_matmul" | "gpu_fuse" | "gpu_fused_linear" => Some("gpu"),
+        "actor_spawn" | "actor_send" | "actor_ask" | "actor_stop" | "supervisor_spawn"
+        | "sim_start" | "sim_stop" | "sim_actor_spawn" | "sim_actor_send" | "sim_step"
+        | "sim_run_until" | "sim_partition" | "cap_restrict" | "gc_collect" | "gc_pause"
+        | "gc_resume" | "arena_scope" => Some("state"),
         _ => None,
     }
 }
@@ -701,6 +765,1310 @@ fn verify_effects_and_contracts(ast: &[Stmt], errors: &mut Vec<String>) {
     }
 }
 
+fn is_taint_sink(name: &str) -> bool {
+    matches!(
+        name,
+        "print"
+            | "println"
+            | "http_get"
+            | "http_post"
+            | "http_request"
+            | "write_file"
+            | "append_file"
+            | "shell"
+            | "spawn_process"
+            | "ffi_call"
+            | "py_exec"
+    )
+}
+
+fn verify_taint_security(ast: &[Stmt], errors: &mut Vec<String>) {
+    let mut secret_fns: HashSet<String> = HashSet::new();
+    let mut secret_fn_params: HashMap<String, Vec<String>> = HashMap::new();
+    let mut sanitizer_fns: HashSet<String> = HashSet::new();
+
+    fn collect_taint_sigs(
+        stmts: &[Stmt],
+        secret_fns: &mut HashSet<String>,
+        secret_fn_params: &mut HashMap<String, Vec<String>>,
+        sanitizer_fns: &mut HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::DecoratedFn(decs, name, _, _, body) => {
+                    let (is_sec, sec_args) = decorator_string_args(decs, "secret");
+                    let (is_tnt, tnt_args) = decorator_string_args(decs, "tainted");
+                    if is_sec || is_tnt {
+                        let mut pnames = sec_args;
+                        pnames.extend(tnt_args);
+                        if pnames.is_empty() {
+                            secret_fns.insert(name.clone());
+                        } else {
+                            secret_fn_params.insert(name.clone(), pnames);
+                        }
+                    }
+                    if decorator_string_args(decs, "sanitize").0 {
+                        sanitizer_fns.insert(name.clone());
+                    }
+                    collect_taint_sigs(body, secret_fns, secret_fn_params, sanitizer_fns);
+                }
+                Stmt::Fn(_, _, _, body)
+                | Stmt::AsyncFn(_, _, _, body)
+                | Stmt::Class(_, _, _, _, body) => {
+                    collect_taint_sigs(body, secret_fns, secret_fn_params, sanitizer_fns);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn expr_is_tainted(
+        e: &Expr,
+        tainted_vars: &HashSet<String>,
+        secret_fns: &HashSet<String>,
+        sanitizer_fns: &HashSet<String>,
+        errors: &mut Vec<String>,
+    ) -> bool {
+        if let Some((name, args)) = extract_direct_call(e) {
+            let mut arg_tainted = false;
+            for a in &args {
+                if expr_is_tainted(a, tainted_vars, secret_fns, sanitizer_fns, errors) {
+                    arg_tainted = true;
+                }
+            }
+            if is_taint_sink(name) && arg_tainted {
+                errors.push(format!(
+                    "security error: tainted/secret data flows into sink '{name}' without sanitize()"
+                ));
+            }
+            if name == "sanitize" || sanitizer_fns.contains(name) {
+                return false;
+            }
+            if matches!(name, "secret_mark" | "tainted") || secret_fns.contains(name) {
+                return true;
+            }
+            return arg_tainted;
+        }
+        match e {
+            Expr::Var(n) => tainted_vars.contains(n),
+            Expr::List(xs) => xs
+                .iter()
+                .any(|x| expr_is_tainted(x, tainted_vars, secret_fns, sanitizer_fns, errors)),
+            Expr::Map(ps) => ps.iter().any(|(k, v)| {
+                expr_is_tainted(k, tainted_vars, secret_fns, sanitizer_fns, errors)
+                    || expr_is_tainted(v, tainted_vars, secret_fns, sanitizer_fns, errors)
+            }),
+            Expr::Bin(a, _, b) | Expr::Index(a, b) => {
+                expr_is_tainted(a, tainted_vars, secret_fns, sanitizer_fns, errors)
+                    || expr_is_tainted(b, tainted_vars, secret_fns, sanitizer_fns, errors)
+            }
+            Expr::Ternary(c, a, b) => {
+                let tc = expr_is_tainted(c, tainted_vars, secret_fns, sanitizer_fns, errors);
+                let ta = expr_is_tainted(a, tainted_vars, secret_fns, sanitizer_fns, errors);
+                let tb = expr_is_tainted(b, tainted_vars, secret_fns, sanitizer_fns, errors);
+                tc || ta || tb
+            }
+            Expr::Unary(_, x) | Expr::Await(x) | Expr::Member(x, _) => {
+                expr_is_tainted(x, tainted_vars, secret_fns, sanitizer_fns, errors)
+            }
+            Expr::MethodCall(o, m, args) => {
+                let to = expr_is_tainted(o, tainted_vars, secret_fns, sanitizer_fns, errors);
+                let mut ta = false;
+                for a in args {
+                    if expr_is_tainted(a, tainted_vars, secret_fns, sanitizer_fns, errors) {
+                        ta = true;
+                    }
+                }
+                if m == "sanitize" { false } else { to || ta }
+            }
+            Expr::CallExpr(c, args) => {
+                let tc = expr_is_tainted(c, tainted_vars, secret_fns, sanitizer_fns, errors);
+                let mut ta = false;
+                for a in args {
+                    if expr_is_tainted(a, tainted_vars, secret_fns, sanitizer_fns, errors) {
+                        ta = true;
+                    }
+                }
+                tc || ta
+            }
+            Expr::ChainedCmp(f, rest) => {
+                let tf = expr_is_tainted(f, tainted_vars, secret_fns, sanitizer_fns, errors);
+                let mut tr = false;
+                for (_, r) in rest {
+                    if expr_is_tainted(r, tainted_vars, secret_fns, sanitizer_fns, errors) {
+                        tr = true;
+                    }
+                }
+                tf || tr
+            }
+            Expr::ListComp(v, _, it, cond) => {
+                let ti = expr_is_tainted(it, tainted_vars, secret_fns, sanitizer_fns, errors);
+                let tv = expr_is_tainted(v, tainted_vars, secret_fns, sanitizer_fns, errors);
+                let tc = cond.as_ref().is_some_and(|c| {
+                    expr_is_tainted(c, tainted_vars, secret_fns, sanitizer_fns, errors)
+                });
+                ti || tv || tc
+            }
+            _ => false,
+        }
+    }
+
+    fn walk_taint_stmts(
+        stmts: &[Stmt],
+        tainted_vars: &mut HashSet<String>,
+        secret_fns: &HashSet<String>,
+        secret_fn_params: &HashMap<String, Vec<String>>,
+        sanitizer_fns: &HashSet<String>,
+        errors: &mut Vec<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Let(n, _, e, _) | Stmt::Assign(n, e) => {
+                    if expr_is_tainted(e, tainted_vars, secret_fns, sanitizer_fns, errors) {
+                        tainted_vars.insert(n.clone());
+                    } else {
+                        tainted_vars.remove(n);
+                    }
+                }
+                Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Yield(e) | Stmt::Return(Some(e)) => {
+                    let _ = expr_is_tainted(e, tainted_vars, secret_fns, sanitizer_fns, errors);
+                }
+                Stmt::SetMember(o, _, v) => {
+                    let _ = expr_is_tainted(o, tainted_vars, secret_fns, sanitizer_fns, errors);
+                    let _ = expr_is_tainted(v, tainted_vars, secret_fns, sanitizer_fns, errors);
+                }
+                Stmt::SetIndex(o, i, v) => {
+                    let _ = expr_is_tainted(o, tainted_vars, secret_fns, sanitizer_fns, errors);
+                    let _ = expr_is_tainted(i, tainted_vars, secret_fns, sanitizer_fns, errors);
+                    let _ = expr_is_tainted(v, tainted_vars, secret_fns, sanitizer_fns, errors);
+                }
+                Stmt::If(c, t, e) => {
+                    let _ = expr_is_tainted(c, tainted_vars, secret_fns, sanitizer_fns, errors);
+                    let mut tt = tainted_vars.clone();
+                    walk_taint_stmts(
+                        t,
+                        &mut tt,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                    let mut te = tainted_vars.clone();
+                    walk_taint_stmts(
+                        e,
+                        &mut te,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                    tainted_vars.extend(tt);
+                    tainted_vars.extend(te);
+                }
+                Stmt::While(c, b) => {
+                    let _ = expr_is_tainted(c, tainted_vars, secret_fns, sanitizer_fns, errors);
+                    walk_taint_stmts(
+                        b,
+                        tainted_vars,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                }
+                Stmt::ForRange(_, a, b, body) => {
+                    let _ = expr_is_tainted(a, tainted_vars, secret_fns, sanitizer_fns, errors);
+                    let _ = expr_is_tainted(b, tainted_vars, secret_fns, sanitizer_fns, errors);
+                    walk_taint_stmts(
+                        body,
+                        tainted_vars,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                }
+                Stmt::ForEach(_, it, body) | Stmt::With(it, _, body) => {
+                    let _ = expr_is_tainted(it, tainted_vars, secret_fns, sanitizer_fns, errors);
+                    walk_taint_stmts(
+                        body,
+                        tainted_vars,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                }
+                Stmt::Try(b, _, c, f) => {
+                    walk_taint_stmts(
+                        b,
+                        tainted_vars,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                    walk_taint_stmts(
+                        c,
+                        tainted_vars,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                    walk_taint_stmts(
+                        f,
+                        tainted_vars,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                }
+                Stmt::Fn(_, _, _, body) | Stmt::AsyncFn(_, _, _, body) => {
+                    let mut fn_tainted = HashSet::new();
+                    walk_taint_stmts(
+                        body,
+                        &mut fn_tainted,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                }
+                Stmt::DecoratedFn(_, name, _, _, body) => {
+                    let mut fn_tainted = HashSet::new();
+                    if let Some(pnames) = secret_fn_params.get(name) {
+                        for p in pnames {
+                            fn_tainted.insert(p.clone());
+                        }
+                    }
+                    walk_taint_stmts(
+                        body,
+                        &mut fn_tainted,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                }
+                Stmt::Class(_, _, _, _, body) => {
+                    walk_taint_stmts(
+                        body,
+                        tainted_vars,
+                        secret_fns,
+                        secret_fn_params,
+                        sanitizer_fns,
+                        errors,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    collect_taint_sigs(
+        ast,
+        &mut secret_fns,
+        &mut secret_fn_params,
+        &mut sanitizer_fns,
+    );
+    let mut top = HashSet::new();
+    walk_taint_stmts(
+        ast,
+        &mut top,
+        &secret_fns,
+        &secret_fn_params,
+        &sanitizer_fns,
+        errors,
+    );
+}
+
+fn verify_linear_resources(ast: &[Stmt], errors: &mut Vec<String>) {
+    let mut linear_constructors: HashSet<String> = HashSet::new();
+    let mut linear_fn_params: HashMap<String, Vec<String>> = HashMap::new();
+
+    fn collect_linear_sigs(
+        stmts: &[Stmt],
+        linear_constructors: &mut HashSet<String>,
+        linear_fn_params: &mut HashMap<String, Vec<String>>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::DecoratedFn(decs, name, _, _, body) => {
+                    let (has_lin, lin_args) = decorator_string_args(decs, "linear");
+                    if has_lin {
+                        if lin_args.is_empty() {
+                            linear_constructors.insert(name.clone());
+                        } else {
+                            linear_fn_params.insert(name.clone(), lin_args);
+                        }
+                    }
+                    collect_linear_sigs(body, linear_constructors, linear_fn_params);
+                }
+                Stmt::Fn(_, _, _, body)
+                | Stmt::AsyncFn(_, _, _, body)
+                | Stmt::Class(_, _, _, _, body) => {
+                    collect_linear_sigs(body, linear_constructors, linear_fn_params);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn consume_var(var: &str, state: &mut HashMap<String, bool>, errors: &mut Vec<String>) {
+        match state.get(var).copied() {
+            Some(true) => {
+                state.insert(var.to_string(), false);
+            }
+            Some(false) => {
+                errors.push(format!(
+                    "ownership error: linear resource '{var}' consumed more than once"
+                ));
+            }
+            None => {}
+        }
+    }
+
+    fn check_linear_expr(
+        e: &Expr,
+        state: &mut HashMap<String, bool>,
+        linear_constructors: &HashSet<String>,
+        linear_fn_params: &HashMap<String, Vec<String>>,
+        errors: &mut Vec<String>,
+    ) -> bool {
+        if let Some((name, args)) = extract_direct_call(e) {
+            if name == "linear_consume" {
+                for a in args {
+                    if let Expr::Var(v) = a {
+                        consume_var(v, state, errors);
+                    } else {
+                        let _ = check_linear_expr(
+                            a,
+                            state,
+                            linear_constructors,
+                            linear_fn_params,
+                            errors,
+                        );
+                    }
+                }
+                return false;
+            }
+            let moves_args =
+                linear_constructors.contains(name) || linear_fn_params.contains_key(name);
+            for a in args {
+                if moves_args && let Expr::Var(v) = a {
+                    consume_var(v, state, errors);
+                } else {
+                    let _ =
+                        check_linear_expr(a, state, linear_constructors, linear_fn_params, errors);
+                }
+            }
+            return linear_constructors.contains(name);
+        }
+        match e {
+            Expr::Var(v) => {
+                if state.get(v) == Some(&false) {
+                    errors.push(format!(
+                        "ownership error: linear resource '{v}' used after move/consume"
+                    ));
+                }
+                false
+            }
+            Expr::MethodCall(o, m, args) => {
+                if m == "close"
+                    && args.is_empty()
+                    && let Expr::Var(v) = o.as_ref()
+                {
+                    consume_var(v, state, errors);
+                    return false;
+                }
+                let _ = check_linear_expr(o, state, linear_constructors, linear_fn_params, errors);
+                for a in args {
+                    let _ =
+                        check_linear_expr(a, state, linear_constructors, linear_fn_params, errors);
+                }
+                false
+            }
+            Expr::List(xs) => {
+                for x in xs {
+                    let _ =
+                        check_linear_expr(x, state, linear_constructors, linear_fn_params, errors);
+                }
+                false
+            }
+            Expr::Map(ps) => {
+                for (k, v) in ps {
+                    let _ =
+                        check_linear_expr(k, state, linear_constructors, linear_fn_params, errors);
+                    let _ =
+                        check_linear_expr(v, state, linear_constructors, linear_fn_params, errors);
+                }
+                false
+            }
+            Expr::Bin(a, _, b) | Expr::Index(a, b) => {
+                let _ = check_linear_expr(a, state, linear_constructors, linear_fn_params, errors);
+                let _ = check_linear_expr(b, state, linear_constructors, linear_fn_params, errors);
+                false
+            }
+            Expr::Ternary(c, a, b) => {
+                let _ = check_linear_expr(c, state, linear_constructors, linear_fn_params, errors);
+                let _ = check_linear_expr(a, state, linear_constructors, linear_fn_params, errors);
+                let _ = check_linear_expr(b, state, linear_constructors, linear_fn_params, errors);
+                false
+            }
+            Expr::Unary(_, x) | Expr::Await(x) | Expr::Member(x, _) => {
+                let _ = check_linear_expr(x, state, linear_constructors, linear_fn_params, errors);
+                false
+            }
+            Expr::CallExpr(callee, args) => {
+                let _ =
+                    check_linear_expr(callee, state, linear_constructors, linear_fn_params, errors);
+                for a in args {
+                    let _ =
+                        check_linear_expr(a, state, linear_constructors, linear_fn_params, errors);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn walk_linear_block(
+        stmts: &[Stmt],
+        state: &mut HashMap<String, bool>,
+        linear_constructors: &HashSet<String>,
+        linear_fn_params: &HashMap<String, Vec<String>>,
+        errors: &mut Vec<String>,
+    ) {
+        let mut local_owned: Vec<String> = Vec::new();
+        for s in stmts {
+            match s {
+                Stmt::Let(n, _, e, _) => {
+                    let mut produced_lin =
+                        check_linear_expr(e, state, linear_constructors, linear_fn_params, errors);
+                    if let Expr::Var(src) = e
+                        && state.get(src) == Some(&true)
+                    {
+                        state.insert(src.clone(), false);
+                        produced_lin = true;
+                    }
+                    if produced_lin {
+                        state.insert(n.clone(), true);
+                        local_owned.push(n.clone());
+                    }
+                }
+                Stmt::Assign(n, e) => {
+                    let mut produced_lin =
+                        check_linear_expr(e, state, linear_constructors, linear_fn_params, errors);
+                    if let Expr::Var(src) = e
+                        && state.get(src) == Some(&true)
+                    {
+                        state.insert(src.clone(), false);
+                        produced_lin = true;
+                    }
+                    if state.get(n) == Some(&true) {
+                        errors.push(format!(
+                            "ownership error: linear resource '{n}' overwritten before being consumed"
+                        ));
+                    }
+                    if produced_lin {
+                        state.insert(n.clone(), true);
+                        if !local_owned.contains(n) {
+                            local_owned.push(n.clone());
+                        }
+                    }
+                }
+                Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Yield(e) => {
+                    let _ =
+                        check_linear_expr(e, state, linear_constructors, linear_fn_params, errors);
+                }
+                Stmt::Return(Some(e)) => {
+                    if let Expr::Var(v) = e
+                        && state.get(v) == Some(&true)
+                    {
+                        state.insert(v.clone(), false);
+                    } else {
+                        let _ = check_linear_expr(
+                            e,
+                            state,
+                            linear_constructors,
+                            linear_fn_params,
+                            errors,
+                        );
+                    }
+                }
+                Stmt::If(c, t, e) => {
+                    let _ =
+                        check_linear_expr(c, state, linear_constructors, linear_fn_params, errors);
+                    let outer_live: Vec<String> = state
+                        .iter()
+                        .filter_map(|(k, v)| if *v { Some(k.clone()) } else { None })
+                        .collect();
+                    let mut t_st = state.clone();
+                    walk_linear_block(t, &mut t_st, linear_constructors, linear_fn_params, errors);
+                    let mut e_st = state.clone();
+                    walk_linear_block(e, &mut e_st, linear_constructors, linear_fn_params, errors);
+                    for k in outer_live {
+                        let in_t = t_st.get(&k).copied().unwrap_or(true);
+                        let in_e = e_st.get(&k).copied().unwrap_or(true);
+                        if in_t != in_e {
+                            errors.push(format!(
+                                "ownership error: linear resource '{k}' consumed on one branch only"
+                            ));
+                            state.insert(k, false);
+                        } else {
+                            state.insert(k, in_t);
+                        }
+                    }
+                }
+                Stmt::While(c, b) => {
+                    let _ =
+                        check_linear_expr(c, state, linear_constructors, linear_fn_params, errors);
+                    let outer_live: Vec<String> = state
+                        .iter()
+                        .filter_map(|(k, v)| if *v { Some(k.clone()) } else { None })
+                        .collect();
+                    let mut loop_st = state.clone();
+                    walk_linear_block(
+                        b,
+                        &mut loop_st,
+                        linear_constructors,
+                        linear_fn_params,
+                        errors,
+                    );
+                    for k in outer_live {
+                        if loop_st.get(&k).copied() == Some(false) {
+                            errors.push(format!(
+                                "ownership error: linear resource '{k}' moved inside loop"
+                            ));
+                            state.insert(k, false);
+                        }
+                    }
+                }
+                Stmt::ForRange(_, a, b, body) => {
+                    let _ =
+                        check_linear_expr(a, state, linear_constructors, linear_fn_params, errors);
+                    let _ =
+                        check_linear_expr(b, state, linear_constructors, linear_fn_params, errors);
+                    walk_linear_block(body, state, linear_constructors, linear_fn_params, errors);
+                }
+                Stmt::ForEach(_, it, body) | Stmt::With(it, _, body) => {
+                    let _ =
+                        check_linear_expr(it, state, linear_constructors, linear_fn_params, errors);
+                    walk_linear_block(body, state, linear_constructors, linear_fn_params, errors);
+                }
+                Stmt::Try(b, _, c, f) => {
+                    walk_linear_block(b, state, linear_constructors, linear_fn_params, errors);
+                    walk_linear_block(c, state, linear_constructors, linear_fn_params, errors);
+                    walk_linear_block(f, state, linear_constructors, linear_fn_params, errors);
+                }
+                Stmt::Fn(_, _, _, body) | Stmt::AsyncFn(_, _, _, body) => {
+                    let mut fn_st = HashMap::new();
+                    walk_linear_block(
+                        body,
+                        &mut fn_st,
+                        linear_constructors,
+                        linear_fn_params,
+                        errors,
+                    );
+                }
+                Stmt::DecoratedFn(_, name, _, _, body) => {
+                    let mut fn_st = HashMap::new();
+                    if let Some(pnames) = linear_fn_params.get(name) {
+                        for p in pnames {
+                            fn_st.insert(p.clone(), true);
+                        }
+                    }
+                    walk_linear_block(
+                        body,
+                        &mut fn_st,
+                        linear_constructors,
+                        linear_fn_params,
+                        errors,
+                    );
+                    for k in fn_st.keys().filter(|k| fn_st.get(*k) == Some(&true)) {
+                        errors.push(format!(
+                            "ownership error: linear resource '{k}' dropped without being consumed"
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for name in local_owned {
+            if state.get(&name) == Some(&true) {
+                errors.push(format!(
+                    "ownership error: linear resource '{name}' dropped without being consumed"
+                ));
+            }
+        }
+    }
+
+    collect_linear_sigs(ast, &mut linear_constructors, &mut linear_fn_params);
+    let mut top = HashMap::new();
+    walk_linear_block(
+        ast,
+        &mut top,
+        &linear_constructors,
+        &linear_fn_params,
+        errors,
+    );
+}
+
+#[derive(Clone, Debug)]
+struct AbsInterval {
+    lo: f64,
+    hi: f64,
+    non_zero: bool,
+    list_len: Option<usize>,
+}
+
+impl AbsInterval {
+    fn any() -> Self {
+        Self {
+            lo: f64::NEG_INFINITY,
+            hi: f64::INFINITY,
+            non_zero: false,
+            list_len: None,
+        }
+    }
+    fn exact(n: f64) -> Self {
+        Self {
+            lo: n,
+            hi: n,
+            non_zero: n != 0.0,
+            list_len: None,
+        }
+    }
+    fn list_exact(len: usize) -> Self {
+        Self {
+            lo: f64::NEG_INFINITY,
+            hi: f64::INFINITY,
+            non_zero: false,
+            list_len: Some(len),
+        }
+    }
+    fn definitely_nonzero(&self) -> bool {
+        self.non_zero || self.lo > 0.0 || self.hi < 0.0
+    }
+}
+
+#[derive(Default)]
+struct VerifySummary {
+    functions_checked: usize,
+    contracts_proven: usize,
+    invariants_checked: usize,
+}
+
+fn eval_interval(expr: &Expr, env: &HashMap<String, AbsInterval>) -> AbsInterval {
+    match expr {
+        Expr::Num(n) => AbsInterval::exact(*n),
+        Expr::Bool(b) => AbsInterval::exact(if *b { 1.0 } else { 0.0 }),
+        Expr::List(xs) => AbsInterval::list_exact(xs.len()),
+        Expr::Var(n) => env.get(n).cloned().unwrap_or_else(AbsInterval::any),
+        Expr::Unary(op, inner) => {
+            let iv = eval_interval(inner, env);
+            match op.as_str() {
+                "-" => AbsInterval {
+                    lo: -iv.hi,
+                    hi: -iv.lo,
+                    non_zero: iv.non_zero,
+                    list_len: None,
+                },
+                "+" => iv,
+                _ => AbsInterval::any(),
+            }
+        }
+        Expr::Bin(l, op, r) => {
+            let a = eval_interval(l, env);
+            let b = eval_interval(r, env);
+            match op.as_str() {
+                "+" if a.lo.is_finite()
+                    && a.hi.is_finite()
+                    && b.lo.is_finite()
+                    && b.hi.is_finite() =>
+                {
+                    let lo = a.lo + b.lo;
+                    let hi = a.hi + b.hi;
+                    AbsInterval {
+                        lo,
+                        hi,
+                        non_zero: lo > 0.0 || hi < 0.0,
+                        list_len: None,
+                    }
+                }
+                "-" if a.lo.is_finite()
+                    && a.hi.is_finite()
+                    && b.lo.is_finite()
+                    && b.hi.is_finite() =>
+                {
+                    let lo = a.lo - b.hi;
+                    let hi = a.hi - b.lo;
+                    AbsInterval {
+                        lo,
+                        hi,
+                        non_zero: lo > 0.0 || hi < 0.0,
+                        list_len: None,
+                    }
+                }
+                "*" if a.lo.is_finite()
+                    && a.hi.is_finite()
+                    && b.lo.is_finite()
+                    && b.hi.is_finite() =>
+                {
+                    let ps = [a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi];
+                    let lo = ps.iter().copied().fold(f64::INFINITY, f64::min);
+                    let hi = ps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    AbsInterval {
+                        lo,
+                        hi,
+                        non_zero: a.definitely_nonzero() && b.definitely_nonzero(),
+                        list_len: None,
+                    }
+                }
+                "/" if b.definitely_nonzero() => {
+                    if a.lo.is_finite()
+                        && a.hi.is_finite()
+                        && b.lo.is_finite()
+                        && b.hi.is_finite()
+                        && (b.lo > 0.0 || b.hi < 0.0)
+                    {
+                        let qs = [a.lo / b.lo, a.lo / b.hi, a.hi / b.lo, a.hi / b.hi];
+                        let lo = qs.iter().copied().fold(f64::INFINITY, f64::min);
+                        let hi = qs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        AbsInterval {
+                            lo,
+                            hi,
+                            non_zero: lo > 0.0 || hi < 0.0,
+                            list_len: None,
+                        }
+                    } else if a.lo >= 0.0 && b.lo > 0.0 {
+                        let lo = if b.hi.is_finite() { a.lo / b.hi } else { 0.0 };
+                        let hi = if a.hi.is_finite() {
+                            a.hi / b.lo
+                        } else {
+                            f64::INFINITY
+                        };
+                        AbsInterval {
+                            lo,
+                            hi,
+                            non_zero: lo > 0.0,
+                            list_len: None,
+                        }
+                    } else if a.hi <= 0.0 && b.lo > 0.0 {
+                        let lo = if a.lo.is_finite() {
+                            a.lo / b.lo
+                        } else {
+                            f64::NEG_INFINITY
+                        };
+                        let hi = if b.hi.is_finite() { a.hi / b.hi } else { 0.0 };
+                        AbsInterval {
+                            lo,
+                            hi,
+                            non_zero: hi < 0.0,
+                            list_len: None,
+                        }
+                    } else {
+                        AbsInterval::any()
+                    }
+                }
+                _ => AbsInterval::any(),
+            }
+        }
+        _ => AbsInterval::any(),
+    }
+}
+
+fn eval_cond_static(cond: &Expr, env: &HashMap<String, AbsInterval>) -> Option<bool> {
+    if let Some(b) = const_eval_bool(cond) {
+        return Some(b);
+    }
+    match cond {
+        Expr::Unary(op, inner) if op == "not" || op == "!" => {
+            eval_cond_static(inner, env).map(|b| !b)
+        }
+        Expr::Bin(l, op, r) => match op.as_str() {
+            "and" => match (eval_cond_static(l, env), eval_cond_static(r, env)) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            },
+            "or" => match (eval_cond_static(l, env), eval_cond_static(r, env)) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+            "==" | "!=" | "<" | "<=" | ">" | ">=" => {
+                let a = eval_interval(l, env);
+                let b = eval_interval(r, env);
+                if a.lo.is_nan() || a.hi.is_nan() || b.lo.is_nan() || b.hi.is_nan() {
+                    return None;
+                }
+                match op.as_str() {
+                    ">" => {
+                        if a.lo > b.hi {
+                            Some(true)
+                        } else if a.hi <= b.lo {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                    ">=" => {
+                        if a.lo >= b.hi {
+                            Some(true)
+                        } else if a.hi < b.lo {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                    "<" => {
+                        if a.hi < b.lo {
+                            Some(true)
+                        } else if a.lo >= b.hi {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                    "<=" => {
+                        if a.hi <= b.lo {
+                            Some(true)
+                        } else if a.lo > b.hi {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                    "==" => {
+                        if a.lo == a.hi && b.lo == b.hi && a.lo == b.lo {
+                            Some(true)
+                        } else if a.hi < b.lo || b.hi < a.lo {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                    "!=" => {
+                        if a.hi < b.lo || b.hi < a.lo {
+                            Some(true)
+                        } else if a.lo == a.hi && b.lo == b.hi && a.lo == b.lo {
+                            Some(false)
+                        } else if (b.lo == 0.0 && b.hi == 0.0 && a.definitely_nonzero())
+                            || (a.lo == 0.0 && a.hi == 0.0 && b.definitely_nonzero())
+                        {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn refine_env_from_cond(env: &mut HashMap<String, AbsInterval>, cond: &Expr, truth: bool) {
+    match cond {
+        Expr::Bin(l, op, r) if truth && op == "and" => {
+            refine_env_from_cond(env, l, true);
+            refine_env_from_cond(env, r, true);
+        }
+        Expr::Bin(l, op, r) if !truth && op == "or" => {
+            refine_env_from_cond(env, l, false);
+            refine_env_from_cond(env, r, false);
+        }
+        Expr::Bin(l, op, r) => {
+            let effective_op = if truth {
+                op.as_str()
+            } else {
+                match op.as_str() {
+                    "==" => "!=",
+                    "!=" => "==",
+                    ">" => "<=",
+                    ">=" => "<",
+                    "<" => ">=",
+                    "<=" => ">",
+                    _ => return,
+                }
+            };
+            if let Expr::Var(v) = l.as_ref() {
+                let rhs = eval_interval(r, env);
+                let mut cur = env.get(v).cloned().unwrap_or_else(AbsInterval::any);
+                match effective_op {
+                    ">" if rhs.lo.is_finite() => {
+                        cur.lo = cur.lo.max(rhs.lo + 1e-9);
+                        if cur.lo > 0.0 {
+                            cur.non_zero = true;
+                        }
+                    }
+                    ">=" if rhs.lo.is_finite() => {
+                        cur.lo = cur.lo.max(rhs.lo);
+                        if cur.lo > 0.0 {
+                            cur.non_zero = true;
+                        }
+                    }
+                    "<" if rhs.hi.is_finite() => {
+                        cur.hi = cur.hi.min(rhs.hi - 1e-9);
+                        if cur.hi < 0.0 {
+                            cur.non_zero = true;
+                        }
+                    }
+                    "<=" if rhs.hi.is_finite() => {
+                        cur.hi = cur.hi.min(rhs.hi);
+                        if cur.hi < 0.0 {
+                            cur.non_zero = true;
+                        }
+                    }
+                    "==" if rhs.lo == rhs.hi && rhs.lo.is_finite() => {
+                        cur.lo = rhs.lo;
+                        cur.hi = rhs.lo;
+                        cur.non_zero = rhs.lo != 0.0;
+                    }
+                    "!=" if rhs.lo == 0.0 && rhs.hi == 0.0 => {
+                        cur.non_zero = true;
+                    }
+                    _ => {}
+                }
+                env.insert(v.clone(), cur);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn verify_contracts_strict(
+    ast: &[Stmt],
+    strict_all: bool,
+    errors: &mut Vec<String>,
+) -> VerifySummary {
+    struct FnContractSig {
+        params: Vec<String>,
+        preconditions: Vec<Expr>,
+    }
+
+    let mut fn_sigs: HashMap<String, FnContractSig> = HashMap::new();
+    for s in ast {
+        let (name, params, body) = match s {
+            Stmt::Fn(n, p, _, b) | Stmt::AsyncFn(n, p, _, b) | Stmt::DecoratedFn(_, n, p, _, b) => {
+                (n, p, b)
+            }
+            _ => continue,
+        };
+        let mut pre = Vec::new();
+        for stmt in body {
+            if let Stmt::Expr(e) = stmt
+                && let Some((cname, args)) = extract_direct_call(e)
+                && cname == "requires"
+                && let Some(cond) = args.first()
+            {
+                pre.push((*cond).clone());
+            } else if !matches!(stmt, Stmt::SourceLine(_)) {
+                break;
+            }
+        }
+        fn_sigs.insert(
+            name.clone(),
+            FnContractSig {
+                params: params.iter().map(|(pn, _)| pn.clone()).collect(),
+                preconditions: pre,
+            },
+        );
+    }
+
+    fn verify_expr_strict(
+        e: &Expr,
+        env: &HashMap<String, AbsInterval>,
+        fn_sigs: &HashMap<String, FnContractSig>,
+        summary: &mut VerifySummary,
+        errors: &mut Vec<String>,
+    ) {
+        if let Some((cname, args)) = extract_direct_call(e) {
+            for a in &args {
+                verify_expr_strict(a, env, fn_sigs, summary, errors);
+            }
+            if let Some(sig) = fn_sigs.get(cname)
+                && !sig.preconditions.is_empty()
+                && args.len() == sig.params.len()
+            {
+                let mut callee_env = HashMap::new();
+                for (p, a) in sig.params.iter().zip(args.iter()) {
+                    callee_env.insert(p.clone(), eval_interval(a, env));
+                }
+                for pre in &sig.preconditions {
+                    summary.invariants_checked += 1;
+                    if eval_cond_static(pre, &callee_env) == Some(false) {
+                        errors.push(format!(
+                            "verification error: call to '{cname}' violates requires(...) statically"
+                        ));
+                    } else if eval_cond_static(pre, &callee_env) == Some(true) {
+                        summary.contracts_proven += 1;
+                    }
+                }
+            }
+            return;
+        }
+        match e {
+            Expr::Bin(l, op, r) => {
+                verify_expr_strict(l, env, fn_sigs, summary, errors);
+                verify_expr_strict(r, env, fn_sigs, summary, errors);
+                if matches!(op.as_str(), "/" | "%") {
+                    summary.invariants_checked += 1;
+                    let d = eval_interval(r, env);
+                    if !d.definitely_nonzero() {
+                        errors.push(
+                            "verification error: potential division by zero (guard with 'requires(d != 0)' or 'if d != 0')"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            Expr::Index(arr, idx) => {
+                verify_expr_strict(arr, env, fn_sigs, summary, errors);
+                verify_expr_strict(idx, env, fn_sigs, summary, errors);
+                let arr_iv = eval_interval(arr, env);
+                let idx_iv = eval_interval(idx, env);
+                if let Some(len) = arr_iv.list_len
+                    && idx_iv.lo.is_finite()
+                    && idx_iv.hi.is_finite()
+                {
+                    summary.invariants_checked += 1;
+                    if idx_iv.hi < -(len as f64) || idx_iv.lo >= len as f64 {
+                        errors.push(format!(
+                            "verification error: static index [{}, {}] out of bounds for list of length {len}",
+                            idx_iv.lo, idx_iv.hi
+                        ));
+                    }
+                }
+            }
+            Expr::List(xs) => {
+                for x in xs {
+                    verify_expr_strict(x, env, fn_sigs, summary, errors);
+                }
+            }
+            Expr::Map(ps) => {
+                for (k, v) in ps {
+                    verify_expr_strict(k, env, fn_sigs, summary, errors);
+                    verify_expr_strict(v, env, fn_sigs, summary, errors);
+                }
+            }
+            Expr::Ternary(c, a, b) => {
+                verify_expr_strict(c, env, fn_sigs, summary, errors);
+                let mut t_env = env.clone();
+                refine_env_from_cond(&mut t_env, c, true);
+                verify_expr_strict(a, &t_env, fn_sigs, summary, errors);
+                let mut e_env = env.clone();
+                refine_env_from_cond(&mut e_env, c, false);
+                verify_expr_strict(b, &e_env, fn_sigs, summary, errors);
+            }
+            Expr::Unary(_, x) | Expr::Await(x) | Expr::Member(x, _) => {
+                verify_expr_strict(x, env, fn_sigs, summary, errors);
+            }
+            Expr::MethodCall(o, _, args) => {
+                verify_expr_strict(o, env, fn_sigs, summary, errors);
+                for a in args {
+                    verify_expr_strict(a, env, fn_sigs, summary, errors);
+                }
+            }
+            Expr::CallExpr(f, args) => {
+                verify_expr_strict(f, env, fn_sigs, summary, errors);
+                for a in args {
+                    verify_expr_strict(a, env, fn_sigs, summary, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn verify_block_strict(
+        stmts: &[Stmt],
+        env: &mut HashMap<String, AbsInterval>,
+        fn_sigs: &HashMap<String, FnContractSig>,
+        strict_all: bool,
+        summary: &mut VerifySummary,
+        errors: &mut Vec<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Let(n, _, e, _) => {
+                    verify_expr_strict(e, env, fn_sigs, summary, errors);
+                    env.insert(n.clone(), eval_interval(e, env));
+                }
+                Stmt::Assign(n, e) => {
+                    verify_expr_strict(e, env, fn_sigs, summary, errors);
+                    env.insert(n.clone(), eval_interval(e, env));
+                }
+                Stmt::Expr(e) => {
+                    if let Some((cname, args)) = extract_direct_call(e)
+                        && (cname == "requires" || cname == "ensures")
+                        && let Some(cond) = args.first()
+                    {
+                        summary.invariants_checked += 1;
+                        match eval_cond_static(cond, env) {
+                            Some(false) => {
+                                errors.push(format!(
+                                    "verification error: {cname} contract is statically falsified"
+                                ));
+                            }
+                            Some(true) => {
+                                summary.contracts_proven += 1;
+                            }
+                            None => {}
+                        }
+                        if cname == "requires" {
+                            refine_env_from_cond(env, cond, true);
+                        }
+                    } else {
+                        verify_expr_strict(e, env, fn_sigs, summary, errors);
+                    }
+                }
+                Stmt::Return(Some(e)) | Stmt::Throw(e) | Stmt::Yield(e) => {
+                    verify_expr_strict(e, env, fn_sigs, summary, errors);
+                }
+                Stmt::If(c, t, e) => {
+                    verify_expr_strict(c, env, fn_sigs, summary, errors);
+                    let mut t_env = env.clone();
+                    refine_env_from_cond(&mut t_env, c, true);
+                    verify_block_strict(t, &mut t_env, fn_sigs, strict_all, summary, errors);
+                    let mut e_env = env.clone();
+                    refine_env_from_cond(&mut e_env, c, false);
+                    verify_block_strict(e, &mut e_env, fn_sigs, strict_all, summary, errors);
+                    for k in env.keys().cloned().collect::<Vec<_>>() {
+                        env.insert(k, AbsInterval::any());
+                    }
+                }
+                Stmt::While(c, b) => {
+                    for k in env.keys().cloned().collect::<Vec<_>>() {
+                        env.insert(k, AbsInterval::any());
+                    }
+                    let mut loop_env = env.clone();
+                    refine_env_from_cond(&mut loop_env, c, true);
+                    verify_block_strict(b, &mut loop_env, fn_sigs, strict_all, summary, errors);
+                }
+                Stmt::ForRange(v, a, b, body) => {
+                    verify_expr_strict(a, env, fn_sigs, summary, errors);
+                    verify_expr_strict(b, env, fn_sigs, summary, errors);
+                    let mut fenv = env.clone();
+                    let a_iv = eval_interval(a, env);
+                    let b_iv = eval_interval(b, env);
+                    if a_iv.lo.is_finite() && b_iv.hi.is_finite() {
+                        fenv.insert(
+                            v.clone(),
+                            AbsInterval {
+                                lo: a_iv.lo,
+                                hi: b_iv.hi - 1.0,
+                                non_zero: a_iv.lo > 0.0 || b_iv.hi <= 0.0,
+                                list_len: None,
+                            },
+                        );
+                    }
+                    verify_block_strict(body, &mut fenv, fn_sigs, strict_all, summary, errors);
+                }
+                Stmt::Fn(_, params, _, body) | Stmt::AsyncFn(_, params, _, body) if strict_all => {
+                    summary.functions_checked += 1;
+                    let mut fn_env = HashMap::new();
+                    for (p, _) in params {
+                        fn_env.insert(p.clone(), AbsInterval::any());
+                    }
+                    verify_block_strict(body, &mut fn_env, fn_sigs, strict_all, summary, errors);
+                }
+                Stmt::DecoratedFn(decs, _, params, _, body)
+                    if strict_all || decorator_string_args(decs, "verify").0 =>
+                {
+                    summary.functions_checked += 1;
+                    let mut fn_env = HashMap::new();
+                    for (p, _) in params {
+                        fn_env.insert(p.clone(), AbsInterval::any());
+                    }
+                    verify_block_strict(body, &mut fn_env, fn_sigs, strict_all, summary, errors);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut summary = VerifySummary::default();
+    if strict_all {
+        let mut top_env = HashMap::new();
+        verify_block_strict(ast, &mut top_env, &fn_sigs, true, &mut summary, errors);
+    } else {
+        fn scan_verify_fns(
+            stmts: &[Stmt],
+            fn_sigs: &HashMap<String, FnContractSig>,
+            summary: &mut VerifySummary,
+            errors: &mut Vec<String>,
+        ) {
+            for s in stmts {
+                match s {
+                    Stmt::DecoratedFn(decs, _, params, _, body) => {
+                        if decorator_string_args(decs, "verify").0 {
+                            summary.functions_checked += 1;
+                            let mut fn_env = HashMap::new();
+                            for (p, _) in params {
+                                fn_env.insert(p.clone(), AbsInterval::any());
+                            }
+                            verify_block_strict(body, &mut fn_env, fn_sigs, true, summary, errors);
+                        }
+                        scan_verify_fns(body, fn_sigs, summary, errors);
+                    }
+                    Stmt::Fn(_, _, _, body)
+                    | Stmt::AsyncFn(_, _, _, body)
+                    | Stmt::Class(_, _, _, _, body) => {
+                        scan_verify_fns(body, fn_sigs, summary, errors);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        scan_verify_fns(ast, &fn_sigs, &mut summary, errors);
+    }
+    summary
+}
+
+pub(crate) fn verify_source_strict(src: &str) -> Result<JsonValue, String> {
+    let t = lex_with_lines(src)?;
+    let ast = Parser::new_with_lines(t).program()?;
+    let mut errors = Vec::new();
+    if let Err(sem_err) = semantic_check_ast(&ast) {
+        for part in sem_err
+            .strip_prefix("semantic errors: ")
+            .unwrap_or(&sem_err)
+            .split("; ")
+        {
+            if !part.is_empty() {
+                errors.push(part.to_string());
+            }
+        }
+    }
+    let summary = verify_contracts_strict(&ast, true, &mut errors);
+    errors.sort();
+    errors.dedup();
+    Ok(json!({
+        "ok": errors.is_empty(),
+        "functions_checked": summary.functions_checked,
+        "contracts_proven": summary.contracts_proven,
+        "invariants_checked": summary.invariants_checked,
+        "diagnostics": errors,
+    }))
+}
+
+pub(crate) fn optimize_source_stats(src: &str) -> Result<JsonValue, String> {
+    let unopt = compile_source_unoptimized(src)?;
+    let (_, stats) = optimize_bytecode_with_stats(unopt);
+    Ok(json!({
+        "ops_before": stats.ops_before,
+        "ops_after": stats.ops_after,
+        "constants_folded": stats.constants_folded,
+        "algebraic_simplified": stats.algebraic_simplified,
+        "dead_removed": stats.dead_removed,
+    }))
+}
+
 pub(crate) fn semantic_check_ast(ast: &[Stmt]) -> Result<(), String> {
     semantic_check_ast_with_globals(ast, &[])
 }
@@ -1025,6 +2393,9 @@ pub(crate) fn semantic_check_ast_with_globals(
     let mut errors = vec![];
     check_block(ast, &[root], &mut errors);
     verify_effects_and_contracts(ast, &mut errors);
+    verify_taint_security(ast, &mut errors);
+    verify_linear_resources(ast, &mut errors);
+    let _ = verify_contracts_strict(ast, false, &mut errors);
     errors.sort();
     errors.dedup();
     if errors.is_empty() {
@@ -1057,6 +2428,294 @@ pub(crate) fn compile_source_with_debug_and_globals(
     let mut c = Compiler::new();
     c.emit_stmts(&ast)?;
     Ok(c.finish_with_debug())
+}
+
+pub(crate) fn analyze_cell_deps(
+    src: &str,
+) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    fn collect_pattern_binds(pat: &Pattern, out: &mut HashSet<String>) {
+        match pat {
+            Pattern::Capture(name) => {
+                out.insert(name.clone());
+            }
+            Pattern::As(inner, name) => {
+                out.insert(name.clone());
+                collect_pattern_binds(inner, out);
+            }
+            Pattern::Or(pats) => {
+                for p in pats {
+                    collect_pattern_binds(p, out);
+                }
+            }
+            Pattern::Seq(elems) => {
+                for el in elems {
+                    match el {
+                        SeqElem::Pat(p) => collect_pattern_binds(p, out),
+                        SeqElem::Star(Some(n)) => {
+                            out.insert(n.clone());
+                        }
+                        SeqElem::Star(None) => {}
+                    }
+                }
+            }
+            Pattern::Map { entries, rest } => {
+                for (_, p) in entries {
+                    collect_pattern_binds(p, out);
+                }
+                if let Some(r) = rest {
+                    out.insert(r.clone());
+                }
+            }
+            Pattern::Class { pos, kw, .. } => {
+                for p in pos {
+                    collect_pattern_binds(p, out);
+                }
+                for (_, p) in kw {
+                    collect_pattern_binds(p, out);
+                }
+            }
+            Pattern::Wildcard | Pattern::Literal(_) => {}
+        }
+    }
+
+    fn walk_expr(expr: &Expr, bound: &HashSet<String>, refs: &mut BTreeSet<String>) {
+        match expr {
+            Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => {}
+            Expr::Var(name) => {
+                if !bound.contains(name) {
+                    refs.insert(name.clone());
+                }
+            }
+            Expr::List(xs) => {
+                for x in xs {
+                    walk_expr(x, bound, refs);
+                }
+            }
+            Expr::Map(pairs) => {
+                for (k, v) in pairs {
+                    walk_expr(k, bound, refs);
+                    walk_expr(v, bound, refs);
+                }
+            }
+            Expr::Index(a, b) | Expr::Bin(a, _, b) => {
+                walk_expr(a, bound, refs);
+                walk_expr(b, bound, refs);
+            }
+            Expr::Member(obj, _) | Expr::Await(obj) | Expr::Unary(_, obj) => {
+                walk_expr(obj, bound, refs);
+            }
+            Expr::MethodCall(obj, _, args) => {
+                walk_expr(obj, bound, refs);
+                for a in args {
+                    walk_expr(a, bound, refs);
+                }
+            }
+            Expr::Call(name, args) => {
+                if !bound.contains(name) {
+                    refs.insert(name.clone());
+                }
+                for a in args {
+                    walk_expr(a, bound, refs);
+                }
+            }
+            Expr::CallExpr(callee, args) => {
+                walk_expr(callee, bound, refs);
+                for a in args {
+                    walk_expr(a, bound, refs);
+                }
+            }
+            Expr::CallExt { callee, args, .. } => {
+                walk_expr(callee, bound, refs);
+                for a in args {
+                    match a {
+                        CallArg::Pos(e)
+                        | CallArg::Star(e)
+                        | CallArg::Kw(_, e)
+                        | CallArg::KwStar(e) => {
+                            walk_expr(e, bound, refs);
+                        }
+                    }
+                }
+            }
+            Expr::Ternary(c, t, e) => {
+                walk_expr(c, bound, refs);
+                walk_expr(t, bound, refs);
+                walk_expr(e, bound, refs);
+            }
+            Expr::ChainedCmp(first, rest) => {
+                walk_expr(first, bound, refs);
+                for (_, e) in rest {
+                    walk_expr(e, bound, refs);
+                }
+            }
+            Expr::ListComp(body, var, iter, cond) => {
+                walk_expr(iter, bound, refs);
+                let mut inner = bound.clone();
+                inner.insert(var.clone());
+                if let Some(c) = cond {
+                    walk_expr(c, &inner, refs);
+                }
+                walk_expr(body, &inner, refs);
+            }
+            Expr::Lambda(params, _, body) => {
+                let mut inner = bound.clone();
+                for (p, _) in params {
+                    inner.insert(p.clone());
+                }
+                let mut dummy_defs = BTreeSet::new();
+                let mut dummy_assigns = BTreeSet::new();
+                walk_stmts(
+                    body,
+                    false,
+                    &mut inner,
+                    &mut dummy_defs,
+                    &mut dummy_assigns,
+                    refs,
+                );
+            }
+        }
+    }
+
+    fn walk_stmts(
+        stmts: &[Stmt],
+        top_level: bool,
+        bound: &mut HashSet<String>,
+        defs: &mut BTreeSet<String>,
+        assigns: &mut BTreeSet<String>,
+        refs: &mut BTreeSet<String>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let(name, _, init, _) => {
+                    walk_expr(init, bound, refs);
+                    bound.insert(name.clone());
+                    if top_level {
+                        defs.insert(name.clone());
+                    }
+                }
+                Stmt::Assign(name, expr) => {
+                    walk_expr(expr, bound, refs);
+                    if !bound.contains(name) {
+                        assigns.insert(name.clone());
+                        refs.insert(name.clone());
+                    }
+                }
+                Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Yield(e) => walk_expr(e, bound, refs),
+                Stmt::Return(Some(e)) => walk_expr(e, bound, refs),
+                Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::SourceLine(_) => {}
+                Stmt::SetMember(o, _, v) => {
+                    walk_expr(o, bound, refs);
+                    walk_expr(v, bound, refs);
+                }
+                Stmt::SetIndex(o, i, v) => {
+                    walk_expr(o, bound, refs);
+                    walk_expr(i, bound, refs);
+                    walk_expr(v, bound, refs);
+                }
+                Stmt::If(c, t, e) => {
+                    walk_expr(c, bound, refs);
+                    walk_stmts(t, false, &mut bound.clone(), defs, assigns, refs);
+                    walk_stmts(e, false, &mut bound.clone(), defs, assigns, refs);
+                }
+                Stmt::While(c, b) => {
+                    walk_expr(c, bound, refs);
+                    walk_stmts(b, false, &mut bound.clone(), defs, assigns, refs);
+                }
+                Stmt::ForRange(v, lo, hi, b) => {
+                    walk_expr(lo, bound, refs);
+                    walk_expr(hi, bound, refs);
+                    let mut inner = bound.clone();
+                    inner.insert(v.clone());
+                    walk_stmts(b, false, &mut inner, defs, assigns, refs);
+                }
+                Stmt::ForEach(v, iter, b) => {
+                    walk_expr(iter, bound, refs);
+                    let mut inner = bound.clone();
+                    inner.insert(v.clone());
+                    walk_stmts(b, false, &mut inner, defs, assigns, refs);
+                }
+                Stmt::With(e, alias, b) => {
+                    walk_expr(e, bound, refs);
+                    let mut inner = bound.clone();
+                    inner.insert(alias.clone());
+                    walk_stmts(b, false, &mut inner, defs, assigns, refs);
+                }
+                Stmt::Try(tb, err_v, cb, fb) => {
+                    walk_stmts(tb, false, &mut bound.clone(), defs, assigns, refs);
+                    let mut c_bound = bound.clone();
+                    c_bound.insert(err_v.clone());
+                    walk_stmts(cb, false, &mut c_bound, defs, assigns, refs);
+                    walk_stmts(fb, false, &mut bound.clone(), defs, assigns, refs);
+                }
+                Stmt::Match(scrut, arms) => {
+                    walk_expr(scrut, bound, refs);
+                    for (pat, guard, body) in arms {
+                        let mut inner = bound.clone();
+                        collect_pattern_binds(pat, &mut inner);
+                        if let Some(g) = guard {
+                            walk_expr(g, &inner, refs);
+                        }
+                        walk_stmts(body, false, &mut inner, defs, assigns, refs);
+                    }
+                }
+                Stmt::Fn(name, params, _, body) | Stmt::AsyncFn(name, params, _, body) => {
+                    bound.insert(name.clone());
+                    if top_level {
+                        defs.insert(name.clone());
+                    }
+                    let mut inner = bound.clone();
+                    for (p, _) in params {
+                        inner.insert(p.clone());
+                    }
+                    walk_stmts(body, false, &mut inner, defs, assigns, refs);
+                }
+                Stmt::DecoratedFn(decs, name, params, _, body) => {
+                    for d in decs {
+                        walk_expr(d, bound, refs);
+                    }
+                    bound.insert(name.clone());
+                    if top_level {
+                        defs.insert(name.clone());
+                    }
+                    let mut inner = bound.clone();
+                    for (p, _) in params {
+                        inner.insert(p.clone());
+                    }
+                    walk_stmts(body, false, &mut inner, defs, assigns, refs);
+                }
+                Stmt::Class(name, decs, base, mixins, body) => {
+                    for d in decs {
+                        walk_expr(d, bound, refs);
+                    }
+                    if let Some(b) = base {
+                        walk_expr(b, bound, refs);
+                    }
+                    for m in mixins {
+                        walk_expr(m, bound, refs);
+                    }
+                    bound.insert(name.clone());
+                    if top_level {
+                        defs.insert(name.clone());
+                    }
+                    let mut inner = bound.clone();
+                    walk_stmts(body, false, &mut inner, defs, assigns, refs);
+                }
+            }
+        }
+    }
+
+    let mut defs = BTreeSet::new();
+    let mut assigns = BTreeSet::new();
+    let mut refs = BTreeSet::new();
+    let Ok(tokens) = lex_with_lines(src) else {
+        return (defs, assigns, refs);
+    };
+    let Ok(ast) = Parser::new_with_debug_lines(tokens).program() else {
+        return (defs, assigns, refs);
+    };
+    let mut bound = HashSet::new();
+    walk_stmts(&ast, true, &mut bound, &mut defs, &mut assigns, &mut refs);
+    (defs, assigns, refs)
 }
 
 pub(crate) fn compile_notebook_cell_with_globals(

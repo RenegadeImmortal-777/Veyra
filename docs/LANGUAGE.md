@@ -37,6 +37,25 @@ Built-in types include Int, Float, Number, String, Bool, List, Map, Function, Nu
     @effect("io", "net")
     fn fetch_data(url) { return http_get(url); }
 
+## Static Safety: Taint, Linear Ownership & Verification
+
+    @secret
+    fn load_token() -> String { return "sk-live"; }
+    let clean = sanitize(load_token());
+    print(clean);
+
+    @linear
+    fn open_conn(name: String) -> String { return "conn:" + name; }
+    let c = open_conn("primary");
+    linear_consume(c);
+
+    @verify
+    fn safe_div(a: Int, b: Int) -> Int {
+        requires(a >= 0, "a >= 0");
+        requires(b >= 2, "b >= 2");
+        return a / b;
+    }
+
 ## Modules
 
     use "other.vy";

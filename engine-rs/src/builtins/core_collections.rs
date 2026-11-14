@@ -77,6 +77,46 @@ impl Vm {
                 }
                 Val::Null
             }
+            "secret_mark" => {
+                if a.len() != 1 {
+                    return Err("secret_mark expects 1 argument".into());
+                }
+                a.into_iter().next().unwrap_or(Val::Null)
+            }
+            "sanitize" => {
+                if a.len() != 1 {
+                    return Err("sanitize expects 1 argument".into());
+                }
+                a.into_iter().next().unwrap_or(Val::Null)
+            }
+            "linear_consume" => {
+                if a.len() != 1 {
+                    return Err("linear_consume expects 1 argument".into());
+                }
+                Val::Null
+            }
+            "verify_source" => {
+                if a.len() != 1 {
+                    return Err("verify_source expects source String".into());
+                }
+                let src = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("verify_source expects source String".into()),
+                };
+                let report = crate::pipeline::verify_source_strict(src)?;
+                json_to_val(&report)
+            }
+            "ir_stats" => {
+                if a.len() != 1 {
+                    return Err("ir_stats expects source String".into());
+                }
+                let src = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("ir_stats expects source String".into()),
+                };
+                let report = crate::pipeline::optimize_source_stats(src)?;
+                json_to_val(&report)
+            }
             "vybc_compile" => {
                 if a.len() != 1 {
                     return Err("vybc_compile expects source String".into());

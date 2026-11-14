@@ -28,6 +28,8 @@ pub(crate) struct JitCallCtx {
     pub(crate) lists_ptr: *const JitSlice,
     pub(crate) list_count: usize,
     pub(crate) oob: u8,
+    pub(crate) dyn_lists_ptr: *mut Vec<Vec<f64>>,
+    pub(crate) dyn_slices_ptr: *mut Vec<JitSlice>,
 }
 
 pub(crate) type JitEntry =
@@ -77,8 +79,8 @@ impl AbstractType {
     }
 }
 
-struct ExecMem {
-    ptr: *mut u8,
+pub(crate) struct ExecMem {
+    pub(crate) ptr: *mut u8,
     #[allow(dead_code)]
     size: usize,
 }
@@ -172,7 +174,7 @@ impl CompiledJitFn {
             heap_args.as_ptr()
         };
 
-        let slices: Vec<JitSlice> = flat_lists
+        let mut slices: Vec<JitSlice> = flat_lists
             .iter_mut()
             .map(|v| JitSlice {
                 ptr: v.as_mut_ptr(),
@@ -187,6 +189,8 @@ impl CompiledJitFn {
             },
             list_count: slices.len(),
             oob: 0,
+            dyn_lists_ptr: &mut flat_lists as *mut Vec<Vec<f64>>,
+            dyn_slices_ptr: &mut slices as *mut Vec<JitSlice>,
         };
         let out = unsafe { (self.entry)(arg_ptr, args.len(), &mut ctx) };
         if ctx.oob != 0 {
@@ -572,6 +576,7 @@ pub(crate) fn jit_info_val() -> Val {
 enum CallResolution {
     SelfCall,
     LenList,
+    AllocList(usize),
     MathHelper(MathHelper),
     InterFn(String), // variant key into JIT_FN_SLOTS
 }
@@ -886,6 +891,11 @@ fn verify_and_collect_plans(
                         if fn_name == "len" && *argc == 1 && arg_types[0] == AbstractType::NumList {
                             call_resolutions.insert(cur, CallResolution::LenList);
                             stack.push(AbstractType::Num);
+                        } else if fn_name == "__list"
+                            && arg_types.iter().all(|t| *t == AbstractType::Num)
+                        {
+                            call_resolutions.insert(cur, CallResolution::AllocList(*argc));
+                            stack.push(AbstractType::NumList);
                         } else if fn_name == name
                             && arg_kinds == param_kinds
                             && *argc == def.params.len()
@@ -1038,6 +1048,12 @@ unsafe extern "C" fn jit_exp(x: f64) -> f64 {
 unsafe extern "C" fn jit_log(x: f64) -> f64 {
     x.ln()
 }
+unsafe extern "C" fn jit_log10(x: f64) -> f64 {
+    x.log10()
+}
+unsafe extern "C" fn jit_log2(x: f64) -> f64 {
+    x.log2()
+}
 unsafe extern "C" fn jit_floor(x: f64) -> f64 {
     x.floor()
 }
@@ -1052,6 +1068,12 @@ unsafe extern "C" fn jit_pow(a: f64, b: f64) -> f64 {
 }
 unsafe extern "C" fn jit_fmod(a: f64, b: f64) -> f64 {
     a % b
+}
+unsafe extern "C" fn jit_hypot(a: f64, b: f64) -> f64 {
+    a.hypot(b)
+}
+unsafe extern "C" fn jit_atan2(y: f64, x: f64) -> f64 {
+    y.atan2(x)
 }
 unsafe extern "C" fn jit_min(a: f64, b: f64) -> f64 {
     a.min(b)
@@ -1129,6 +1151,43 @@ unsafe extern "C" fn jit_list_set(
     f64::from_bits(list_idx as u64)
 }
 
+unsafe extern "C" fn jit_alloc_list(
+    elems_ptr: *const f64,
+    len: usize,
+    ctx: *mut JitCallCtx,
+) -> f64 {
+    if ctx.is_null() {
+        return 0.0;
+    }
+    let ctx_ref = unsafe { &mut *ctx };
+    if ctx_ref.dyn_lists_ptr.is_null() || ctx_ref.dyn_slices_ptr.is_null() {
+        ctx_ref.oob = 1;
+        return 0.0;
+    }
+    let lists = unsafe { &mut *ctx_ref.dyn_lists_ptr };
+    let slices = unsafe { &mut *ctx_ref.dyn_slices_ptr };
+    if lists.len() >= 1_000_000 {
+        ctx_ref.oob = 1;
+        return 0.0;
+    }
+    let mut vec = if len == 0 || elems_ptr.is_null() {
+        Vec::new()
+    } else {
+        unsafe { core::slice::from_raw_parts(elems_ptr, len) }.to_vec()
+    };
+    let data_ptr = if len == 0 {
+        core::ptr::null_mut()
+    } else {
+        vec.as_mut_ptr()
+    };
+    let idx = lists.len();
+    lists.push(vec);
+    slices.push(JitSlice { ptr: data_ptr, len });
+    ctx_ref.lists_ptr = slices.as_ptr();
+    ctx_ref.list_count = slices.len();
+    f64::from_bits(idx as u64)
+}
+
 fn math_helper_kind(name: &str, argc: usize) -> Option<MathHelper> {
     match (name, argc) {
         ("abs", 1) => Some(MathHelper::One(jit_abs as *const () as usize)),
@@ -1137,13 +1196,18 @@ fn math_helper_kind(name: &str, argc: usize) -> Option<MathHelper> {
         ("cos", 1) => Some(MathHelper::One(jit_cos as *const () as usize)),
         ("tan", 1) => Some(MathHelper::One(jit_tan as *const () as usize)),
         ("exp", 1) => Some(MathHelper::One(jit_exp as *const () as usize)),
-        ("log", 1) => Some(MathHelper::One(jit_log as *const () as usize)),
+        ("log" | "ln", 1) => Some(MathHelper::One(jit_log as *const () as usize)),
+        ("log10", 1) => Some(MathHelper::One(jit_log10 as *const () as usize)),
+        ("log2", 1) => Some(MathHelper::One(jit_log2 as *const () as usize)),
         ("floor", 1) => Some(MathHelper::One(jit_floor as *const () as usize)),
         ("ceil", 1) => Some(MathHelper::One(jit_ceil as *const () as usize)),
         ("round", 1) => Some(MathHelper::One(jit_round as *const () as usize)),
         ("pow", 2) => Some(MathHelper::Two(jit_pow as *const () as usize)),
         ("min", 2) => Some(MathHelper::Two(jit_min as *const () as usize)),
         ("max", 2) => Some(MathHelper::Two(jit_max as *const () as usize)),
+        ("fmod", 2) => Some(MathHelper::Two(jit_fmod as *const () as usize)),
+        ("hypot", 2) => Some(MathHelper::Two(jit_hypot as *const () as usize)),
+        ("atan2", 2) => Some(MathHelper::Two(jit_atan2 as *const () as usize)),
         _ => None,
     }
 }
@@ -1592,7 +1656,9 @@ fn compile_x86_64_code(
                         asm.emit_call_abs(*addr);
                         asm.push_xmm0(&mut depth, local_count);
                     }
-                    CallResolution::SelfCall | CallResolution::InterFn(_) => {
+                    CallResolution::SelfCall
+                    | CallResolution::InterFn(_)
+                    | CallResolution::AllocList(_) => {
                         let arg_base_depth = depth - *argc;
                         let arg_disp = ((local_count + arg_base_depth) * 8) as i32;
                         depth = arg_base_depth;
@@ -1627,6 +1693,9 @@ fn compile_x86_64_code(
                                 asm.emit_u64(slot_addr as u64);
                                 asm.code.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
                                 asm.code.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                            }
+                            CallResolution::AllocList(_) => {
+                                asm.emit_call_abs(jit_alloc_list as *const () as usize);
                             }
                             _ => unreachable!(),
                         }
@@ -1987,7 +2056,9 @@ fn compile_aarch64_code(
                         asm.emit_call_abs(*addr);
                         asm.push_d0(&mut depth, local_count)?;
                     }
-                    CallResolution::SelfCall | CallResolution::InterFn(_) => {
+                    CallResolution::SelfCall
+                    | CallResolution::InterFn(_)
+                    | CallResolution::AllocList(_) => {
                         let arg_base_depth = depth - *argc;
                         let arg_disp_bytes = ((local_count + arg_base_depth) * 8) as u32;
                         if arg_disp_bytes >= 4096 {
@@ -2015,6 +2086,9 @@ fn compile_aarch64_code(
                                 asm.emit(0xF940_0210);
                                 // BLR X16
                                 asm.emit(0xD63F_0200);
+                            }
+                            CallResolution::AllocList(_) => {
+                                asm.emit_call_abs(jit_alloc_list as *const () as usize);
                             }
                             _ => unreachable!(),
                         }
@@ -2129,7 +2203,7 @@ pub(crate) fn debug_emit_aarch64(
 }
 
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), windows))]
-fn alloc_executable(bytes: &[u8]) -> Result<ExecMem, String> {
+pub(crate) fn alloc_executable(bytes: &[u8]) -> Result<ExecMem, String> {
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_RESERVE: u32 = 0x2000;
     const PAGE_READWRITE: u32 = 0x04;
@@ -2188,7 +2262,7 @@ fn alloc_executable(bytes: &[u8]) -> Result<ExecMem, String> {
 }
 
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), unix))]
-fn alloc_executable(bytes: &[u8]) -> Result<ExecMem, String> {
+pub(crate) fn alloc_executable(bytes: &[u8]) -> Result<ExecMem, String> {
     const PROT_READ: i32 = 0x1;
     const PROT_WRITE: i32 = 0x2;
     const PROT_EXEC: i32 = 0x4;
@@ -2253,6 +2327,6 @@ fn alloc_executable(bytes: &[u8]) -> Result<ExecMem, String> {
     all(target_arch = "x86_64", any(windows, unix)),
     all(target_arch = "aarch64", any(windows, unix))
 )))]
-fn alloc_executable(_bytes: &[u8]) -> Result<ExecMem, String> {
+pub(crate) fn alloc_executable(_bytes: &[u8]) -> Result<ExecMem, String> {
     Err("native JIT requires x86_64 or aarch64 host".into())
 }

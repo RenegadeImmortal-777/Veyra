@@ -62,18 +62,40 @@ struct PreparedCall {
 
 pub(crate) struct GcStatsInner {
     pub(crate) collections: usize,
+    pub(crate) minor_collections: usize,
+    pub(crate) major_collections: usize,
+    pub(crate) promotions: usize,
+    pub(crate) write_barriers: usize,
+    pub(crate) arena_freed: usize,
     pub(crate) total_collected: usize,
     pub(crate) last_collected: usize,
     pub(crate) next_threshold: usize,
+    pub(crate) last_pause_ns: u64,
+    pub(crate) total_pause_ns: u64,
+    pub(crate) nursery: HashSet<u64>,
+    pub(crate) old_gen: HashSet<u64>,
+    pub(crate) remembered_set: HashSet<u64>,
+    pub(crate) arena_frames: Vec<HashSet<u64>>,
 }
 
 impl Default for GcStatsInner {
     fn default() -> Self {
         Self {
             collections: 0,
+            minor_collections: 0,
+            major_collections: 0,
+            promotions: 0,
+            write_barriers: 0,
+            arena_freed: 0,
             total_collected: 0,
             last_collected: 0,
             next_threshold: 4096,
+            last_pause_ns: 0,
+            total_pause_ns: 0,
+            nursery: HashSet::new(),
+            old_gen: HashSet::new(),
+            remembered_set: HashSet::new(),
+            arena_frames: Vec::new(),
         }
     }
 }
@@ -1154,6 +1176,12 @@ impl Vm {
                     fields,
                 },
             );
+        if let Ok(mut st) = self.gc.inner.lock() {
+            st.nursery.insert(id);
+            if let Some(frame) = st.arena_frames.last_mut() {
+                frame.insert(id);
+            }
+        }
         self.gc.allocs_since_gc.fetch_add(1, Ordering::Relaxed);
         Ok(Val::Object(id))
     }
@@ -2052,9 +2080,20 @@ impl Vm {
                 }
             }
         }
-        let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-        let data = heap.get_mut(&id).ok_or("dangling object")?;
-        data.fields.insert(name, value);
+        let has_ref = Self::val_contains_heap_ref(&value);
+        {
+            let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+            let data = heap.get_mut(&id).ok_or("dangling object")?;
+            data.fields.insert(name, value);
+        }
+        // Generational write barrier: record old -> child mutations for minor GC scans.
+        if has_ref
+            && let Ok(mut st) = self.gc.inner.lock()
+            && st.old_gen.contains(&id)
+        {
+            st.remembered_set.insert(id);
+            st.write_barriers += 1;
+        }
         Ok(())
     }
     pub(crate) fn vm_del_attr(&mut self, obj: &Val, name: &str) -> Result<(), String> {
@@ -2773,7 +2812,127 @@ impl Vm {
         }
     }
 
+    fn val_contains_heap_ref(val: &Val) -> bool {
+        let mut stack = vec![val];
+        while let Some(cur) = stack.pop() {
+            match cur {
+                Val::Object(_) | Val::Function(_) | Val::Generator(_) => return true,
+                Val::List(xs) => stack.extend(xs.iter()),
+                Val::Map(pairs) => {
+                    for (k, v) in pairs {
+                        stack.push(k);
+                        stack.push(v);
+                    }
+                }
+                Val::Num(_) | Val::Str(_) | Val::Bool(_) | Val::Null => {}
+            }
+        }
+        false
+    }
+
+    fn seed_class_object_roots(&self, visited: &mut HashSet<u64>, work_objs: &mut Vec<u64>) {
+        if let Ok(class_objs) = self.class_objects.lock() {
+            for &id in class_objs.values() {
+                if visited.insert(id) {
+                    work_objs.push(id);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trace_gc_worklist(
+        &self,
+        should_expand_obj: &impl Fn(u64) -> bool,
+        visited: &mut HashSet<u64>,
+        work_objs: &mut Vec<u64>,
+        seen_funcs: &mut HashSet<String>,
+        pending_funcs: &mut Vec<String>,
+        seen_gens: &mut HashSet<u64>,
+        pending_gens: &mut Vec<u64>,
+    ) -> Result<(), String> {
+        while !work_objs.is_empty() || !pending_funcs.is_empty() || !pending_gens.is_empty() {
+            while let Some(fname) = pending_funcs.pop() {
+                let def_opt = self
+                    .funcs
+                    .get(&fname)
+                    .cloned()
+                    .or_else(|| resolve_function_object(&fname).ok().flatten());
+                if let Some(def) = def_opt {
+                    for v in def.captures.values() {
+                        Self::collect_val_gc_refs(
+                            v,
+                            visited,
+                            work_objs,
+                            seen_funcs,
+                            pending_funcs,
+                            seen_gens,
+                            pending_gens,
+                        );
+                    }
+                    for cell in def.upvalues.values() {
+                        if let Ok(guard) = cell.lock() {
+                            Self::collect_val_gc_refs(
+                                &guard,
+                                visited,
+                                work_objs,
+                                seen_funcs,
+                                pending_funcs,
+                                seen_gens,
+                                pending_gens,
+                            );
+                        }
+                    }
+                }
+            }
+            while let Some(gid) = pending_gens.pop() {
+                if let Ok(gens) = generators().lock()
+                    && let Some(gvm) = gens.get(&gid)
+                    && Arc::ptr_eq(&gvm.objects, &self.objects)
+                {
+                    Self::seed_vm_gc_roots(
+                        gvm,
+                        visited,
+                        work_objs,
+                        seen_funcs,
+                        pending_funcs,
+                        seen_gens,
+                        pending_gens,
+                    );
+                }
+            }
+            if !work_objs.is_empty() {
+                let batch = std::mem::take(work_objs);
+                let field_vals: Vec<Val> = {
+                    let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                    let mut out = Vec::new();
+                    for oid in batch {
+                        if should_expand_obj(oid)
+                            && let Some(obj) = heap.get(&oid)
+                        {
+                            out.extend(obj.fields.values().cloned());
+                        }
+                    }
+                    out
+                };
+                for fv in &field_vals {
+                    Self::collect_val_gc_refs(
+                        fv,
+                        visited,
+                        work_objs,
+                        seen_funcs,
+                        pending_funcs,
+                        seen_gens,
+                        pending_gens,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_mark_sweep_objects(&self) -> Result<(usize, usize), String> {
+        let t0 = std::time::Instant::now();
         let mut visited: HashSet<u64> = HashSet::new();
         let mut work_objs: Vec<u64> = Vec::new();
         let mut seen_funcs: HashSet<String> = HashSet::new();
@@ -2790,89 +2949,16 @@ impl Vm {
             &mut seen_gens,
             &mut pending_gens,
         );
-        if let Ok(class_objs) = self.class_objects.lock() {
-            for &id in class_objs.values() {
-                if visited.insert(id) {
-                    work_objs.push(id);
-                }
-            }
-        }
-
-        while !work_objs.is_empty() || !pending_funcs.is_empty() || !pending_gens.is_empty() {
-            while let Some(fname) = pending_funcs.pop() {
-                let def_opt = self
-                    .funcs
-                    .get(&fname)
-                    .cloned()
-                    .or_else(|| resolve_function_object(&fname).ok().flatten());
-                if let Some(def) = def_opt {
-                    for v in def.captures.values() {
-                        Self::collect_val_gc_refs(
-                            v,
-                            &mut visited,
-                            &mut work_objs,
-                            &mut seen_funcs,
-                            &mut pending_funcs,
-                            &mut seen_gens,
-                            &mut pending_gens,
-                        );
-                    }
-                    for cell in def.upvalues.values() {
-                        if let Ok(guard) = cell.lock() {
-                            Self::collect_val_gc_refs(
-                                &guard,
-                                &mut visited,
-                                &mut work_objs,
-                                &mut seen_funcs,
-                                &mut pending_funcs,
-                                &mut seen_gens,
-                                &mut pending_gens,
-                            );
-                        }
-                    }
-                }
-            }
-            while let Some(gid) = pending_gens.pop() {
-                if let Ok(gens) = generators().lock()
-                    && let Some(gvm) = gens.get(&gid)
-                    && Arc::ptr_eq(&gvm.objects, &self.objects)
-                {
-                    Self::seed_vm_gc_roots(
-                        gvm,
-                        &mut visited,
-                        &mut work_objs,
-                        &mut seen_funcs,
-                        &mut pending_funcs,
-                        &mut seen_gens,
-                        &mut pending_gens,
-                    );
-                }
-            }
-            if !work_objs.is_empty() {
-                let batch = std::mem::take(&mut work_objs);
-                let field_vals: Vec<Val> = {
-                    let heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
-                    let mut out = Vec::new();
-                    for oid in batch {
-                        if let Some(obj) = heap.get(&oid) {
-                            out.extend(obj.fields.values().cloned());
-                        }
-                    }
-                    out
-                };
-                for fv in &field_vals {
-                    Self::collect_val_gc_refs(
-                        fv,
-                        &mut visited,
-                        &mut work_objs,
-                        &mut seen_funcs,
-                        &mut pending_funcs,
-                        &mut seen_gens,
-                        &mut pending_gens,
-                    );
-                }
-            }
-        }
+        self.seed_class_object_roots(&mut visited, &mut work_objs);
+        self.trace_gc_worklist(
+            &|_| true,
+            &mut visited,
+            &mut work_objs,
+            &mut seen_funcs,
+            &mut pending_funcs,
+            &mut seen_gens,
+            &mut pending_gens,
+        )?;
 
         let (collected, live) = {
             let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
@@ -2881,13 +2967,115 @@ impl Vm {
             let after = heap.len();
             (before.saturating_sub(after), after)
         };
+        let elapsed_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
 
         self.gc.allocs_since_gc.store(0, Ordering::Relaxed);
         if let Ok(mut st) = self.gc.inner.lock() {
+            let promoted = st.nursery.iter().filter(|id| visited.contains(id)).count();
+            st.promotions += promoted;
+            st.nursery.clear();
+            st.old_gen = visited;
+            st.remembered_set.clear();
             st.collections += 1;
+            st.major_collections += 1;
             st.last_collected = collected;
             st.total_collected += collected;
+            st.last_pause_ns = elapsed_ns;
+            st.total_pause_ns = st.total_pause_ns.saturating_add(elapsed_ns);
             st.next_threshold = (live.saturating_mul(2)).max(4096);
+        }
+        Ok((collected, live))
+    }
+
+    fn run_minor_gc(&self) -> Result<(usize, usize), String> {
+        let t0 = std::time::Instant::now();
+        let (nursery_snapshot, remembered_snapshot) = {
+            let st = self.gc.inner.lock().map_err(|_| "gc state poisoned")?;
+            (st.nursery.clone(), st.remembered_set.clone())
+        };
+        if nursery_snapshot.is_empty() {
+            let live = self
+                .objects
+                .lock()
+                .map_err(|_| "object heap poisoned")?
+                .len();
+            let elapsed_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            self.gc.allocs_since_gc.store(0, Ordering::Relaxed);
+            if let Ok(mut st) = self.gc.inner.lock() {
+                st.remembered_set.clear();
+                st.collections += 1;
+                st.minor_collections += 1;
+                st.last_collected = 0;
+                st.last_pause_ns = elapsed_ns;
+                st.total_pause_ns = st.total_pause_ns.saturating_add(elapsed_ns);
+            }
+            return Ok((0, live));
+        }
+
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut work_objs: Vec<u64> = Vec::new();
+        let mut seen_funcs: HashSet<String> = HashSet::new();
+        let mut pending_funcs: Vec<String> = Vec::new();
+        let mut seen_gens: HashSet<u64> = HashSet::new();
+        let mut pending_gens: Vec<u64> = Vec::new();
+
+        Self::seed_vm_gc_roots(
+            self,
+            &mut visited,
+            &mut work_objs,
+            &mut seen_funcs,
+            &mut pending_funcs,
+            &mut seen_gens,
+            &mut pending_gens,
+        );
+        self.seed_class_object_roots(&mut visited, &mut work_objs);
+        for &rem_id in &remembered_snapshot {
+            if visited.insert(rem_id) {
+                work_objs.push(rem_id);
+            }
+        }
+        self.trace_gc_worklist(
+            &|oid| nursery_snapshot.contains(&oid) || remembered_snapshot.contains(&oid),
+            &mut visited,
+            &mut work_objs,
+            &mut seen_funcs,
+            &mut pending_funcs,
+            &mut seen_gens,
+            &mut pending_gens,
+        )?;
+
+        let (collected, live, promoted) = {
+            let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+            let mut removed = 0usize;
+            for &nid in &nursery_snapshot {
+                if !visited.contains(&nid) && heap.remove(&nid).is_some() {
+                    removed += 1;
+                }
+            }
+            let promoted_count = nursery_snapshot
+                .iter()
+                .filter(|nid| visited.contains(nid) && heap.contains_key(nid))
+                .count();
+            (removed, heap.len(), promoted_count)
+        };
+        let elapsed_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+
+        self.gc.allocs_since_gc.store(0, Ordering::Relaxed);
+        if let Ok(mut st) = self.gc.inner.lock() {
+            for &nid in &nursery_snapshot {
+                st.nursery.remove(&nid);
+                if visited.contains(&nid) {
+                    st.old_gen.insert(nid);
+                }
+            }
+            st.remembered_set.clear();
+            st.collections += 1;
+            st.minor_collections += 1;
+            st.promotions += promoted;
+            st.last_collected = collected;
+            st.total_collected += collected;
+            st.last_pause_ns = elapsed_ns;
+            st.total_pause_ns = st.total_pause_ns.saturating_add(elapsed_ns);
         }
         Ok((collected, live))
     }
@@ -2908,36 +3096,101 @@ impl Vm {
             .unwrap_or(4096);
         let heap_len = self.objects.lock().map(|h| h.len()).unwrap_or(0);
         if heap_len >= threshold || allocs >= threshold {
-            let _ = self.run_mark_sweep_objects()?;
+            let (_, post_minor_live) = self.run_minor_gc()?;
+            if post_minor_live >= threshold {
+                let _ = self.run_mark_sweep_objects()?;
+            }
             let _ = self.gc_tensors()?;
         }
         Ok(())
     }
 
-    pub(crate) fn gc_collect(&self) -> Result<Val, String> {
-        let (collected, live) = self.run_mark_sweep_objects()?;
-        let tensors_collected = self.gc_tensors()?;
-        let (collections, total_collected) = self
-            .gc
-            .inner
-            .lock()
-            .map(|s| (s.collections, s.total_collected))
-            .unwrap_or((1, collected));
-        let paused = self.gc.paused.load(Ordering::Relaxed);
-        Ok(Val::Map(vec![
-            (Val::Str("collected".into()), Val::Num(collected as f64)),
+    fn gc_metrics_pairs(st: &GcStatsInner, live: usize, paused: bool) -> Vec<(Val, Val)> {
+        vec![
             (Val::Str("live_objects".into()), Val::Num(live as f64)),
+            (
+                Val::Str("collections".into()),
+                Val::Num(st.collections as f64),
+            ),
+            (
+                Val::Str("minor_collections".into()),
+                Val::Num(st.minor_collections as f64),
+            ),
+            (
+                Val::Str("major_collections".into()),
+                Val::Num(st.major_collections as f64),
+            ),
+            (
+                Val::Str("promotions".into()),
+                Val::Num(st.promotions as f64),
+            ),
+            (
+                Val::Str("write_barriers".into()),
+                Val::Num(st.write_barriers as f64),
+            ),
+            (
+                Val::Str("nursery_objects".into()),
+                Val::Num(st.nursery.len() as f64),
+            ),
+            (
+                Val::Str("old_objects".into()),
+                Val::Num(st.old_gen.len() as f64),
+            ),
+            (
+                Val::Str("remembered_set".into()),
+                Val::Num(st.remembered_set.len() as f64),
+            ),
+            (
+                Val::Str("arena_freed".into()),
+                Val::Num(st.arena_freed as f64),
+            ),
+            (
+                Val::Str("last_collected".into()),
+                Val::Num(st.last_collected as f64),
+            ),
+            (
+                Val::Str("total_collected".into()),
+                Val::Num(st.total_collected as f64),
+            ),
+            (
+                Val::Str("last_pause_ns".into()),
+                Val::Num(st.last_pause_ns as f64),
+            ),
+            (
+                Val::Str("total_pause_ns".into()),
+                Val::Num(st.total_pause_ns as f64),
+            ),
+            (Val::Str("paused".into()), Val::Bool(paused)),
+        ]
+    }
+
+    pub(crate) fn gc_collect(&self) -> Result<Val, String> {
+        self.gc_collect_mode(None)
+    }
+
+    pub(crate) fn gc_collect_mode(&self, mode: Option<&str>) -> Result<Val, String> {
+        let mode_norm = mode.unwrap_or("major");
+        let ((collected, live), tensors_collected) = match mode_norm {
+            "minor" | "young" => (self.run_minor_gc()?, 0),
+            "major" | "full" => (self.run_mark_sweep_objects()?, self.gc_tensors()?),
+            other => {
+                return Err(format!(
+                    "unknown gc mode '{other}'; expected 'minor' or 'major'"
+                ));
+            }
+        };
+        let paused = self.gc.paused.load(Ordering::Relaxed);
+        let st = self.gc.inner.lock().map_err(|_| "gc state poisoned")?;
+        let mut pairs = vec![
+            (Val::Str("mode".into()), Val::Str(mode_norm.into())),
+            (Val::Str("collected".into()), Val::Num(collected as f64)),
             (
                 Val::Str("tensors_collected".into()),
                 Val::Num(tensors_collected as f64),
             ),
-            (Val::Str("collections".into()), Val::Num(collections as f64)),
-            (
-                Val::Str("total_collected".into()),
-                Val::Num(total_collected as f64),
-            ),
-            (Val::Str("paused".into()), Val::Bool(paused)),
-        ]))
+        ];
+        pairs.extend(Self::gc_metrics_pairs(&st, live, paused));
+        Ok(Val::Map(pairs))
     }
 
     pub(crate) fn gc_stats(&self) -> Result<Val, String> {
@@ -2948,22 +3201,80 @@ impl Vm {
             .len();
         let paused = self.gc.paused.load(Ordering::Relaxed);
         let st = self.gc.inner.lock().map_err(|_| "gc state poisoned")?;
-        Ok(Val::Map(vec![
-            (Val::Str("live_objects".into()), Val::Num(live as f64)),
-            (
-                Val::Str("collections".into()),
-                Val::Num(st.collections as f64),
-            ),
-            (
-                Val::Str("total_collected".into()),
-                Val::Num(st.total_collected as f64),
-            ),
-            (
-                Val::Str("last_collected".into()),
-                Val::Num(st.last_collected as f64),
-            ),
-            (Val::Str("paused".into()), Val::Bool(paused)),
-        ]))
+        Ok(Val::Map(Self::gc_metrics_pairs(&st, live, paused)))
+    }
+
+    pub(crate) fn arena_scope(&mut self, callee: Val) -> Result<Val, String> {
+        {
+            let mut st = self.gc.inner.lock().map_err(|_| "gc state poisoned")?;
+            st.arena_frames.push(HashSet::new());
+        }
+        let res = self.invoke_callable_sync(&callee, Vec::new());
+        let arena_ids = {
+            let mut st = self.gc.inner.lock().map_err(|_| "gc state poisoned")?;
+            st.arena_frames.pop().unwrap_or_default()
+        };
+        let out = res?;
+        if !arena_ids.is_empty() {
+            let mut visited: HashSet<u64> = HashSet::new();
+            let mut work_objs: Vec<u64> = Vec::new();
+            let mut seen_funcs: HashSet<String> = HashSet::new();
+            let mut pending_funcs: Vec<String> = Vec::new();
+            let mut seen_gens: HashSet<u64> = HashSet::new();
+            let mut pending_gens: Vec<u64> = Vec::new();
+
+            Self::collect_val_gc_refs(
+                &out,
+                &mut visited,
+                &mut work_objs,
+                &mut seen_funcs,
+                &mut pending_funcs,
+                &mut seen_gens,
+                &mut pending_gens,
+            );
+            Self::seed_vm_gc_roots(
+                self,
+                &mut visited,
+                &mut work_objs,
+                &mut seen_funcs,
+                &mut pending_funcs,
+                &mut seen_gens,
+                &mut pending_gens,
+            );
+            self.seed_class_object_roots(&mut visited, &mut work_objs);
+            self.trace_gc_worklist(
+                &|_| true,
+                &mut visited,
+                &mut work_objs,
+                &mut seen_funcs,
+                &mut pending_funcs,
+                &mut seen_gens,
+                &mut pending_gens,
+            )?;
+
+            let mut freed = 0usize;
+            {
+                let mut heap = self.objects.lock().map_err(|_| "object heap poisoned")?;
+                for &aid in &arena_ids {
+                    if !visited.contains(&aid) && heap.remove(&aid).is_some() {
+                        freed += 1;
+                    }
+                }
+            }
+            if let Ok(mut st) = self.gc.inner.lock() {
+                for &aid in &arena_ids {
+                    if !visited.contains(&aid) {
+                        st.nursery.remove(&aid);
+                        st.old_gen.remove(&aid);
+                        st.remembered_set.remove(&aid);
+                    } else if let Some(parent) = st.arena_frames.last_mut() {
+                        parent.insert(aid);
+                    }
+                }
+                st.arena_freed += freed;
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn gc_set_paused(&self, paused: bool) -> Val {

@@ -9,11 +9,11 @@ Veyra is a native-first general-purpose language and application platform with i
 - decorators, `with`/`as`, `try`/`catch`/`finally`
 - async functions, `gather`, tasks, channels, task status and timeout-aware waits
 - module objects via `import_package()`
-- C ABI FFI + pure-Rust C header bindgen (`veyra ffi bindgen <header.h> <lib_path>`) + in-process CPython C-API (`python3xx.dll`/`libpython3`) + PEP 3118 & PyCapsule DLPack (`tensor_to_dlpack` / `py_from_dlpack`) zero-copy tensor interop + `veyra pkg py-bridge`
-- first-class `requires` / `ensures` contracts and static transitive `@pure` / `@effect(...)` verification
-- standalone WebAssembly emitter/disassembler/VM (`veyra wasm`), direct zero-toolchain PE32+/ELF64 emission (`veyra aot --direct`), and multi-arch x86_64/aarch64 native JIT (`Op::SetIndex` + `NumList` returns)
-- single-pass fused SPIR-V & HLSL GPU pipelines (`gpu_fuse`, `gpu_fuse_inspect`), mark-sweep object GC (`gc_collect`, `gc_stats`, `gc_pause`, `gc_resume`), deterministic simulation (`sim_start`..`sim_log`), and supervised actors (`actor_spawn`..`actor_status`)
-- capability sandboxing (`veyra run --caps`, `cap_current`, `cap_restrict`, `veyra audit`), reproducible `.vypkg.json` bundles, reversible time-travel DAP (`stepBack`, `reverseContinue`), and persistent reactive notebook server (`veyra notebook`)
+- C ABI FFI + pure-Rust C header `struct`/`enum`/`#define` bindgen (`veyra ffi bindgen <header.h> <lib_path>`) + dynamic multi-arg x86_64 C-ABI calls + bounded `mem_*` buffers + in-process CPython C-API + PEP 3118 & strided PyCapsule DLPack (`tensor_to_dlpack` / `py_from_dlpack`) zero-copy tensor interop
+- IR SSA / algebraic / DCE optimizer (`ir_stats`), first-class `requires` / `ensures` contracts, transitive `@pure` / `@effect(...)`, formal `@secret` / `sanitize(...)` taint flow, `@linear` / `linear_consume(...)` ownership, and `@verify` interval bounds checking
+- standalone WebAssembly/WASI emitter with linear-memory strings & arrays (`veyra wasm`), direct zero-toolchain PE32+/ELF64 emission with strings & arrays (`veyra aot --direct`), and multi-arch x86_64/aarch64 native JIT (dynamic `[..]` lists, `Op::SetIndex`, `log2`/`hypot`/`fmod`/`atan2`)
+- rich `gpu_devices` inspection, extended single-pass fused SPIR-V & HLSL GPU pipelines (`gpu_fuse`, `gpu_fused_linear`), 2-generation nursery/old-gen GC with write barriers & `arena_scope(fn)`, virtual-clock actor clusters (`sim_actor_*`, `sim_partition`, `sim_trace`), and OTP supervision trees (`supervisor_spawn` with `one_for_one`/`one_for_all`/`rest_for_one`)
+- capability sandboxing (`veyra run --caps`, `cap_current`, `cap_restrict`, `veyra audit`), reproducible `.vypkg.json` bundles, reversible time-travel DAP with forward/reverse data watchpoints (`stepBack`, `reverseContinue`, `setDataBreakpoints`), and reactive topological DAG notebooks (`veyra notebook`, `/api/notebook/dag`, `/api/notebook/export`)
 - dynamic web applications with request headers and arbitrary response headers
 - parameterized SQLite and ORM/query-building foundations
 - dataframe/statistics/plotting/ETL foundations

@@ -40,7 +40,7 @@ Last full gate run: **2026-11-14**. Every gate passed (**8/8**).
 | Gate | Result |
 |---|---|
 | `cargo fmt --check` | PASS |
-| `cargo test` | PASS — 112 passed, 0 failed |
+| `cargo test` | PASS — 123 passed, 0 failed |
 | `cargo check --no-default-features` | PASS |
 | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | `cargo build --release` | PASS |
@@ -53,37 +53,49 @@ and per-gate exit codes are written to `gate-report.txt`.
 
 The engine source is modularized under `engine-rs/src/`:
 - `main.rs` is a 5-line binary entry point calling `veyra::run_cli()` in `lib.rs`.
+- `ir.rs` & `pipeline.rs` provide the SSA propagation / algebraic simplification / DCE optimizer
+  (`optimize_bytecode`, `ir_stats`), transitive `@pure`/`@effect(...)` checking, formal `@secret`/
+  `sanitize(...)` taint-flow verification, `@linear`/`linear_consume(...)` ownership analysis, and
+  `@verify` static interval/bounds proving.
 - `vm.rs` implements the flat `CallFrame` execution stack, indexed local variable
   slots (`LoadLocal`/`DefineLocal`/`StoreLocal`), loop/indexing superinstructions, shared
-  method cache, mark-sweep cycle-collecting object GC (`gc_collect`, `gc_stats`,
-  `gc_pause`, `gc_resume`), automatic hot-function promotion into `jit.rs`, and
-  `Arc<Mutex<Val>>` closure upvalue cell management, while built-in operations live in
+  method cache, 2-generation nursery/old-gen cycle-collecting object GC with remembered-set
+  write barriers (`gc_collect("minor"|"major")`, `gc_stats`, `gc_pause`, `gc_resume`) and
+  deterministic LIFO `arena_scope(fn)` temporary arenas, automatic hot-function promotion
+  into `jit.rs`, and `Arc<Mutex<Val>>` closure upvalue cell management, while built-in operations live in
   `engine-rs/src/builtins/{mod,core_collections,math_text_fs,science_ml,data_gui,sys_net_conc_ffi}.rs`.
 - `jit.rs` provides Veyra's in-memory **multi-architecture x86_64 & aarch64 native machine-code JIT compiler**
   (`W^X` executable allocation, CFG type/stack verification, self-recursion `call rel32`, inter-function calls,
-  list indexing/slicing, `Op::SetIndex` list mutation and `NumList` returns, libm helpers, and `jit_*` builtins).
+  dynamic `[..]` list allocation via `jit_alloc_list`, list indexing/slicing, `Op::SetIndex` list mutation and
+  `NumList` returns, and extended math helpers including `log2`, `hypot`, `fmod`, `atan2`).
 - `gpu.rs` and `spirv.rs` provide Veyra's **universal Vulkan SPIR-V & Direct3D 11 (`cs_5_0` HLSL) `f64`/`f32` GPU compute
   backend** (`vulkan-1.dll`/`libvulkan.so.1`, `dxgi.dll`, `d3d11.dll`, `d3dcompiler_47.dll` with multi-threaded
-  CPU fallback), single-pass fused elementwise kernel generation (`gpu_fuse`, `gpu_fuse_inspect`), custom HLSL
-  (`gpu_run_hlsl`), and `tensor_to(t, "gpu")` device execution.
+  CPU fallback), rich adapter discovery (`gpu_devices`), single-pass fused elementwise kernel generation
+  (`gpu_fuse`, `gpu_fuse_inspect` including `div`, `silu`, `clamp`, `pow_scalar`, `recip`), fused GEMM+bias+activation
+  (`gpu_fused_linear`), custom HLSL (`gpu_run_hlsl`), and `tensor_to(t, "gpu")` device execution.
 - `native_codegen.rs` and `aot.rs` implement standalone WebAssembly (`.wasm`) compilation/disassembly/execution
-  (`veyra wasm [file.vy] [-o out.wasm] [--disasm] [--run <fn> [args...]]`, `wasm_compile`/`wasm_disasm`/`wasm_run`),
-  direct zero-toolchain PE32+/ELF64 binary emission (`veyra aot [--direct] [--elf|--pe]`), and full-parity
-  `rustc`-compiled AOT builds (`veyra aot`, `veyra build --native`).
+  with WASI linear-memory strings & arrays (`veyra wasm [file.vy] [-o out.wasm] [--disasm] [--run <fn> [args...]]`,
+  `wasm_compile`/`wasm_disasm`/`wasm_run`), direct zero-toolchain PE32+/ELF64 binary emission including
+  strings & arrays (`veyra aot [--direct] [--elf|--pe]`), and full-parity `rustc`-compiled AOT builds (`veyra aot`, `veyra build --native`).
 - `plugin.rs` and `registry.rs` implement Veyra's `veyra_plugin_v1` native `cdylib`
-  extension ABI, pure-Rust C header FFI bindgen (`veyra ffi bindgen <header.h> <lib_path> [-o out.vy]`,
-  `ffi_bindgen`, capability-gated `ffi_call`), HMAC-SHA256 package signing (`keygen`/`sign`/`verify`),
-  reproducible `.vypkg.json` bundles (`pack`/`unpack`), scoped `@org/pkg` + semver constraints, `veyra.lock` format 3,
+  extension ABI, pure-Rust C header FFI bindgen with `struct`/`enum`/`#define` layout lowering,
+  dynamic multi-arg x86_64 C-ABI trampoline (`ffi_call`), and bounded linear heap buffers (`mem_*`),
+  HMAC-SHA256 package signing (`keygen`/`sign`/`verify`), reproducible `.vypkg.json` bundles
+  (`pack`/`unpack`), scoped `@org/pkg` + semver constraints, `veyra.lock` format 3,
   federated registries (`VEYRA_REGISTRY_URLS`) with offline cache (`VEYRA_OFFLINE=1`), monorepo
   `"workspaces"`, `veyra pkg py-bridge`, and HTTP registry publishing/serving (`veyra pkg serve`, `POST /publish`).
 - `py_bridge.rs` provides in-process CPython C-API bindings (`python3xx.dll`/`libpython3`, zero-copy PEP 3118
-  buffer `py_to_tensor`, and PyCapsule DLPack `DLManagedTensor` / `DLManagedTensorVersioned` interop via
-  `tensor_to_dlpack` / `py_from_dlpack`) with subprocess fallback across VM and native AOT binaries.
-- `sim_actor.rs` implements deterministic simulation (`sim_start`/`sim_stop`/`sim_now`/`sim_advance`/`sim_rand`/
-  `sim_fault`/`sim_log`) and message-passing supervised actors (`actor_spawn`/`actor_send`/`actor_ask`/`actor_stop`/
-  `actor_status`).
-- `dap.rs`, `lsp.rs`, and `server.rs` implement the time-travel reversible DAP server (`stepBack`/`reverseContinue`),
-  the LSP server, and the stateful reactive notebook server (`veyra notebook [dir] [port]`).
+  buffer `py_to_tensor`, and PyCapsule DLPack `DLManagedTensor` / `DLManagedTensorVersioned` contiguous +
+  strided/non-contiguous interop via `tensor_to_dlpack` / `py_from_dlpack`) with subprocess fallback across VM and native AOT binaries.
+- `sim_actor.rs` implements SplitMix64 deterministic simulation and virtual-clock actor clusters
+  (`sim_start`/`sim_stop`/`sim_now`/`sim_advance`/`sim_rand`/`sim_fault`/`sim_log`, `sim_actor_spawn`,
+  `sim_actor_send`, `sim_step`, `sim_run_until`, `sim_partition`, `sim_actor_state`, `sim_trace`) and
+  OTP-style supervised actors (`actor_spawn`/`actor_send`/`actor_ask`/`actor_stop`/`actor_status`/
+  `actor_mailbox_len`, `supervisor_spawn` with `"one_for_one"`, `"one_for_all"`, `"rest_for_one"`, and `supervisor_status`).
+- `dap.rs`, `lsp.rs`, and `server.rs` implement the time-travel reversible DAP server with forward & reverse
+  data watchpoints (`stepBack`, `reverseContinue`, `dataBreakpointInfo`, `setDataBreakpoints`),
+  the LSP server, and the AST dependency-driven reactive topological DAG notebook server (`veyra notebook [dir] [port]`,
+  cycle detection, `GET /api/notebook/dag`, `GET /api/notebook/export`).
 - See [docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md) and [WAY_FORWARD.md](WAY_FORWARD.md)
   for the full architectural map.
 

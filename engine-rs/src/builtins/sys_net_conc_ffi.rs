@@ -1066,13 +1066,18 @@ impl Vm {
                 crate::runtime::run_with_caps(caps, || self.invoke_callable_sync(&callee, vec![]))?
             }
             "wasm_compile" => {
-                if a.len() != 1 {
-                    return Err("wasm_compile expects (source_string)".into());
+                if a.is_empty() || a.len() > 2 {
+                    return Err("wasm_compile expects (source_string[, wasi])".into());
                 }
                 let Val::Str(src) = &a[0] else {
                     return Err("wasm_compile source must be String".into());
                 };
-                let bytes = crate::native_codegen::compile_source_to_wasm(src)?;
+                let wasi = match a.get(1) {
+                    None => false,
+                    Some(Val::Bool(b)) => *b,
+                    Some(_) => return Err("wasm_compile wasi flag must be Bool".into()),
+                };
+                let bytes = crate::native_codegen::compile_source_to_wasm_with_opts(src, wasi)?;
                 Val::List(bytes.into_iter().map(|b| Val::Num(f64::from(b))).collect())
             }
             "wasm_disasm" => {
@@ -1123,10 +1128,22 @@ impl Vm {
                 crate::plugin::get_loaded_plugin(pid)?.call(fname, xs)?
             }
             "gc_collect" => {
-                if !a.is_empty() {
-                    return Err("gc_collect expects 0 arguments".into());
+                if a.len() > 1 {
+                    return Err("gc_collect expects ([mode])".into());
                 }
-                self.gc_collect()?
+                match a.first() {
+                    None | Some(Val::Null) => self.gc_collect()?,
+                    Some(Val::Str(mode)) => self.gc_collect_mode(Some(mode))?,
+                    Some(_) => {
+                        return Err("gc_collect mode must be String ('minor' or 'major')".into());
+                    }
+                }
+            }
+            "arena_scope" => {
+                if a.len() != 1 {
+                    return Err("arena_scope expects (callable)".into());
+                }
+                self.arena_scope(a[0].clone())?
             }
             "gc_stats" => {
                 if !a.is_empty() {
@@ -1209,6 +1226,108 @@ impl Vm {
                     crate::sim_actor::sim_log_append(a[0].clone())?
                 }
             }
+            "sim_actor_spawn" => match a.len() {
+                1 => crate::sim_actor::sim_actor_spawn(self, None, a[0].clone(), None)?,
+                2 => {
+                    if let Val::Str(ref name) = a[0] {
+                        crate::sim_actor::sim_actor_spawn(self, Some(name), a[1].clone(), None)?
+                    } else {
+                        crate::sim_actor::sim_actor_spawn(self, None, a[0].clone(), Some(&a[1]))?
+                    }
+                }
+                3 => {
+                    let Val::Str(ref name) = a[0] else {
+                        return Err("sim_actor_spawn first argument must be String name".into());
+                    };
+                    crate::sim_actor::sim_actor_spawn(self, Some(name), a[1].clone(), Some(&a[2]))?
+                }
+                _ => {
+                    return Err(
+                        "sim_actor_spawn expects ([name,] handler[, options_or_init])".into(),
+                    );
+                }
+            },
+            "sim_actor_send" => match a.len() {
+                2 => {
+                    let Val::Str(ref to) = a[0] else {
+                        return Err("sim_actor_send target must be String name".into());
+                    };
+                    crate::sim_actor::sim_actor_send("__host__", to, a[1].clone(), 1)?
+                }
+                3 => {
+                    let (Val::Str(from), Val::Str(to)) = (&a[0], &a[1]) else {
+                        return Err(
+                            "sim_actor_send (from, to, payload) expects String actor names".into(),
+                        );
+                    };
+                    crate::sim_actor::sim_actor_send(from, to, a[2].clone(), 1)?
+                }
+                4 => {
+                    let (Val::Str(from), Val::Str(to), Val::Num(delay)) = (&a[0], &a[1], &a[3])
+                    else {
+                        return Err(
+                            "sim_actor_send expects (from, to, payload[, delay_ticks])".into()
+                        );
+                    };
+                    if !delay.is_finite() || *delay < 0.0 {
+                        return Err("sim_actor_send delay_ticks must be non-negative Number".into());
+                    }
+                    crate::sim_actor::sim_actor_send(from, to, a[2].clone(), *delay as u64)?
+                }
+                _ => {
+                    return Err(
+                        "sim_actor_send expects ([from,] to, payload[, delay_ticks])".into(),
+                    );
+                }
+            },
+            "sim_step" => {
+                if !a.is_empty() {
+                    return Err("sim_step expects 0 arguments".into());
+                }
+                crate::sim_actor::sim_step()?
+            }
+            "sim_run_until" => {
+                if a.len() > 1 {
+                    return Err("sim_run_until expects ([until_tick])".into());
+                }
+                let until = match a.first() {
+                    None | Some(Val::Null) => None,
+                    Some(Val::Num(n)) if n.is_finite() && *n >= 0.0 => Some(*n as u64),
+                    Some(_) => {
+                        return Err("sim_run_until until_tick must be non-negative Number".into());
+                    }
+                };
+                crate::sim_actor::sim_run_until(until)?
+            }
+            "sim_partition" => {
+                if a.len() < 2 || a.len() > 3 {
+                    return Err("sim_partition expects (actor_a, actor_b[, drop_prob])".into());
+                }
+                let (Val::Str(a_name), Val::Str(b_name)) = (&a[0], &a[1]) else {
+                    return Err("sim_partition actor names must be String".into());
+                };
+                let prob = match a.get(2) {
+                    None | Some(Val::Null) => 1.0,
+                    Some(Val::Num(p)) => *p,
+                    Some(_) => return Err("sim_partition drop_prob must be Number".into()),
+                };
+                crate::sim_actor::sim_partition(a_name, b_name, prob)?
+            }
+            "sim_actor_state" => {
+                if a.len() != 1 {
+                    return Err("sim_actor_state expects (actor_name)".into());
+                }
+                let Val::Str(ref name) = a[0] else {
+                    return Err("sim_actor_state name must be String".into());
+                };
+                crate::sim_actor::sim_actor_state(name)?
+            }
+            "sim_trace" => {
+                if !a.is_empty() {
+                    return Err("sim_trace expects 0 arguments".into());
+                }
+                crate::sim_actor::sim_trace()?
+            }
             "actor_spawn" => {
                 if a.is_empty() || a.len() > 2 {
                     return Err("actor_spawn expects (handler[, options_map])".into());
@@ -1264,6 +1383,44 @@ impl Vm {
                 };
                 crate::sim_actor::actor_status(id as u64)?
             }
+            "actor_mailbox_len" => {
+                if a.len() != 1 {
+                    return Err("actor_mailbox_len expects (actor_id)".into());
+                }
+                let Val::Num(id) = a[0] else {
+                    return Err("actor_mailbox_len id must be Number".into());
+                };
+                if !id.is_finite() || id < 0.0 {
+                    return Err("actor_mailbox_len id must be non-negative Number".into());
+                }
+                crate::sim_actor::actor_mailbox_len(id as u64)?
+            }
+            "supervisor_spawn" => {
+                if a.len() < 2 || a.len() > 3 {
+                    return Err(
+                        "supervisor_spawn expects (strategy, child_specs[, options])".into(),
+                    );
+                }
+                let (Val::Str(strategy), Val::List(specs)) = (&a[0], &a[1]) else {
+                    return Err(
+                        "supervisor_spawn expects (strategy: String, child_specs: List[, options])"
+                            .into(),
+                    );
+                };
+                crate::sim_actor::supervisor_spawn(self, strategy, specs, a.get(2))?
+            }
+            "supervisor_status" => {
+                if a.len() != 1 {
+                    return Err("supervisor_status expects (supervisor_id)".into());
+                }
+                let Val::Num(id) = a[0] else {
+                    return Err("supervisor_status id must be Number".into());
+                };
+                if !id.is_finite() || id < 0.0 {
+                    return Err("supervisor_status id must be non-negative Number".into());
+                }
+                crate::sim_actor::supervisor_status(id as u64)?
+            }
             "ffi_bindgen" => {
                 if a.len() != 2 {
                     return Err("ffi_bindgen expects (header_source, lib_path)".into());
@@ -1272,6 +1429,91 @@ impl Vm {
                     return Err("ffi_bindgen expects String arguments".into());
                 };
                 Val::Str(crate::plugin::ffi_bindgen(header_src, lib_path)?)
+            }
+            "mem_alloc" => {
+                crate::runtime::require_cap("ffi")?;
+                if a.len() != 1 {
+                    return Err("mem_alloc expects (size)".into());
+                }
+                let Val::Num(sz) = a[0] else {
+                    return Err("mem_alloc size must be Number".into());
+                };
+                if !sz.is_finite() || sz <= 0.0 {
+                    return Err("mem_alloc size must be positive".into());
+                }
+                Val::Num(crate::plugin::mem_alloc(sz as usize)? as f64)
+            }
+            "mem_free" => {
+                crate::runtime::require_cap("ffi")?;
+                if a.len() != 1 {
+                    return Err("mem_free expects (ptr)".into());
+                }
+                let Val::Num(ptr) = a[0] else {
+                    return Err("mem_free ptr must be Number".into());
+                };
+                Val::Bool(crate::plugin::mem_free(ptr as usize)?)
+            }
+            "mem_read_u8" | "mem_read_i32" | "mem_read_i64" | "mem_read_f32" | "mem_read_f64"
+            | "mem_read_cstr" => {
+                crate::runtime::require_cap("ffi")?;
+                if a.is_empty() || a.len() > 2 {
+                    return Err(format!("{n} expects (ptr[, offset])"));
+                }
+                let Val::Num(ptr) = a[0] else {
+                    return Err(format!("{n} ptr must be Number"));
+                };
+                let offset = match a.get(1) {
+                    None => 0usize,
+                    Some(Val::Num(o)) if o.is_finite() && *o >= 0.0 => *o as usize,
+                    Some(_) => return Err(format!("{n} offset must be non-negative Number")),
+                };
+                let p = ptr as usize;
+                match n {
+                    "mem_read_u8" => Val::Num(f64::from(crate::plugin::mem_read_u8(p, offset)?)),
+                    "mem_read_i32" => Val::Num(f64::from(crate::plugin::mem_read_i32(p, offset)?)),
+                    "mem_read_i64" => Val::Num(crate::plugin::mem_read_i64(p, offset)? as f64),
+                    "mem_read_f32" => Val::Num(f64::from(crate::plugin::mem_read_f32(p, offset)?)),
+                    "mem_read_f64" => Val::Num(crate::plugin::mem_read_f64(p, offset)?),
+                    "mem_read_cstr" => Val::Str(crate::plugin::mem_read_cstr(p, offset)?),
+                    _ => unreachable!(),
+                }
+            }
+            "mem_write_u8" | "mem_write_i32" | "mem_write_i64" | "mem_write_f32"
+            | "mem_write_f64" => {
+                crate::runtime::require_cap("ffi")?;
+                if a.len() != 2 && a.len() != 3 {
+                    return Err(format!("{n} expects (ptr, [offset, ]val)"));
+                }
+                let Val::Num(ptr) = a[0] else {
+                    return Err(format!("{n} ptr must be Number"));
+                };
+                let (offset, val) = if a.len() == 2 {
+                    let Val::Num(v) = a[1] else {
+                        return Err(format!("{n} val must be Number"));
+                    };
+                    (0usize, v)
+                } else {
+                    let Val::Num(o) = a[1] else {
+                        return Err(format!("{n} offset must be Number"));
+                    };
+                    if !o.is_finite() || o < 0.0 {
+                        return Err(format!("{n} offset must be non-negative Number"));
+                    }
+                    let Val::Num(v) = a[2] else {
+                        return Err(format!("{n} val must be Number"));
+                    };
+                    (o as usize, v)
+                };
+                let p = ptr as usize;
+                match n {
+                    "mem_write_u8" => crate::plugin::mem_write_u8(p, offset, val as u8)?,
+                    "mem_write_i32" => crate::plugin::mem_write_i32(p, offset, val as i32)?,
+                    "mem_write_i64" => crate::plugin::mem_write_i64(p, offset, val as i64)?,
+                    "mem_write_f32" => crate::plugin::mem_write_f32(p, offset, val as f32)?,
+                    "mem_write_f64" => crate::plugin::mem_write_f64(p, offset, val)?,
+                    _ => unreachable!(),
+                }
+                Val::Null
             }
             "ffi_call" => {
                 crate::runtime::require_cap("ffi")?;
